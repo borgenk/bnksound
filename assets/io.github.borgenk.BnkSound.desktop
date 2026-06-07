@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=BNK Sound
+Comment=Audio device and volume control
+Exec=bnksound
+Icon=io.github.borgenk.BnkSound
+Terminal=false
+StartupNotify=false
+Categories=Settings;AudioVideo;Audio;
+Keywords=sound;audio;volume;mixer;
