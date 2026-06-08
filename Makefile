@@ -1,10 +1,11 @@
-.PHONY: fmt clippy build build-release build-linux install run test check
+.PHONY: fmt clippy build build-release build-linux install run test check bump
 
 APP_NAME := bnksound
 APP_ID := io.github.borgenk.BnkSound
 BUILD_PATH := target/release
 VERSION := $(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 LINUX_TARGET := x86_64-unknown-linux-gnu
+BIN_DIR := ~/.local/bin
 APPS_DIR := ~/.local/share/applications
 ICON_DIR := ~/.local/share/icons/hicolor
 
@@ -20,17 +21,30 @@ build:
 build-release:
 	cargo build --release
 
-# Install release binary to /usr/local/bin and the desktop entry + icons to ~/.local/share.
+# Install the release binary, desktop entry, and icons under ~/.local, the same
+# per-user location install.sh uses.
 # The icon cache / desktop database refreshes are best-effort (ignored if the tools are absent).
 install: build-release
-	sudo install -Dm755 $(BUILD_PATH)/$(APP_NAME) /usr/local/bin/$(APP_NAME)
+	install -Dm755 $(BUILD_PATH)/$(APP_NAME) $(BIN_DIR)/$(APP_NAME)
 	install -Dm644 assets/$(APP_ID).desktop $(APPS_DIR)/$(APP_ID).desktop
 	mkdir -p $(ICON_DIR)
 	cp -r assets/icons/hicolor/. $(ICON_DIR)/
 	-gtk-update-icon-cache -f -t $(ICON_DIR)
 	-update-desktop-database $(APPS_DIR)
-	@echo "Installed $(APP_NAME) to /usr/local/bin/"
+	@echo "Installed $(APP_NAME) to ~/.local/bin/"
 	@echo "Installed desktop file + icons to ~/.local/share/"
+
+# Bump version, commit, and tag: make bump V=0.2.0
+# Pushing the tag triggers the release workflow, which rejects any tag whose
+# name does not match this version, so the two stay in lockstep.
+bump:
+	@test -n "$(V)" || (echo "Current: $(VERSION). Usage: make bump V=0.2.0" && exit 1)
+	sed -i '0,/^version = ".*"/{s//version = "$(V)"/}' Cargo.toml
+	cargo update --workspace
+	git add Cargo.toml Cargo.lock
+	git commit -m "Bump version to $(V)"
+	git tag "v$(V)"
+	@echo "Bumped to v$(V). Push with: git push origin main --tags"
 
 # Build a release tarball into dist/ for upload to a GitHub Release.
 # Bundles the binary, desktop entry, and icon tree so install.sh can place them all.

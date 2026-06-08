@@ -15,7 +15,7 @@ _Disclaimer: personal project, built mainly for my own use, partly AI-assisted._
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/borgenk/bnk_sound/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/borgenk/bnksound/main/install.sh | sh
 ```
 
 This drops the binary in `~/.local/bin` and installs the desktop entry and icon.
