@@ -458,6 +458,8 @@ menubutton.bnk-profile-menu-btn > button:focus-within {
     box-shadow: 0 1px 2px @bnk_shadow_strong, 0 2px 4px @bnk_shadow_soft;
     margin: -6px;
     padding: 0;
+    /* Fade the hover ring in and out rather than snap. */
+    transition: box-shadow 120ms ease-out;
 }
 .bnk-scale.bnk-scale-warning slider,
 .bnk-scale.bnk-scale-warning slider:hover,
@@ -512,6 +514,24 @@ menubutton.bnk-profile-menu-btn > button:focus-within {
 .bnk-scale slider:focus-visible {
     /* Re-assert the resting drop shadow so focus doesn't strip it. */
     box-shadow: 0 1px 2px @bnk_shadow_strong, 0 2px 4px @bnk_shadow_soft;
+}
+/* Semi-transparent outer ring while the knob is pointed at or dragged. The
+   spread shadow follows the knob's full radius, so it reads as a halo around
+   the circle without touching layout. Listed last, and the warning variant
+   carries the matching specificity, so the ring wins in both states. */
+.bnk-scale slider:hover,
+.bnk-scale slider:active {
+    box-shadow:
+        0 1px 2px @bnk_shadow_strong,
+        0 2px 4px @bnk_shadow_soft,
+        0 0 0 5px @bnk_knob_halo;
+}
+.bnk-scale.bnk-scale-warning slider:hover,
+.bnk-scale.bnk-scale-warning slider:active {
+    box-shadow:
+        0 1px 2px @bnk_shadow_strong,
+        0 2px 4px @bnk_shadow_soft,
+        0 0 0 5px @bnk_knob_halo;
 }
 "#;
 

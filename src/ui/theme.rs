@@ -88,6 +88,8 @@ pub(super) struct Palette {
     // Volume slider fill.
     pub scale_fill: Color,
     pub scale_fill_warning: Color,
+    // Semi-transparent ring drawn around the knob while it is hovered or dragged.
+    pub knob_halo: Color,
     // Contrast washes, named by alpha percentage. `dim_grid` is the faintest,
     // shared by the slider trough (CSS) and the meter's unlit grid (cairo).
     pub dim_grid: Color,
@@ -139,6 +141,7 @@ impl Palette {
             danger_bg_hover: Color::hex(0x6e, 0x36, 0x36),
             scale_fill: Color::hex(0x4c, 0xaf, 0x50),
             scale_fill_warning: Color::hex(0xf4, 0x51, 0x1e),
+            knob_halo: Color::hexa(0xff, 0xff, 0xff, 0.07),
             dim_grid: Color::hexa(0xff, 0xff, 0xff, 0.03),
             wash_4: Color::hexa(0xff, 0xff, 0xff, 0.04),
             wash_5: Color::hexa(0xff, 0xff, 0xff, 0.05),
@@ -186,6 +189,7 @@ impl Palette {
             ("bnk_danger_bg_hover", self.danger_bg_hover),
             ("bnk_scale_fill", self.scale_fill),
             ("bnk_scale_fill_warning", self.scale_fill_warning),
+            ("bnk_knob_halo", self.knob_halo),
             ("bnk_dim_grid", self.dim_grid),
             ("bnk_wash_4", self.wash_4),
             ("bnk_wash_5", self.wash_5),

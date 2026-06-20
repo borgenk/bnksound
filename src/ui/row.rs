@@ -378,6 +378,23 @@ fn slider_node(scale: &gtk::Scale) -> Option<gtk::Widget> {
     dfs(scale.upcast_ref::<gtk::Widget>())
 }
 
+/// Show the pointer cursor over the whole scale, knob included. GTK draws the
+/// cursor of the widget holding the pointer grab, which during a drag is the
+/// scale's internal trough/slider gizmo rather than the scale itself, so the
+/// cursor is stamped on every descendant too or it falls back to the default
+/// mid-drag.
+fn set_pointer_cursor(scale: &gtk::Scale) {
+    fn stamp(w: &gtk::Widget) {
+        w.set_cursor_from_name(Some("pointer"));
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            stamp(&c);
+            child = c.next_sibling();
+        }
+    }
+    stamp(scale.upcast_ref::<gtk::Widget>());
+}
+
 /// Percent readout above a row of: meter, scale, and a right column with
 /// the optional `picker` + mute button. `mute_msg` fires on mute click,
 /// `volume_msg` fires continuously while dragging. Sink rows wire per-stream
@@ -464,6 +481,7 @@ fn build_slider_area(
     scale.set_halign(gtk::Align::Start);
     scale.set_height_request(SLIDER_TRACK_HEIGHT);
     scale.set_draw_value(false);
+    set_pointer_cursor(&scale);
     let tx_v = tx.clone();
     let scale_handler = scale.connect_value_changed(move |s| {
         let _ = tx_v.send(volume_msg(s.value() as f32));
