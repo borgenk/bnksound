@@ -31,6 +31,8 @@ jobs:
             exit 1
           fi
 
+      # Both variants are built here, so this is the union of what each needs:
+      # the GTK packages for the binary that ships, the rest for both.
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -40,6 +42,10 @@ jobs:
             libwayland-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libharfbuzz-dev \
+            libxkbcommon-dev \
             clang \
             libclang-dev
 
@@ -49,8 +55,27 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # The tarball holds the GTK build under the name bnksound. The native one
+      # is built too but not published: a tag should not be the moment we find
+      # out it stopped compiling.
+      - name: Build the native binary
+        run: cargo build --release --bin bnksound
+
       - name: Build release tarball
         run: make build-linux
+
+      # The published binary is the GTK one whatever the file is called, so
+      # check the artifact says so before it goes out.
+      - name: Verify the tarball holds the GTK build
+        run: |
+          tar -xzf dist/*.tar.gz -O ./bnksound > /tmp/shipped
+          chmod +x /tmp/shipped
+          needed=$(readelf -d /tmp/shipped | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
+          echo "$needed"
+          echo "$needed" | grep -q '^libgtk-4' || {
+            echo "::error::the tarball's bnksound does not link GTK"
+            exit 1
+          }
 
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2

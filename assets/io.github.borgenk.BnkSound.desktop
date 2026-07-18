@@ -5,6 +5,6 @@ Comment=Audio device and volume control
 Exec=bnksound
 Icon=io.github.borgenk.BnkSound
 Terminal=false
-StartupNotify=false
+StartupNotify=true
 Categories=Settings;AudioVideo;Audio;
 Keywords=sound;audio;volume;mixer;

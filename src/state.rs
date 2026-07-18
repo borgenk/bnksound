@@ -7,7 +7,7 @@ use crate::domain::{
     linear_to_cubic,
 };
 use crate::geometry::Geometry;
-use crate::pipewire_worker::{self as worker, Command, Event as WorkerEvent};
+use crate::pipewire_worker::{Command, Event as WorkerEvent};
 use crate::profile::{AppSettings, DeviceSettings, Pending, Profile, ProfileStore};
 use crate::store;
 
@@ -81,6 +81,9 @@ pub struct App {
     /// Highlighted-row index into the *filtered* command list, for Up/Down
     /// navigation and the row Enter executes.
     pub palette_selected: usize,
+    /// First row of the filtered list the panel shows. Navigation keeps the
+    /// selection inside the window it opens; the wheel moves it on its own.
+    pub palette_scroll: usize,
     /// Live IN/OUT/APP column visibility. Seeded from the active profile,
     /// flipped by `ToggleSection`, folded back on save so each profile
     /// reopens with its own layout. Read via [`App::shows_section`].
@@ -203,9 +206,9 @@ pub enum Message {
     /// Debounce tick. Snapshots a dirty active profile and/or persists
     /// dirty geometry; otherwise a no-op.
     AutoSaveTick,
-    /// Window resize / maximize notification. GTK4's `default-width`/
-    /// `default-height` track the last normal-state size (they don't move
-    /// while maximized/tiled), so this is the size to restore next launch.
+    /// Window resize / maximize notification. width/height carry the last
+    /// normal-state size (not the maximized or tiled size), so this is the size
+    /// to restore next launch.
     GeometryChanged {
         width: u32,
         height: u32,
@@ -219,18 +222,44 @@ pub enum Message {
     PaletteSelectPrev,
     /// Move the highlighted palette row down, wrapping to 0.
     PaletteSelectNext,
+    /// Show the palette list from this row down. Moves the window under the
+    /// selection without changing which row is selected; the sender clamps it
+    /// to the list, since only the projection knows how many rows fit.
+    PaletteScrollTo(usize),
 }
 
 pub fn boot() -> App {
-    // Load state but don't auto-apply device settings: WirePlumber already
-    // restores per-app volumes, and re-asserting them would surprise the
-    // user. Pure view state (the section filter) is restored, no audio side
-    // effects.
-    let store_path = store::state_path();
+    boot_from(store::state_path())
+}
+
+/// An App with nothing loaded and no persistence. Tests and headless render
+/// harnesses use this so they never read (or write) the developer's real state.
+pub fn empty() -> App {
+    boot_from(None)
+}
+
+/// Build the app from an optional state file.
+///
+/// Load state but don't auto-apply device settings: WirePlumber already
+/// restores per-app volumes, and re-asserting them would surprise the user.
+/// Pure view state (the section filter) is restored, no audio side effects.
+fn boot_from(store_path: Option<PathBuf>) -> App {
     let (loaded, load_err) = match store_path.as_deref() {
         Some(p) => match store::load_from(p) {
             Ok(s) => (s, None),
-            Err(e) => (store::State::default(), Some(format!("load state: {e:#}"))),
+            // Booting from defaults means the first save would write over the
+            // file that would not load, so it is set aside first.
+            Err(e) => {
+                let note = match store::quarantine(p) {
+                    Ok(kept) => {
+                        format!("load state: {e:#}; kept the old file at {}", kept.display())
+                    }
+                    Err(set_aside) => {
+                        format!("load state: {e:#}; could not set the old file aside: {set_aside}")
+                    }
+                };
+                (store::State::default(), Some(note))
+            }
         },
         None => (store::State::default(), None),
     };
@@ -256,6 +285,7 @@ pub fn boot() -> App {
         palette_open: false,
         palette_query: String::new(),
         palette_selected: 0,
+        palette_scroll: 0,
         section_filter: SectionFilter::default(),
     };
     ensure_active_profile(&mut app);
@@ -287,7 +317,11 @@ fn ensure_active_profile(state: &mut App) {
     }
 }
 
-pub fn update(state: &mut App, message: Message) {
+/// Reduce one message into `state`, pushing whatever the audio server has to be
+/// told onto `out`. Nothing is sent from here: the caller owns the worker and
+/// drains the commands, which is what keeps this a pure function of its inputs
+/// and lets the tests read back what a gesture would have done.
+pub fn update(state: &mut App, message: Message, out: &mut Vec<Command>) {
     match message {
         Message::Worker(evt) => match *evt {
             WorkerEvent::StreamAdded(s) | WorkerEvent::StreamUpdated(s) => {
@@ -360,7 +394,7 @@ pub fn update(state: &mut App, message: Message) {
                 // Pending profile entries fulfill on a matching stream.
                 // The tombstone-inherit branch below overrides this so
                 // in-session edits beat the saved profile.
-                consume_pending_for_stream(state, new_id);
+                consume_pending_for_stream(state, new_id, out);
 
                 if let Some((volume, muted, target_sink_name)) = inherit {
                     // Apply locally first so the UI doesn't wait for the
@@ -370,23 +404,21 @@ pub fn update(state: &mut App, message: Message) {
                         target.muted = muted;
                         target.target_sink_name = target_sink_name.clone();
                     }
-                    if let Some(h) = worker::handle() {
-                        h.send(Command::SetVolume {
+                    out.push(Command::SetVolume {
+                        node_id: new_id,
+                        volume,
+                    });
+                    out.push(Command::SetMute {
+                        node_id: new_id,
+                        mute: muted,
+                    });
+                    // Only replay a pin; replaying `None` would clear the
+                    // route the fresh stream came back with.
+                    if target_sink_name.is_some() {
+                        out.push(Command::SetStreamTarget {
                             node_id: new_id,
-                            volume,
+                            sink_node_name: target_sink_name,
                         });
-                        h.send(Command::SetMute {
-                            node_id: new_id,
-                            mute: muted,
-                        });
-                        // Only replay a pin; replaying `None` would clear
-                        // the route the fresh stream came back with.
-                        if target_sink_name.is_some() {
-                            h.send(Command::SetStreamTarget {
-                                node_id: new_id,
-                                sink_node_name: target_sink_name,
-                            });
-                        }
                     }
                 }
             }
@@ -418,10 +450,8 @@ pub fn update(state: &mut App, message: Message) {
             }
             // Tombstoned rows have no live Node; skip the command. The
             // local update is replayed if the app reconnects.
-            if !state.tombstoned.contains(&id)
-                && let Some(h) = worker::handle()
-            {
-                h.send(Command::SetVolume {
+            if !state.tombstoned.contains(&id) {
+                out.push(Command::SetVolume {
                     node_id: id,
                     volume: linear,
                 });
@@ -440,8 +470,8 @@ pub fn update(state: &mut App, message: Message) {
                 mark_dirty(state);
                 return;
             }
-            if let (Some(h), Some((muted, volume))) = (worker::handle(), toggle) {
-                send_mute_reassert(&h, id, muted, volume);
+            if let Some((muted, volume)) = toggle {
+                send_mute_reassert(out, id, muted, volume);
             }
             mark_dirty(state);
         }
@@ -451,7 +481,7 @@ pub fn update(state: &mut App, message: Message) {
             if members.is_empty() {
                 return;
             }
-            apply_group_volume(state, &members, cubic);
+            apply_group_volume(state, &members, cubic, out);
             mark_dirty(state);
         }
         Message::GroupMuteToggled(key) => {
@@ -459,7 +489,7 @@ pub fn update(state: &mut App, message: Message) {
             if members.is_empty() {
                 return;
             }
-            apply_group_mute(state, &members);
+            apply_group_mute(state, &members, out);
             mark_dirty(state);
         }
         Message::GroupSetStreamTarget { key, sink_id } => {
@@ -470,12 +500,12 @@ pub fn update(state: &mut App, message: Message) {
                 .and_then(|s| s.node_name.clone());
             let Some(sink_name) = sink_name else { return };
             let members = members_of_app_row(state, &key);
-            apply_group_target(state, &members, Some(&sink_name));
+            apply_group_target(state, &members, Some(&sink_name), out);
             mark_dirty(state);
         }
         Message::GroupClearStreamTarget(key) => {
             let members = members_of_app_row(state, &key);
-            apply_group_target(state, &members, None);
+            apply_group_target(state, &members, None, out);
             mark_dirty(state);
         }
         Message::GroupToggleExpanded(key) => {
@@ -490,8 +520,8 @@ pub fn update(state: &mut App, message: Message) {
             }
         }
         Message::MprisChanged => {}
-        Message::MakeDefault(id) => make_default(state, id, StreamKind::Sink),
-        Message::MakeDefaultSource(id) => make_default(state, id, StreamKind::Source),
+        Message::MakeDefault(id) => make_default(state, id, StreamKind::Sink, out),
+        Message::MakeDefaultSource(id) => make_default(state, id, StreamKind::Source, out),
         Message::ToggleSection(section) => {
             state.section_filter.toggle(section);
             mark_dirty(state);
@@ -506,7 +536,7 @@ pub fn update(state: &mut App, message: Message) {
                 .map(|s| s.id)
                 .collect();
             for id in sink_ids {
-                set_sink_mute(state, id, target_mute);
+                set_sink_mute(state, id, target_mute, out);
             }
             mark_dirty(state);
         }
@@ -521,7 +551,7 @@ pub fn update(state: &mut App, message: Message) {
             };
             // Optimistic local update so the UI stays snappy; the
             // metadata listener echoes the write back later.
-            set_app_target(state, &worker::handle(), app_id, Some(&sink_name));
+            set_app_target(state, app_id, Some(&sink_name), out);
             mark_dirty(state);
         }
         Message::ResetAllStreamTargets => {
@@ -533,18 +563,17 @@ pub fn update(state: &mut App, message: Message) {
                 })
                 .map(|(id, _)| *id)
                 .collect();
-            let handle = worker::handle();
             for id in ids {
-                set_app_target(state, &handle, id, None);
+                set_app_target(state, id, None, out);
             }
             mark_dirty(state);
         }
         Message::ClearStreamTarget(app_id) => {
-            set_app_target(state, &worker::handle(), app_id, None);
+            set_app_target(state, app_id, None, out);
             mark_dirty(state);
         }
         Message::ApplyProfile(name) => {
-            apply_profile(state, &name);
+            apply_profile(state, &name, out);
         }
         Message::DeleteProfile(name) => {
             let was_active = state.profiles.active.as_deref() == Some(name.as_str());
@@ -628,15 +657,18 @@ pub fn update(state: &mut App, message: Message) {
             state.palette_open = !state.palette_open;
             state.palette_query.clear();
             state.palette_selected = 0;
+            state.palette_scroll = 0;
         }
         Message::PaletteQueryChanged(q) => {
             state.palette_query = q;
             state.palette_selected = 0;
+            state.palette_scroll = 0;
         }
         Message::PaletteSelectPrev => {
             let count = filtered_palette_count(state);
             if count == 0 {
                 state.palette_selected = 0;
+                state.palette_scroll = 0;
                 return;
             }
             let last = count - 1;
@@ -645,11 +677,13 @@ pub fn update(state: &mut App, message: Message) {
             } else {
                 state.palette_selected - 1
             };
+            follow_palette_selection(state);
         }
         Message::PaletteSelectNext => {
             let count = filtered_palette_count(state);
             if count == 0 {
                 state.palette_selected = 0;
+                state.palette_scroll = 0;
                 return;
             }
             let last = count - 1;
@@ -658,8 +692,20 @@ pub fn update(state: &mut App, message: Message) {
             } else {
                 state.palette_selected + 1
             };
+            follow_palette_selection(state);
         }
+        Message::PaletteScrollTo(row) => state.palette_scroll = row,
     }
+}
+
+/// Move the list so the selected row is on screen. The window is the nominal
+/// one; a window too short for that many rows is layout's to narrow further.
+fn follow_palette_selection(state: &mut App) {
+    state.palette_scroll = command_palette::scroll_into_view(
+        state.palette_scroll,
+        state.palette_selected,
+        command_palette::VISIBLE_ROWS,
+    );
 }
 
 /// Palette rows matching the current query, capped at `MAX_VISIBLE`.
@@ -806,7 +852,7 @@ fn current_default(state: &App, kind: StreamKind) -> Option<&str> {
 
 /// Make stream `id` the system default for its direction. No-op if `id`
 /// isn't a non-default device of `kind` or no worker handle exists.
-fn make_default(state: &mut App, id: u32, kind: StreamKind) {
+fn make_default(state: &mut App, id: u32, kind: StreamKind, out: &mut Vec<Command>) {
     let command: fn(String) -> Command = match kind {
         StreamKind::Sink => |node_name| Command::SetDefaultSink { node_name },
         StreamKind::Source => |node_name| Command::SetDefaultSource { node_name },
@@ -817,8 +863,8 @@ fn make_default(state: &mut App, id: u32, kind: StreamKind) {
         .get(&id)
         .filter(|s| s.kind == kind && !s.is_default)
         .and_then(|s| s.node_name.clone());
-    if let (Some(h), Some(node_name)) = (worker::handle(), target) {
-        h.send(command(node_name));
+    if let Some(node_name) = target {
+        out.push(command(node_name));
         mark_dirty(state);
     }
 }
@@ -826,16 +872,16 @@ fn make_default(state: &mut App, id: u32, kind: StreamKind) {
 /// Push `SetMute`, then re-assert `SetVolume` on unmute. Bluetooth AVRCP
 /// sinks zero their device volume on mute and don't restore it on unmute,
 /// so the re-assert snaps them back. Benign no-op elsewhere.
-fn send_mute_reassert(h: &worker::Handle, node_id: u32, mute: bool, volume: f32) {
-    h.send(Command::SetMute { node_id, mute });
+fn send_mute_reassert(out: &mut Vec<Command>, node_id: u32, mute: bool, volume: f32) {
+    out.push(Command::SetMute { node_id, mute });
     if !mute {
-        h.send(Command::SetVolume { node_id, volume });
+        out.push(Command::SetVolume { node_id, volume });
     }
 }
 
 /// Set one sink's mute: flip the local flag, then push via
 /// [`send_mute_reassert`]. Tombstoned nodes get the local flip only.
-fn set_sink_mute(state: &mut App, id: u32, mute: bool) {
+fn set_sink_mute(state: &mut App, id: u32, mute: bool, out: &mut Vec<Command>) {
     let tombstoned = state.tombstoned.contains(&id);
     let volume = state.streams.get_mut(&id).map(|s| {
         s.muted = mute;
@@ -844,14 +890,14 @@ fn set_sink_mute(state: &mut App, id: u32, mute: bool) {
     if tombstoned {
         return;
     }
-    if let (Some(h), Some(volume)) = (worker::handle(), volume) {
-        send_mute_reassert(&h, id, mute, volume);
+    if let Some(volume) = volume {
+        send_mute_reassert(out, id, mute, volume);
     }
 }
 
 /// Push every entry of the named profile onto live state. Unmatched
 /// entries go into `state.pending` and apply when the stream connects.
-fn apply_profile(state: &mut App, name: &str) {
+fn apply_profile(state: &mut App, name: &str, out: &mut Vec<Command>) {
     // Flush in-flight changes to the previous profile first. Re-applying
     // the same profile is NOT a flush; it's a "revert to saved" gesture.
     if state.dirty
@@ -866,17 +912,16 @@ fn apply_profile(state: &mut App, name: &str) {
         return;
     };
 
-    let handle = worker::handle();
     let mut pending = Pending::default();
 
     for (node_name, settings) in &profile.sinks {
-        if !apply_device_entry(state, &handle, StreamKind::Sink, node_name, settings) {
+        if !apply_device_entry(state, StreamKind::Sink, node_name, settings, out) {
             pending.sinks.insert(node_name.clone(), *settings);
         }
     }
 
     for (node_name, settings) in &profile.sources {
-        if !apply_device_entry(state, &handle, StreamKind::Source, node_name, settings) {
+        if !apply_device_entry(state, StreamKind::Source, node_name, settings, out) {
             pending.sources.insert(node_name.clone(), *settings);
         }
     }
@@ -888,7 +933,7 @@ fn apply_profile(state: &mut App, name: &str) {
             .then_some(*id)
         });
         match target {
-            Some(id) => apply_app_settings(state, &handle, id, settings),
+            Some(id) => apply_app_settings(state, id, settings, out),
             None => {
                 pending.apps.insert(key.clone(), settings.clone());
             }
@@ -900,11 +945,9 @@ fn apply_profile(state: &mut App, name: &str) {
             matches!(s.kind, StreamKind::Sink) && s.node_name.as_deref() == Some(default_name)
         });
         if live {
-            if let Some(h) = &handle {
-                h.send(Command::SetDefaultSink {
-                    node_name: default_name.to_string(),
-                });
-            }
+            out.push(Command::SetDefaultSink {
+                node_name: default_name.to_string(),
+            });
         } else {
             pending.default_sink = Some(default_name.to_string());
         }
@@ -915,11 +958,9 @@ fn apply_profile(state: &mut App, name: &str) {
             matches!(s.kind, StreamKind::Source) && s.node_name.as_deref() == Some(default_name)
         });
         if live {
-            if let Some(h) = &handle {
-                h.send(Command::SetDefaultSource {
-                    node_name: default_name.to_string(),
-                });
-            }
+            out.push(Command::SetDefaultSource {
+                node_name: default_name.to_string(),
+            });
         } else {
             pending.default_source = Some(default_name.to_string());
         }
@@ -936,9 +977,9 @@ fn apply_profile(state: &mut App, name: &str) {
 /// Direction-agnostic; devices carry no per-stream target.
 fn apply_device_settings(
     state: &mut App,
-    handle: &Option<worker::Handle>,
     node_id: u32,
     settings: &DeviceSettings,
+    out: &mut Vec<Command>,
 ) {
     let tombstoned = state.tombstoned.contains(&node_id);
     if let Some(s) = state.streams.get_mut(&node_id) {
@@ -948,30 +989,29 @@ fn apply_device_settings(
     if tombstoned {
         return;
     }
-    let Some(h) = handle else { return };
     // SetVolume, then SetMute with the unmute re-assert.
-    h.send(Command::SetVolume {
+    out.push(Command::SetVolume {
         node_id,
         volume: settings.volume,
     });
-    send_mute_reassert(h, node_id, settings.muted, settings.volume);
+    send_mute_reassert(out, node_id, settings.muted, settings.volume);
 }
 
 /// Apply one device entry of `kind`. Returns `true` if a matching live
 /// stream took the settings, `false` so the caller can stash it in pending.
 fn apply_device_entry(
     state: &mut App,
-    handle: &Option<worker::Handle>,
     kind: StreamKind,
     node_name: &str,
     settings: &DeviceSettings,
+    out: &mut Vec<Command>,
 ) -> bool {
     let target = state.streams.iter().find_map(|(id, s)| {
         (s.kind == kind && s.node_name.as_deref() == Some(node_name)).then_some(*id)
     });
     match target {
         Some(id) => {
-            apply_device_settings(state, handle, id, settings);
+            apply_device_settings(state, id, settings, out);
             true
         }
         None => false,
@@ -980,9 +1020,9 @@ fn apply_device_entry(
 
 fn apply_app_settings(
     state: &mut App,
-    handle: &Option<worker::Handle>,
     node_id: u32,
     settings: &AppSettings,
+    out: &mut Vec<Command>,
 ) {
     let tombstoned = state.tombstoned.contains(&node_id);
     if let Some(s) = state.streams.get_mut(&node_id) {
@@ -993,16 +1033,15 @@ fn apply_app_settings(
     if tombstoned {
         return;
     }
-    let Some(h) = handle else { return };
-    h.send(Command::SetVolume {
+    out.push(Command::SetVolume {
         node_id,
         volume: settings.volume,
     });
-    h.send(Command::SetMute {
+    out.push(Command::SetMute {
         node_id,
         mute: settings.muted,
     });
-    h.send(Command::SetStreamTarget {
+    out.push(Command::SetStreamTarget {
         node_id,
         sink_node_name: settings.target_sink_name.clone(),
     });
@@ -1013,7 +1052,7 @@ fn apply_app_settings(
 /// `target_cubic / master_old_cubic` (master = loudest member). When the
 /// master is ~0 (all silent) write `target_cubic` to every member; members
 /// clamp to `MAX_VOLUME`.
-fn apply_group_volume(state: &mut App, members: &[u32], target_cubic: f32) {
+fn apply_group_volume(state: &mut App, members: &[u32], target_cubic: f32, out: &mut Vec<Command>) {
     let master_old_cubic = members
         .iter()
         .filter_map(|id| state.streams.get(id))
@@ -1037,7 +1076,6 @@ fn apply_group_volume(state: &mut App, members: &[u32], target_cubic: f32) {
         members.iter().map(|id| (*id, linear)).collect()
     };
 
-    let handle = worker::handle();
     for (id, linear) in plan {
         if let Some(s) = state.streams.get_mut(&id) {
             s.set_uniform_volume(linear);
@@ -1045,24 +1083,21 @@ fn apply_group_volume(state: &mut App, members: &[u32], target_cubic: f32) {
         if state.tombstoned.contains(&id) {
             continue;
         }
-        if let Some(h) = &handle {
-            h.send(Command::SetVolume {
-                node_id: id,
-                volume: linear,
-            });
-        }
+        out.push(Command::SetVolume {
+            node_id: id,
+            volume: linear,
+        });
     }
 }
 
 /// Toggle a collapsed app row's mute. If every member is muted, unmute
 /// all; otherwise mute all. The unmute re-assert applies per member.
-fn apply_group_mute(state: &mut App, members: &[u32]) {
+fn apply_group_mute(state: &mut App, members: &[u32], out: &mut Vec<Command>) {
     let all_muted = members
         .iter()
         .filter_map(|id| state.streams.get(id))
         .all(|s| s.muted);
     let new_muted = !all_muted;
-    let handle = worker::handle();
 
     for &id in members {
         let avg = match state.streams.get_mut(&id) {
@@ -1075,8 +1110,7 @@ fn apply_group_mute(state: &mut App, members: &[u32]) {
         if state.tombstoned.contains(&id) {
             continue;
         }
-        let Some(h) = &handle else { continue };
-        send_mute_reassert(h, id, new_muted, avg);
+        send_mute_reassert(out, id, new_muted, avg);
     }
 }
 
@@ -1085,9 +1119,9 @@ fn apply_group_mute(state: &mut App, members: &[u32]) {
 /// local update only; the reconnect path replays the pin.
 fn set_app_target(
     state: &mut App,
-    handle: &Option<worker::Handle>,
     id: u32,
     target_sink_name: Option<&str>,
+    out: &mut Vec<Command>,
 ) {
     if let Some(s) = state.streams.get_mut(&id) {
         s.target_sink_name = target_sink_name.map(str::to_string);
@@ -1095,46 +1129,45 @@ fn set_app_target(
     if state.tombstoned.contains(&id) {
         return;
     }
-    if let Some(h) = handle {
-        h.send(Command::SetStreamTarget {
-            node_id: id,
-            sink_node_name: target_sink_name.map(str::to_string),
-        });
-    }
+    out.push(Command::SetStreamTarget {
+        node_id: id,
+        sink_node_name: target_sink_name.map(str::to_string),
+    });
 }
 
 /// Apply `target_sink_name` (or clear when `None`) to every member of a
 /// collapsed app row.
-fn apply_group_target(state: &mut App, members: &[u32], target_sink_name: Option<&str>) {
-    let handle = worker::handle();
+fn apply_group_target(
+    state: &mut App,
+    members: &[u32],
+    target_sink_name: Option<&str>,
+    out: &mut Vec<Command>,
+) {
     for &id in members {
-        set_app_target(state, &handle, id, target_sink_name);
+        set_app_target(state, id, target_sink_name, out);
     }
 }
 
 /// Apply any matching `pending` entry to a freshly-added stream and remove
 /// it, so a later reconnect doesn't reapply stale state.
-fn consume_pending_for_stream(state: &mut App, stream_id: u32) {
+fn consume_pending_for_stream(state: &mut App, stream_id: u32, out: &mut Vec<Command>) {
     if state.pending.is_empty() {
         return;
     }
     let Some(stream) = state.streams.get(&stream_id) else {
         return;
     };
-    let handle = worker::handle();
     match stream.kind {
         StreamKind::Sink => {
             let Some(node_name) = stream.node_name.clone() else {
                 return;
             };
             if let Some(settings) = state.pending.sinks.remove(&node_name) {
-                apply_device_settings(state, &handle, stream_id, &settings);
+                apply_device_settings(state, stream_id, &settings, out);
             }
             if state.pending.default_sink.as_deref() == Some(node_name.as_str()) {
                 state.pending.default_sink = None;
-                if let Some(h) = &handle {
-                    h.send(Command::SetDefaultSink { node_name });
-                }
+                out.push(Command::SetDefaultSink { node_name });
             }
         }
         StreamKind::Source => {
@@ -1142,13 +1175,11 @@ fn consume_pending_for_stream(state: &mut App, stream_id: u32) {
                 return;
             };
             if let Some(settings) = state.pending.sources.remove(&node_name) {
-                apply_device_settings(state, &handle, stream_id, &settings);
+                apply_device_settings(state, stream_id, &settings, out);
             }
             if state.pending.default_source.as_deref() == Some(node_name.as_str()) {
                 state.pending.default_source = None;
-                if let Some(h) = &handle {
-                    h.send(Command::SetDefaultSource { node_name });
-                }
+                out.push(Command::SetDefaultSource { node_name });
             }
         }
         StreamKind::Application => {
@@ -1156,7 +1187,7 @@ fn consume_pending_for_stream(state: &mut App, stream_id: u32) {
                 return;
             };
             if let Some(settings) = state.pending.apps.remove(&key) {
-                apply_app_settings(state, &handle, stream_id, &settings);
+                apply_app_settings(state, stream_id, &settings, out);
             }
         }
     }
@@ -1176,6 +1207,20 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    /// Reduce one message, dropping the commands it asks for. Most tests are
+    /// about what the reduce did to the state, not what it told the server.
+    fn update(state: &mut App, message: Message) {
+        super::update(state, message, &mut Vec::new());
+    }
+
+    /// Reduce one message and hand back the commands it pushed, for the tests
+    /// that are about exactly that.
+    fn commands_for(state: &mut App, message: Message) -> Vec<Command> {
+        let mut out = Vec::new();
+        super::update(state, message, &mut out);
+        out
+    }
 
     fn app_stream(id: u32) -> AudioStream {
         AudioStream {
@@ -1255,6 +1300,7 @@ mod tests {
             palette_open: false,
             palette_query: String::new(),
             palette_selected: 0,
+            palette_scroll: 0,
             section_filter: SectionFilter::default(),
         }
     }
@@ -2538,6 +2584,83 @@ mod tests {
         assert_eq!(state.palette_selected, cmd_count - 1);
     }
 
+    /// A palette with more commands than the list can show at once.
+    fn long_palette_state() -> App {
+        let mut state = boot_state();
+        state.palette_open = true;
+        for i in 0..command_palette::VISIBLE_ROWS + 4 {
+            state.profiles.insert_or_replace(Profile {
+                name: format!("profile {i}"),
+                ..Profile::default()
+            });
+        }
+        assert!(
+            command_palette::build_commands(&state).len() > command_palette::VISIBLE_ROWS,
+            "scene needs a list longer than the window"
+        );
+        state
+    }
+
+    #[test]
+    fn walking_down_scrolls_only_once_the_selection_reaches_the_bottom() {
+        let mut state = long_palette_state();
+        for _ in 0..command_palette::VISIBLE_ROWS - 1 {
+            update(&mut state, Message::PaletteSelectNext);
+        }
+        assert_eq!(state.palette_selected, command_palette::VISIBLE_ROWS - 1);
+        assert_eq!(
+            state.palette_scroll, 0,
+            "the last visible row needs no scroll"
+        );
+
+        update(&mut state, Message::PaletteSelectNext);
+        assert_eq!(
+            state.palette_scroll, 1,
+            "one row past the window moves it one"
+        );
+    }
+
+    #[test]
+    fn wrapping_past_either_end_shows_the_row_it_lands_on() {
+        let mut state = long_palette_state();
+        let count = command_palette::build_commands(&state)
+            .len()
+            .min(command_palette::MAX_VISIBLE);
+
+        // Up from the first row wraps to the last, which is off the bottom.
+        update(&mut state, Message::PaletteSelectPrev);
+        assert_eq!(state.palette_selected, count - 1);
+        assert_eq!(
+            state.palette_scroll,
+            count - command_palette::VISIBLE_ROWS,
+            "the window ends on the last row"
+        );
+
+        // Down from the last row wraps to the first, back at the top.
+        update(&mut state, Message::PaletteSelectNext);
+        assert_eq!(state.palette_selected, 0);
+        assert_eq!(state.palette_scroll, 0);
+    }
+
+    #[test]
+    fn a_new_query_puts_the_list_back_at_the_top() {
+        let mut state = long_palette_state();
+        update(&mut state, Message::PaletteSelectPrev);
+        assert!(state.palette_scroll > 0);
+
+        update(&mut state, Message::PaletteQueryChanged("profile".into()));
+        assert_eq!(state.palette_scroll, 0);
+        assert_eq!(state.palette_selected, 0);
+    }
+
+    #[test]
+    fn scrolling_the_list_leaves_the_selection_where_it_was() {
+        let mut state = long_palette_state();
+        update(&mut state, Message::PaletteScrollTo(3));
+        assert_eq!(state.palette_scroll, 3);
+        assert_eq!(state.palette_selected, 0, "the wheel selects nothing");
+    }
+
     fn source_stream(id: u32, node_name: &str) -> AudioStream {
         let mut s = sink_stream(id, node_name);
         s.kind = StreamKind::Source;
@@ -2692,5 +2815,238 @@ mod tests {
         assert!(!state.streams[&1].muted);
         assert!(!state.streams[&2].muted);
         assert!(!state.all_outputs_muted());
+    }
+
+    /// A state file that will not decode is the only copy of whatever the user
+    /// had. Booting from defaults and then saving would write straight over it,
+    /// so it has to be set aside before that first save can happen.
+    #[test]
+    fn a_state_file_that_will_not_load_is_kept_rather_than_overwritten() {
+        let dir = std::env::temp_dir().join(format!(
+            "bnksound_state_bad_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("state.bin");
+        // A version this build does not read, which is what a downgrade sees.
+        let mut bytes = b"BNKZ".to_vec();
+        bytes.push(99);
+        std::fs::write(&path, &bytes).expect("write");
+
+        let mut state = boot_from(Some(path.clone()));
+        assert!(
+            state.status.as_deref().is_some_and(|s| s.contains("kept")),
+            "the status says where it went: {:?}",
+            state.status,
+        );
+        let kept = dir.join("state.bin.bad");
+        assert_eq!(std::fs::read(&kept).expect("kept file"), bytes);
+        assert!(!path.exists(), "the unreadable file is out of the way");
+
+        // The session carries on and saves normally from here.
+        state.profiles.active = Some("Default".into());
+        state.dirty = true;
+        update(&mut state, Message::AutoSaveTick);
+        assert!(path.exists(), "a fresh state file takes its place");
+        assert_eq!(
+            std::fs::read(&kept).expect("kept file"),
+            bytes,
+            "and the old one is untouched",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bluetooth AVRCP sinks zero their device volume when muted and do not put
+    /// it back on unmute, so every unmute re-asserts the volume behind it.
+    #[test]
+    fn unmuting_re_asserts_the_volume_and_muting_does_not() {
+        let mut state = boot_state();
+        let mut s = app_stream(10);
+        s.channel_volumes = vec![0.4, 0.4];
+        state.streams.insert(10, s);
+
+        let cmds = commands_for(&mut state, Message::MuteToggled(10));
+        assert_eq!(
+            cmds,
+            vec![Command::SetMute {
+                node_id: 10,
+                mute: true
+            }],
+            "muting says only that",
+        );
+
+        match commands_for(&mut state, Message::MuteToggled(10)).as_slice() {
+            [
+                Command::SetMute {
+                    node_id: 10,
+                    mute: false,
+                },
+                Command::SetVolume {
+                    node_id: 10,
+                    volume,
+                },
+            ] => assert!((volume - 0.4).abs() < 1e-6),
+            other => panic!("expected an unmute then a volume re-assert, got {other:?}"),
+        }
+    }
+
+    /// A tombstoned row has no live Node behind it. Its gestures still land in
+    /// local state, ready to be replayed, but nothing may go to the server.
+    #[test]
+    fn a_tombstoned_row_tells_the_server_nothing() {
+        let mut state = boot_state();
+        state
+            .streams
+            .insert(100, sink_stream(100, "alsa_output.usb"));
+        let mut s = app_stream(10);
+        s.binary = Some("firefox".into());
+        state.streams.insert(10, s);
+        state.tombstoned.insert(10);
+
+        for message in [
+            Message::VolumeChanged(10, 1.0),
+            Message::MuteToggled(10),
+            Message::SetStreamTarget {
+                app_id: 10,
+                sink_id: 100,
+            },
+            Message::ClearStreamTarget(10),
+        ] {
+            let cmds = commands_for(&mut state, message.clone());
+            assert!(cmds.is_empty(), "{message:?} should send nothing: {cmds:?}");
+        }
+
+        // Every one of them still took locally.
+        let row = state.streams.get(&10).expect("row");
+        assert!((row.average_volume() - 1.0).abs() < 1e-6);
+        assert!(row.muted);
+        assert_eq!(row.target_sink_name, None);
+    }
+
+    #[test]
+    fn a_reconnecting_stream_replays_what_its_ghost_held() {
+        let mut state = boot_state();
+        state
+            .streams
+            .insert(100, sink_stream(100, "alsa_output.usb"));
+        let mut old = app_stream(10);
+        old.binary = Some("firefox".into());
+        old.channel_volumes = vec![0.9, 0.9];
+        old.muted = true;
+        old.target_sink_name = Some("alsa_output.usb".into());
+        state.streams.insert(10, old);
+        state.tombstoned.insert(10);
+
+        let mut fresh = app_stream(11);
+        fresh.binary = Some("firefox".into());
+        fresh.channel_volumes = vec![0.2, 0.2];
+        let cmds = commands_for(
+            &mut state,
+            Message::Worker(Box::new(WorkerEvent::StreamAdded(fresh))),
+        );
+
+        match cmds.as_slice() {
+            [
+                Command::SetVolume {
+                    node_id: 11,
+                    volume,
+                },
+                Command::SetMute {
+                    node_id: 11,
+                    mute: true,
+                },
+                Command::SetStreamTarget {
+                    node_id: 11,
+                    sink_node_name,
+                },
+            ] => {
+                assert!((volume - 0.9).abs() < 1e-6);
+                assert_eq!(sink_node_name.as_deref(), Some("alsa_output.usb"));
+            }
+            other => panic!("expected the ghost's state on the fresh node, got {other:?}"),
+        }
+    }
+
+    /// Replaying an absent pin would clear the route the stream came back with,
+    /// so a reconnect that inherits no pin says nothing about routing.
+    #[test]
+    fn a_reconnect_with_no_pin_leaves_the_fresh_route_alone() {
+        let mut state = boot_state();
+        let mut old = app_stream(10);
+        old.binary = Some("firefox".into());
+        state.streams.insert(10, old.clone());
+        state.tombstoned.insert(10);
+        old.id = 11;
+
+        let cmds = commands_for(
+            &mut state,
+            Message::Worker(Box::new(WorkerEvent::StreamAdded(old))),
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Command::SetStreamTarget { .. })),
+            "got {cmds:?}",
+        );
+    }
+
+    #[test]
+    fn applying_a_profile_pushes_every_live_entry_to_the_server() {
+        let mut state = boot_state();
+        state
+            .streams
+            .insert(100, sink_stream(100, "alsa_output.usb"));
+        let mut firefox = app_stream(10);
+        firefox.binary = Some("firefox".into());
+        state.streams.insert(10, firefox);
+        state.profiles.insert_or_replace(profile_with(
+            "Work",
+            &[("alsa_output.usb", 0.7, false)],
+            &[("bin:firefox", 0.4, true, Some("alsa_output.usb"))],
+            Some("alsa_output.usb"),
+        ));
+
+        let cmds = commands_for(&mut state, Message::ApplyProfile("Work".into()));
+
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::SetDefaultSink { node_name }
+                    if node_name == "alsa_output.usb")),
+            "the saved default is named: {cmds:?}",
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Command::SetMute {
+                    node_id: 10,
+                    mute: true
+                }
+            )),
+            "the app takes its saved mute: {cmds:?}",
+        );
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, Command::SetStreamTarget { node_id: 10, sink_node_name }
+                    if sink_node_name.as_deref() == Some("alsa_output.usb"))
+            ),
+            "and its saved pin: {cmds:?}",
+        );
+        // The unmuted sink is set, then re-asserted behind its unmute.
+        let sink_volumes = cmds
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    Command::SetVolume {
+                        node_id: 100,
+                        volume
+                    } if (volume - 0.7).abs() < 1e-6
+                )
+            })
+            .count();
+        assert_eq!(sink_volumes, 2, "set, then re-asserted on unmute: {cmds:?}");
     }
 }

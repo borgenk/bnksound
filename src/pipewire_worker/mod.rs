@@ -25,7 +25,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::thread;
 
 use libspa::pod::serialize::GenError;
@@ -94,7 +94,7 @@ impl std::error::Error for Error {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Command {
     SetVolume {
         node_id: u32,
@@ -141,8 +141,6 @@ impl Handle {
     }
 }
 
-static HANDLE: OnceLock<Handle> = OnceLock::new();
-
 // Hard caps that panic loudly if a bounded structure grows past a sane
 // threshold, cheaper than chasing a runaway leak after the OOM killer.
 
@@ -150,13 +148,10 @@ static HANDLE: OnceLock<Handle> = OnceLock::new();
 pub(crate) const MAX_BOUND_NODES: usize = 1024;
 pub(crate) const MAX_BOUND_CLIENTS: usize = 1024;
 
-/// Spawn the PipeWire thread. Idempotent: subsequent calls are no-ops
-/// (the additional `evt_tx` clones are dropped on the floor).
-pub fn init(evt_tx: BusSender<Event>, pool: Arc<PeakPool>) {
-    if HANDLE.get().is_some() {
-        return;
-    }
-
+/// Spawn the PipeWire thread and return the handle its commands go through.
+/// The caller owns the handle, so how far it travels is visible in the types
+/// rather than being reachable from anywhere.
+pub fn init(evt_tx: BusSender<Event>, pool: Arc<PeakPool>) -> Handle {
     let (cmd_tx, cmd_rx) = pw::channel::channel::<Command>();
 
     let evt_tx_for_thread = evt_tx.clone();
@@ -169,11 +164,7 @@ pub fn init(evt_tx: BusSender<Event>, pool: Arc<PeakPool>) {
         })
         .expect("spawn pipewire thread");
 
-    let _ = HANDLE.set(Handle { commands: cmd_tx });
-}
-
-pub fn handle() -> Option<Handle> {
-    HANDLE.get().cloned()
+    Handle { commands: cmd_tx }
 }
 
 // ---------------------------------------------------------------------------
