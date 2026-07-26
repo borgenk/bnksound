@@ -167,6 +167,22 @@ impl Font {
         Self::from_face(path, 0, desktop_font::DEFAULT_DPI)
     }
 
+    /// Load a font from a file and nothing else. A character the file does not
+    /// cover rasterizes as .notdef rather than reaching fontconfig or the
+    /// colour emoji font: both lookups start already resolved to nothing found,
+    /// so neither lazy cell ever asks the system.
+    ///
+    /// Golden-frame tests render through this, which makes a frame a function
+    /// of bytes in the repository rather than of what the machine has
+    /// installed.
+    pub fn from_path_sealed(path: &Path) -> io::Result<Self> {
+        Ok(Font {
+            emoji: OnceCell::from(None),
+            discovery: OnceCell::from(None),
+            ..Self::from_path(path)?
+        })
+    }
+
     /// Load one face of a font file.
     fn from_face(path: &Path, index: i32, dpi: f32) -> io::Result<Self> {
         Ok(Font {

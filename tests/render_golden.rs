@@ -2,8 +2,10 @@
 //! PNG, failing when the frame moves.
 //!
 //! This is what catches a layout change nobody meant to make. The scene, the
-//! size, and the font are all pinned: the fixture font ships with the repo, so
-//! the result does not depend on which fonts the machine happens to have.
+//! size, and the font are all pinned, and the font is loaded sealed, so a
+//! character it does not cover draws .notdef instead of whatever the machine
+//! has installed. The fixture font is ASCII only, so the arrow in a palette
+//! label is one of those. A frame therefore depends on committed bytes alone.
 //!
 //! When a change to the rendering is intended, regenerate with:
 //!
@@ -153,7 +155,7 @@ enum Overlay {
 
 /// Render a scene through the same path both shells use.
 fn render(app: &state::App, overlay: Overlay) -> PixelBuffer {
-    let font = Font::from_path(&fixture("test-font.ttf")).expect("fixture font");
+    let font = Font::from_path_sealed(&fixture("test-font.ttf")).expect("fixture font");
     let snapshot = build_snapshot(app, |_| None);
     let mut ui = UiState::new();
     if overlay == Overlay::Palette {
