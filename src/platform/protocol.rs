@@ -63,6 +63,11 @@ pub mod evt {
     pub const DISPLAY_DELETE_ID: u16 = 1;
     pub const REGISTRY_GLOBAL: u16 = 0;
     pub const REGISTRY_GLOBAL_REMOVE: u16 = 1;
+    /// wl_surface.enter / .leave, naming an output the surface is shown on.
+    pub const SURFACE_ENTER: u16 = 0;
+    pub const SURFACE_LEAVE: u16 = 1;
+    /// wl_output.scale, the integer scale of that output.
+    pub const OUTPUT_SCALE: u16 = 3;
     pub const CALLBACK_DONE: u16 = 0;
     pub const SHM_FORMAT: u16 = 0;
     pub const BUFFER_RELEASE: u16 = 0;

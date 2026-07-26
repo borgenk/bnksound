@@ -5,6 +5,7 @@
 //! one-window lock, with the meter tick as its timeout, so an idle window does
 //! no work beyond the tick.
 
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
@@ -111,6 +112,16 @@ pub struct App {
     viewporter: u32,
     viewport: u32,
     scale: f32,
+    /// Integer scale per bound wl_output, which is all a compositor without
+    /// fractional scaling reports. Outputs come and go, so this is keyed by
+    /// object rather than kept in one slot.
+    output_scales: HashMap<u32, i32>,
+    /// The outputs the surface is currently shown on. A window straddling two
+    /// takes the larger of their scales, which is what leaves it sharp on both.
+    entered_outputs: Vec<u32>,
+    /// The integer scale last sent with set_buffer_scale, so an unchanged one
+    /// is not re-sent on every enter.
+    buffer_scale: i32,
 
     // Presentation: two buffers in one pool, alternated so a frame is never
     // painted into memory the compositor is still sampling.
@@ -216,6 +227,9 @@ impl App {
             fractional: 0,
             viewporter: 0,
             viewport: 0,
+            output_scales: HashMap::new(),
+            entered_outputs: Vec::new(),
+            buffer_scale: 1,
             scale: 1.0,
             pool: None,
             pool_obj: 0,
@@ -435,6 +449,23 @@ impl App {
                 self.bind_global(name, interface, version);
             }
             (_, evt::REGISTRY_GLOBAL_REMOVE) if msg.object == self.registry => {}
+            (_, evt::OUTPUT_SCALE) if self.output_scales.contains_key(&msg.object) => {
+                let factor = r.i32().unwrap_or(1).max(1);
+                self.output_scales.insert(msg.object, factor);
+                self.apply_output_scale();
+            }
+            (_, evt::SURFACE_ENTER) if msg.object == self.surface => {
+                let output = r.u32().unwrap_or(0);
+                if output != 0 && !self.entered_outputs.contains(&output) {
+                    self.entered_outputs.push(output);
+                }
+                self.apply_output_scale();
+            }
+            (_, evt::SURFACE_LEAVE) if msg.object == self.surface => {
+                let output = r.u32().unwrap_or(0);
+                self.entered_outputs.retain(|o| *o != output);
+                self.apply_output_scale();
+            }
             (_, evt::XDG_WM_BASE_PING) if msg.object == self.wm_base => {
                 let serial = r.u32().unwrap_or(0);
                 let wm = self.wm_base;
@@ -744,6 +775,7 @@ impl App {
             "wp_cursor_shape_manager_v1" => (&mut self.cursor_mgr, 1),
             "wp_fractional_scale_manager_v1" => (&mut self.fractional_mgr, 1),
             "wp_viewporter" => (&mut self.viewporter, 1),
+            "wl_output" => return self.bind_output(name, version),
             _ => return,
         };
         if *slot != 0 {
@@ -767,6 +799,56 @@ impl App {
                 },
             ],
         );
+    }
+
+    /// Bind one wl_output. Every output is bound, not just the first, since
+    /// which one the window lands on is not known until it enters.
+    fn bind_output(&mut self, name: u32, version: u32) {
+        // wl_output.scale arrives at version 2; below that a compositor reports
+        // no scale and 1 is all there is.
+        if version < 2 {
+            return;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.output_scales.insert(id, 1);
+        let registry = self.registry;
+        encode(
+            self.conn.out(),
+            registry,
+            req::REGISTRY_BIND,
+            &[
+                Arg::Uint(name),
+                Arg::Bind {
+                    interface: "wl_output",
+                    version: 2.min(version),
+                    new_id: id,
+                },
+            ],
+        );
+    }
+
+    /// Follow the integer scale of the outputs the window is on.
+    ///
+    /// Only for compositors without fractional scaling: with a viewport in
+    /// hand the fractional scale is finer and already drives the buffer size,
+    /// and mixing the two would scale the frame twice.
+    fn apply_output_scale(&mut self) {
+        // Outputs are bound during the registry roundtrip, so their scales can
+        // arrive before there is a surface to set one on.
+        if self.viewport != 0 || self.surface == 0 {
+            return;
+        }
+        let want = preferred_scale(&self.entered_outputs, &self.output_scales);
+        if want == self.buffer_scale {
+            return;
+        }
+        self.buffer_scale = want;
+        let surface = self.surface;
+        self.send(surface, req::SURFACE_SET_BUFFER_SCALE, &[Arg::Int(want)]);
+        // The buffers hold device pixels, so a new scale is a new buffer size.
+        self.scale = want as f32;
+        self.shell.ui.dirty.mark_full();
     }
 
     fn bind_seat(&mut self, caps: u32) {
@@ -1450,6 +1532,19 @@ fn resize_cursor(edge: ResizeEdge) -> u32 {
     }
 }
 
+/// The scale for a window shown on `entered`: the largest of those outputs'
+/// scales, so one straddling a 1x and a 2x screen stays sharp on the denser.
+/// An output with no scale reported, or none entered at all, counts as 1.
+fn preferred_scale(entered: &[u32], scales: &HashMap<u32, i32>) -> i32 {
+    entered
+        .iter()
+        .filter_map(|o| scales.get(o))
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
 /// Run the native shell until the compositor closes the window.
 ///
 /// A launch that finds a window already up hands itself over to it and returns
@@ -1474,6 +1569,31 @@ mod tests {
     /// Encode a configure's state array the way the compositor sends it.
     fn states(values: &[u32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_ne_bytes()).collect()
+    }
+
+    /// Outputs and the scales they reported.
+    fn scales(pairs: &[(u32, i32)]) -> HashMap<u32, i32> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_window_on_no_output_yet_draws_at_one() {
+        assert_eq!(preferred_scale(&[], &scales(&[(7, 2)])), 1);
+    }
+
+    #[test]
+    fn a_window_takes_the_scale_of_the_output_it_is_on() {
+        assert_eq!(preferred_scale(&[7], &scales(&[(7, 2), (8, 1)])), 2);
+    }
+
+    #[test]
+    fn a_window_across_two_outputs_takes_the_denser() {
+        assert_eq!(preferred_scale(&[8, 7], &scales(&[(7, 3), (8, 1)])), 3);
+    }
+
+    #[test]
+    fn an_output_that_reported_no_scale_counts_as_one() {
+        assert_eq!(preferred_scale(&[9], &scales(&[(7, 2)])), 1);
     }
 
     #[test]
