@@ -28,7 +28,7 @@ use crate::shell::Shell;
 use crate::state::Message;
 use crate::ui::input::{self, ClipboardAction, PointerAction};
 use crate::ui::meter::PEAK_DECAY_INTERVAL;
-use crate::ui::{CARET_BLINK, Chrome, Focus};
+use crate::ui::{CARET_BLINK, Chrome};
 
 pub fn activate(app: &gtk::Application) {
     if let Some(window) = app.active_window() {
@@ -127,14 +127,14 @@ fn wire_input(
     redraw: &Rc<dyn Fn()>,
 ) {
     let handler = {
-        let shell = Rc::clone(shell);
+        let shell_rc = Rc::clone(shell);
         let surface = Rc::clone(surface);
         let redraw = Rc::clone(redraw);
         let msg_tx = msg_tx.clone();
         let window = window.clone();
         Rc::new(move |event: Input| {
             let msgs = {
-                let mut shell = shell.borrow_mut();
+                let mut shell = shell_rc.borrow_mut();
                 let surface = surface.borrow();
                 let (w, h) = (
                     surface.widget.width().max(1),
@@ -175,8 +175,10 @@ fn wire_input(
                         }
                         if let Some(action) = input::clipboard_action(&shell.ui, key) {
                             drop(surface);
-                            clipboard(&window, &mut shell, action, &msg_tx);
+                            // Paste borrows the shell again when GDK answers,
+                            // so this one must be released first.
                             drop(shell);
+                            clipboard(&window, &shell_rc, &redraw, action, &msg_tx);
                             redraw();
                             return;
                         }
@@ -185,7 +187,7 @@ fn wire_input(
                     }
                 }
             };
-            shell.borrow_mut().dispatch(msgs);
+            shell_rc.borrow_mut().dispatch(msgs);
             redraw();
         })
     };
@@ -196,13 +198,15 @@ fn wire_input(
 /// Copy, cut, or paste for the focused editor, through GDK's clipboard.
 fn clipboard(
     window: &gtk::ApplicationWindow,
-    shell: &mut Shell,
+    shell: &Rc<RefCell<Shell>>,
+    redraw: &Rc<dyn Fn()>,
     action: ClipboardAction,
     msg_tx: &Sender<Message>,
 ) {
     let clipboard = WidgetExt::display(window).clipboard();
     match action {
         ClipboardAction::Copy | ClipboardAction::Cut => {
+            let mut shell = shell.borrow_mut();
             let Some(text) = shell.ui.editor.selected_text() else {
                 return;
             };
@@ -213,25 +217,34 @@ fn clipboard(
                     let _ = msg_tx.send(m);
                 }
             }
+            shell.ui.dirty.mark_full();
         }
-        // GDK reads asynchronously, so the paste lands a turn later and sends
-        // its own message rather than returning one.
+        // GDK reads asynchronously, so the text lands a turn later. It goes
+        // through the editor, which owns the caret, the selection, and the
+        // length limit; the message then carries what the editor now holds.
         ClipboardAction::Paste => {
-            let focus = shell.ui.focus;
+            let shell = Rc::clone(shell);
+            let redraw = Rc::clone(redraw);
             let msg_tx = msg_tx.clone();
             clipboard.read_text_async(gtk::gio::Cancellable::NONE, move |result| {
                 let Ok(Some(text)) = result else {
                     return;
                 };
-                let _ = msg_tx.send(match focus {
-                    Focus::Palette => Message::PaletteQueryChanged(text.to_string()),
-                    Focus::Modal => Message::ModalNameChanged(text.to_string()),
-                    Focus::Body => return,
-                });
+                let message = {
+                    let mut shell = shell.borrow_mut();
+                    if !shell.ui.editor.paste(&text) {
+                        return;
+                    }
+                    shell.ui.dirty.mark_full();
+                    input::editor_text_message(&shell.ui)
+                };
+                if let Some(m) = message {
+                    let _ = msg_tx.send(m);
+                }
+                redraw();
             });
         }
     }
-    shell.ui.dirty.mark_full();
 }
 
 /// Drain both buses whenever a producer wakes their fd.
