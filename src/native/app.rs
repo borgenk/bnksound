@@ -1040,6 +1040,12 @@ impl App {
 
     /// Read the current selection as text, if the clipboard holds any.
     fn read_selection(&mut self) -> Option<String> {
+        // Our own source answers a read with DATA_SOURCE_SEND, which arrives on
+        // the loop this call is blocking. Waiting for it would deadlock until
+        // the read gives up, so serve the text we already hold.
+        if self.data_source != 0 {
+            return Some(self.clipboard_text.clone());
+        }
         if self.selection_offer == 0 {
             return None;
         }
