@@ -1,6 +1,10 @@
 pub mod bus;
 pub mod command_palette;
 pub mod dbus;
+/// Development tooling: the perf gate, the table generator, the frame renderer.
+/// Behind a feature so the shipping binary carries none of it.
+#[cfg(feature = "dev")]
+pub mod dev;
 pub mod domain;
 pub mod geometry;
 pub mod meter;

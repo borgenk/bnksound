@@ -12,6 +12,15 @@ default-run = "bnksound"
 default = []
 gtk = ["dep:gtk4", "dep:gdk4-wayland"]
 
+# Development tooling (src/dev/): the perf gate, the Unicode table generator,
+# and the headless frame renderer, reached through flags on the native binary.
+# Off by default so none of it is compiled into what ships.
+dev = []
+# Installs the counting global allocator the perf gate reads. Separate from
+# `dev` because a global allocator taxes every allocation in the process, so
+# only the measuring build should carry it. `make perf` enables both.
+perf-alloc = ["dev"]
+
 # The default, GTK-free native binary.
 [[bin]]
 name = "bnksound"

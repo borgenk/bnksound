@@ -1,7 +1,7 @@
 .PHONY: fmt clippy build build-release build-linux install install-gtk \
 	install-assets run test check bump \
 	build-native build-native-release run-native \
-	build-gtk build-gtk-release run-gtk test-matrix
+	build-gtk build-gtk-release run-gtk test-matrix tables perf perf-save frame
 
 APP_NAME := bnksound
 APP_ID := io.github.borgenk.BnkSound
@@ -49,6 +49,33 @@ run-gtk:
 test-matrix:
 	cargo test
 	cargo test --features gtk
+
+# --- Development tooling (src/dev/) ------------------------------------------
+# All of it hangs off flags on the native binary, behind the `dev` feature, so
+# the shipping build carries none of it.
+
+# Regenerate the Unicode grapheme tables from the data vendored in ucd/. Pure,
+# offline, and deterministic: on an unchanged ucd/ this rewrites the committed
+# file with identical bytes.
+tables:
+	cargo run --features dev -- --gen-tables
+
+# Time the hot paths and compare against perf/baseline.txt, failing on a
+# regression. Release only: a debug build measures the wrong program. The
+# allocator that counts allocations comes in with perf-alloc. Not run in CI,
+# where a shared runner's timings say more about the runner than the code.
+perf:
+	cargo run --release --features perf-alloc -- --perf
+
+# Accept the current numbers as the new baseline, to be committed with whatever
+# change moved them.
+perf-save:
+	cargo run --release --features perf-alloc -- --perf --save
+
+# Paint one frame to a PNG without a compositor, for looking at the UI.
+# Pass a path, width, and height: make frame ARGS="out.png 800 900"
+frame:
+	cargo run --features dev -- --render-frame $(ARGS)
 
 # Install the release binary, desktop entry, and icons under ~/.local, the same
 # per-user location install.sh uses.
