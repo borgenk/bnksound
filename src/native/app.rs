@@ -89,6 +89,10 @@ pub struct App {
     decoration_mgr: u32,
     decoration: u32,
     activation: u32,
+    /// This launch's own activation token, spent on the first configure to ask
+    /// for focus the way a second launch asks on our behalf. Empty when the
+    /// desktop passed none.
+    startup_token: String,
     /// A token request in flight, which the compositor answers with a done
     /// event. Zero when none is outstanding.
     activation_token: u32,
@@ -165,7 +169,7 @@ pub struct App {
 impl App {
     /// Connect, bind globals, and map the toplevel. `instance` is the lock this
     /// launch took, which the loop watches for later ones.
-    pub fn new(instance: Option<Listener>) -> io::Result<Self> {
+    pub fn new(instance: Option<Listener>, startup_token: String) -> io::Result<Self> {
         let (runtime, msg_rx, evt_rx) = Runtime::boot()?;
         let mpris = mpris::init(runtime.sender());
         let font = Font::load()?;
@@ -202,6 +206,7 @@ impl App {
             decoration: 0,
             activation: 0,
             activation_token: 0,
+            startup_token,
             surface: 0,
             xdg_surface: 0,
             xdg_toplevel: 0,
@@ -444,8 +449,15 @@ impl App {
                 // compositor with no geometry to go on is left to invent a size
                 // for the window rather than honour the one it has.
                 self.set_window_geometry();
+                let first = !self.configured;
                 self.configured = true;
                 self.shell.ui.dirty.mark_full();
+                // The surface only exists to be activated once it is
+                // configured, and the token is good for one use.
+                if first {
+                    let token = std::mem::take(&mut self.startup_token);
+                    self.raise(&token);
+                }
             }
             (_, evt::XDG_TOPLEVEL_CONFIGURE) if msg.object == self.xdg_toplevel => {
                 let w = r.i32().unwrap_or(0);
@@ -1443,11 +1455,11 @@ fn resize_cursor(edge: ResizeEdge) -> u32 {
 /// A launch that finds a window already up hands itself over to it and returns
 /// before anything here is started, so the mixer runs one window per session.
 pub fn run() -> io::Result<()> {
-    let instance = match instance::claim() {
-        Launch::Run(listener) => listener,
+    let (instance, token) = match instance::claim() {
+        Launch::Run { listener, token } => (listener, token),
         Launch::HandedOver => return Ok(()),
     };
-    let mut app = App::new(instance)?;
+    let mut app = App::new(instance, token)?;
     while !app.closed {
         app.tick()?;
     }

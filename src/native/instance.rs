@@ -29,8 +29,12 @@ const TOKEN_VARS: [&str; 2] = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"];
 pub enum Launch {
     /// This process is the app. The listener answers later launches; None when
     /// the lock could not be taken at all, which leaves later launches to open
-    /// windows of their own.
-    Run(Option<Listener>),
+    /// windows of their own. The token is this launch's own, to raise the
+    /// window it is about to open.
+    Run {
+        listener: Option<Listener>,
+        token: String,
+    },
     /// A window was already up and has been asked to present itself, so this
     /// process has nothing left to do.
     HandedOver,
@@ -72,10 +76,14 @@ impl Drop for Listener {
 
 /// Claim the one-window lock for this Wayland session.
 pub fn claim() -> Launch {
+    let token = activation_token();
     let Some(path) = socket_path() else {
-        return Launch::Run(None);
+        return Launch::Run {
+            listener: None,
+            token,
+        };
     };
-    claim_at(&path, &activation_token())
+    claim_at(&path, &token)
 }
 
 /// Claim the lock at `path`, handing `token` over to whoever already holds it.
@@ -89,17 +97,26 @@ fn claim_at(path: &Path, token: &str) -> Launch {
                 // The loop polls this fd, so accept must never park the UI on a
                 // peer that connected and left again.
                 if sock.set_nonblocking(true).is_err() {
-                    return Launch::Run(None);
+                    return Launch::Run {
+                        listener: None,
+                        token: token.to_string(),
+                    };
                 }
-                return Launch::Run(Some(Listener {
-                    sock,
-                    path: path.to_path_buf(),
-                }));
+                return Launch::Run {
+                    listener: Some(Listener {
+                        sock,
+                        path: path.to_path_buf(),
+                    }),
+                    token: token.to_string(),
+                };
             }
             Err(e) => e,
         };
         if err.kind() != ErrorKind::AddrInUse {
-            return Launch::Run(None);
+            return Launch::Run {
+                listener: None,
+                token: token.to_string(),
+            };
         }
         match UnixStream::connect(path) {
             Ok(peer) => {
@@ -108,10 +125,18 @@ fn claim_at(path: &Path, token: &str) -> Launch {
             }
             // Bound with nobody listening: the socket outlived its process.
             Err(_) if std::fs::remove_file(path).is_ok() => {}
-            Err(_) => return Launch::Run(None),
+            Err(_) => {
+                return Launch::Run {
+                    listener: None,
+                    token: token.to_string(),
+                };
+            }
         }
     }
-    Launch::Run(None)
+    Launch::Run {
+        listener: None,
+        token: token.to_string(),
+    }
 }
 
 /// Hand this launch over to the running instance. Best effort: it either takes
@@ -189,9 +214,40 @@ mod tests {
     /// The listener a claim took, or a panic naming what it did instead.
     fn listener(launch: Launch) -> Listener {
         match launch {
-            Launch::Run(Some(listener)) => listener,
-            Launch::Run(None) => panic!("the lock was not taken"),
+            Launch::Run {
+                listener: Some(listener),
+                ..
+            } => listener,
+            Launch::Run { listener: None, .. } => panic!("the lock was not taken"),
             Launch::HandedOver => panic!("the launch was handed over"),
+        }
+    }
+
+    #[test]
+    fn the_launch_that_takes_the_lock_keeps_its_own_token() {
+        let path = path("keeps-token");
+        match claim_at(&path, "tok-first") {
+            Launch::Run { listener, token } => {
+                assert!(listener.is_some(), "the lock was there to take");
+                assert_eq!(
+                    token, "tok-first",
+                    "the window this launch opens has a token to raise itself with"
+                );
+            }
+            Launch::HandedOver => panic!("nothing was up to hand over to"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_launch_that_cannot_bind_still_carries_its_token() {
+        let path = Path::new("/bnksound-no-such-directory/instance.sock");
+        match claim_at(path, "tok-unbound") {
+            Launch::Run { listener, token } => {
+                assert!(listener.is_none(), "nothing could be bound");
+                assert_eq!(token, "tok-unbound");
+            }
+            Launch::HandedOver => panic!("there was nobody to hand over to"),
         }
     }
 
@@ -254,7 +310,7 @@ mod tests {
         // cannot be bound. The window still has to come up.
         let path = Path::new("/bnksound-no-such-directory/instance.sock");
         match claim_at(path, "") {
-            Launch::Run(None) => {}
+            Launch::Run { listener: None, .. } => {}
             _ => panic!("a failed lock must still let the app run"),
         }
     }
