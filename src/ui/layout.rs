@@ -1569,7 +1569,7 @@ mod tests {
     #[test]
     fn an_open_overlay_swallows_the_body_but_not_the_resize_edges() {
         let mut app = state::empty();
-        app.palette_open = true;
+        app.palette = Some(state::CommandPalette::default());
         let snap = build_snapshot(&app, |_| None);
         let mut ui = UiState::new();
         ui.chrome = Chrome::Client;
@@ -1852,9 +1852,11 @@ mod tests {
                 ..Default::default()
             });
         }
-        app.palette_open = true;
-        app.palette_scroll = scroll;
-        app.palette_selected = selected;
+        app.palette = Some(state::CommandPalette {
+            scroll,
+            selected,
+            ..state::CommandPalette::default()
+        });
         build_snapshot(&app, |_| None)
     }
 
@@ -1923,7 +1925,7 @@ mod tests {
     #[test]
     fn the_scrollbar_shows_only_when_the_list_outgrows_its_window() {
         let mut app = state::empty();
-        app.palette_open = true;
+        app.palette = Some(state::CommandPalette::default());
         // A fresh app offers a couple of commands, well inside one window.
         let short = build_snapshot(&app, |_| None);
         let layout = project(&short, &UiState::new(), content());

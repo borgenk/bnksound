@@ -239,10 +239,7 @@ mod tests {
             geometry: Geometry::default(),
             geometry_dirty: false,
             store_path: None,
-            palette_open: false,
-            palette_query: String::new(),
-            palette_selected: 0,
-            palette_scroll: 0,
+            palette: None,
             section_filter: crate::domain::SectionFilter::default(),
         }
     }

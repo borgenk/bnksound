@@ -254,7 +254,7 @@ fn mixer_scene() -> state::App {
 /// the two-tone labels, and the scrollbar beside them.
 fn palette_scene() -> state::App {
     let mut app = mixer_scene();
-    app.palette_open = true;
+    app.palette = Some(state::CommandPalette::default());
     app
 }
 

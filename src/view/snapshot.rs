@@ -315,7 +315,7 @@ fn profile_menu(state: &App) -> ProfileMenuView {
 }
 
 fn palette(state: &App) -> PaletteView {
-    if !state.palette_open {
+    let Some(palette) = &state.palette else {
         return PaletteView {
             open: false,
             query: String::new(),
@@ -324,21 +324,21 @@ fn palette(state: &App) -> PaletteView {
             selected: 0,
             scroll: 0,
         };
-    }
+    };
     let cmds = command_palette::build_commands(state);
-    let visible: Vec<usize> = command_palette::filter_commands(&cmds, &state.palette_query)
+    let visible: Vec<usize> = command_palette::filter_commands(&cmds, &palette.query)
         .into_iter()
         .take(command_palette::MAX_VISIBLE)
         .collect();
     let rows = visible.iter().map(|&i| cmds[i].label.clone()).collect();
     let messages = visible.iter().map(|&i| cmds[i].message.clone()).collect();
-    let selected = state.palette_selected.min(visible.len().saturating_sub(1));
-    let scroll = state
-        .palette_scroll
+    let selected = palette.selected.min(visible.len().saturating_sub(1));
+    let scroll = palette
+        .scroll
         .min(visible.len().saturating_sub(command_palette::VISIBLE_ROWS));
     PaletteView {
         open: true,
-        query: state.palette_query.clone(),
+        query: palette.query.clone(),
         rows,
         messages,
         selected,

@@ -74,16 +74,10 @@ pub struct App {
     /// Where to persist the unified state file. `None` disables on-disk
     /// persistence (tests, or environments missing XDG_CONFIG_HOME and HOME).
     pub store_path: Option<PathBuf>,
-    /// True while the Ctrl+K command palette overlay is visible.
-    pub palette_open: bool,
-    /// Live contents of the palette's search box. Cleared on close.
-    pub palette_query: String,
-    /// Highlighted-row index into the *filtered* command list, for Up/Down
-    /// navigation and the row Enter executes.
-    pub palette_selected: usize,
-    /// First row of the filtered list the panel shows. Navigation keeps the
-    /// selection inside the window it opens; the wheel moves it on its own.
-    pub palette_scroll: usize,
+    /// The Ctrl+K command palette while it is open, `None` while it is not.
+    /// Closing drops the state, so a query cannot outlive the panel that
+    /// showed it.
+    pub palette: Option<CommandPalette>,
     /// Live IN/OUT/APP column visibility. Seeded from the active profile,
     /// flipped by `ToggleSection`, folded back on save so each profile
     /// reopens with its own layout. Read via [`App::shows_section`].
@@ -110,6 +104,36 @@ impl App {
             }
         }
         any
+    }
+}
+
+/// The command palette's live state, held only while the overlay is open.
+///
+/// A default value is a freshly opened palette, which is what makes closing
+/// and reopening a reset rather than something the reducer has to remember to
+/// do field by field.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandPalette {
+    /// Live contents of the search box.
+    pub query: String,
+    /// Highlighted-row index into the *filtered* command list, for Up/Down
+    /// navigation and the row Enter executes.
+    pub selected: usize,
+    /// First row of the filtered list the panel shows. Navigation keeps the
+    /// selection inside the window it opens; the wheel moves it on its own.
+    pub scroll: usize,
+}
+
+impl CommandPalette {
+    /// Move the list so the selected row is on screen. The window is the
+    /// nominal one; a window too short for that many rows is layout's to
+    /// narrow further.
+    fn follow_selection(&mut self) {
+        self.scroll = command_palette::scroll_into_view(
+            self.scroll,
+            self.selected,
+            command_palette::VISIBLE_ROWS,
+        );
     }
 }
 
@@ -282,10 +306,7 @@ fn boot_from(store_path: Option<PathBuf>) -> App {
         geometry,
         geometry_dirty: false,
         store_path,
-        palette_open: false,
-        palette_query: String::new(),
-        palette_selected: 0,
-        palette_scroll: 0,
+        palette: None,
         section_filter: SectionFilter::default(),
     };
     ensure_active_profile(&mut app);
@@ -651,67 +672,73 @@ pub fn update(state: &mut App, message: Message, out: &mut Vec<Command>) {
         }
         Message::TogglePalette => {
             // A modal owns focus; don't stack the palette on top of it.
-            if state.modal.is_some() && !state.palette_open {
+            if state.modal.is_some() && state.palette.is_none() {
                 return;
             }
-            state.palette_open = !state.palette_open;
-            state.palette_query.clear();
-            state.palette_selected = 0;
-            state.palette_scroll = 0;
+            state.palette = match state.palette {
+                Some(_) => None,
+                None => Some(CommandPalette::default()),
+            };
         }
         Message::PaletteQueryChanged(q) => {
-            state.palette_query = q;
-            state.palette_selected = 0;
-            state.palette_scroll = 0;
+            if let Some(palette) = &mut state.palette {
+                palette.query = q;
+                palette.selected = 0;
+                palette.scroll = 0;
+            }
         }
         Message::PaletteSelectPrev => {
             let count = filtered_palette_count(state);
+            let Some(palette) = &mut state.palette else {
+                return;
+            };
             if count == 0 {
-                state.palette_selected = 0;
-                state.palette_scroll = 0;
+                palette.selected = 0;
+                palette.scroll = 0;
                 return;
             }
             let last = count - 1;
-            state.palette_selected = if state.palette_selected == 0 {
+            palette.selected = if palette.selected == 0 {
                 last
             } else {
-                state.palette_selected - 1
+                palette.selected - 1
             };
-            follow_palette_selection(state);
+            palette.follow_selection();
         }
         Message::PaletteSelectNext => {
             let count = filtered_palette_count(state);
+            let Some(palette) = &mut state.palette else {
+                return;
+            };
             if count == 0 {
-                state.palette_selected = 0;
-                state.palette_scroll = 0;
+                palette.selected = 0;
+                palette.scroll = 0;
                 return;
             }
             let last = count - 1;
-            state.palette_selected = if state.palette_selected >= last {
+            palette.selected = if palette.selected >= last {
                 0
             } else {
-                state.palette_selected + 1
+                palette.selected + 1
             };
-            follow_palette_selection(state);
+            palette.follow_selection();
         }
-        Message::PaletteScrollTo(row) => state.palette_scroll = row,
+        Message::PaletteScrollTo(row) => {
+            if let Some(palette) = &mut state.palette {
+                palette.scroll = row;
+            }
+        }
     }
 }
 
-/// Move the list so the selected row is on screen. The window is the nominal
-/// one; a window too short for that many rows is layout's to narrow further.
-fn follow_palette_selection(state: &mut App) {
-    state.palette_scroll = command_palette::scroll_into_view(
-        state.palette_scroll,
-        state.palette_selected,
-        command_palette::VISIBLE_ROWS,
-    );
-}
-
-/// Palette rows matching the current query, capped at `MAX_VISIBLE`.
+/// Palette rows matching the current query, capped at `MAX_VISIBLE`. Zero when
+/// the palette is closed, since a closed one filters nothing.
 fn filtered_palette_count(state: &App) -> usize {
+    let Some(palette) = &state.palette else {
+        return 0;
+    };
     let cmds = command_palette::build_commands(state);
-    let filtered = command_palette::filter_commands(&cmds, &state.palette_query);
+    let filtered = command_palette::filter_commands(&cmds, &palette.query);
     filtered.len().min(command_palette::MAX_VISIBLE)
 }
 
@@ -1297,10 +1324,7 @@ mod tests {
             geometry: Geometry::default(),
             geometry_dirty: false,
             store_path: None,
-            palette_open: false,
-            palette_query: String::new(),
-            palette_selected: 0,
-            palette_scroll: 0,
+            palette: None,
             section_filter: SectionFilter::default(),
         }
     }
@@ -2309,31 +2333,37 @@ mod tests {
     #[test]
     fn toggle_palette_opens_and_closes_with_reset() {
         let mut state = boot_state();
-        state.palette_query = "leftover".into();
-        state.palette_selected = 5;
 
         update(&mut state, Message::TogglePalette);
-        assert!(state.palette_open);
-        assert!(state.palette_query.is_empty());
-        assert_eq!(state.palette_selected, 0);
+        assert!(palette(&state).query.is_empty());
+        assert_eq!(palette(&state).selected, 0);
 
-        state.palette_query = "typed".into();
-        state.palette_selected = 3;
+        // Type into it and close: the state goes with the panel.
+        state.palette = Some(CommandPalette {
+            query: "typed".into(),
+            selected: 3,
+            ..CommandPalette::default()
+        });
         update(&mut state, Message::TogglePalette);
-        assert!(!state.palette_open);
-        assert!(state.palette_query.is_empty());
-        assert_eq!(state.palette_selected, 0);
+        assert!(state.palette.is_none());
+
+        // Reopening starts clean rather than restoring what was typed.
+        update(&mut state, Message::TogglePalette);
+        assert!(palette(&state).query.is_empty());
+        assert_eq!(palette(&state).selected, 0);
     }
 
     #[test]
     fn palette_query_change_resets_selection() {
         let mut state = boot_state();
-        state.palette_open = true;
-        state.palette_selected = 4;
+        state.palette = Some(CommandPalette {
+            selected: 4,
+            ..CommandPalette::default()
+        });
 
         update(&mut state, Message::PaletteQueryChanged("mute".into()));
-        assert_eq!(state.palette_query, "mute");
-        assert_eq!(state.palette_selected, 0);
+        assert_eq!(palette(&state).query, "mute");
+        assert_eq!(palette(&state).selected, 0);
     }
 
     #[test]
@@ -2556,13 +2586,13 @@ mod tests {
     #[test]
     fn palette_select_next_and_prev_wrap_within_filtered_count() {
         let mut state = boot_state();
-        state.palette_open = true;
+        state.palette = Some(CommandPalette::default());
         // No streams, no profiles → only "profile: create" matches, so
         // the visible window has exactly one row.
         update(&mut state, Message::PaletteSelectNext);
-        assert_eq!(state.palette_selected, 0, "single-row list stays put");
+        assert_eq!(palette(&state).selected, 0, "single-row list stays put");
         update(&mut state, Message::PaletteSelectPrev);
-        assert_eq!(state.palette_selected, 0);
+        assert_eq!(palette(&state).selected, 0);
 
         // Two profiles add enough commands for navigation to move.
         state.profiles.insert_or_replace(Profile {
@@ -2575,19 +2605,19 @@ mod tests {
         });
 
         update(&mut state, Message::PaletteSelectNext);
-        assert_eq!(state.palette_selected, 1);
+        assert_eq!(palette(&state).selected, 1);
         update(&mut state, Message::PaletteSelectPrev);
-        assert_eq!(state.palette_selected, 0);
+        assert_eq!(palette(&state).selected, 0);
         // Wrap-around from the top.
         update(&mut state, Message::PaletteSelectPrev);
         let cmd_count = command_palette::build_commands(&state).len();
-        assert_eq!(state.palette_selected, cmd_count - 1);
+        assert_eq!(palette(&state).selected, cmd_count - 1);
     }
 
     /// A palette with more commands than the list can show at once.
     fn long_palette_state() -> App {
         let mut state = boot_state();
-        state.palette_open = true;
+        state.palette = Some(CommandPalette::default());
         for i in 0..command_palette::VISIBLE_ROWS + 4 {
             state.profiles.insert_or_replace(Profile {
                 name: format!("profile {i}"),
@@ -2607,15 +2637,17 @@ mod tests {
         for _ in 0..command_palette::VISIBLE_ROWS - 1 {
             update(&mut state, Message::PaletteSelectNext);
         }
-        assert_eq!(state.palette_selected, command_palette::VISIBLE_ROWS - 1);
+        assert_eq!(palette(&state).selected, command_palette::VISIBLE_ROWS - 1);
         assert_eq!(
-            state.palette_scroll, 0,
+            palette(&state).scroll,
+            0,
             "the last visible row needs no scroll"
         );
 
         update(&mut state, Message::PaletteSelectNext);
         assert_eq!(
-            state.palette_scroll, 1,
+            palette(&state).scroll,
+            1,
             "one row past the window moves it one"
         );
     }
@@ -2629,36 +2661,41 @@ mod tests {
 
         // Up from the first row wraps to the last, which is off the bottom.
         update(&mut state, Message::PaletteSelectPrev);
-        assert_eq!(state.palette_selected, count - 1);
+        assert_eq!(palette(&state).selected, count - 1);
         assert_eq!(
-            state.palette_scroll,
+            palette(&state).scroll,
             count - command_palette::VISIBLE_ROWS,
             "the window ends on the last row"
         );
 
         // Down from the last row wraps to the first, back at the top.
         update(&mut state, Message::PaletteSelectNext);
-        assert_eq!(state.palette_selected, 0);
-        assert_eq!(state.palette_scroll, 0);
+        assert_eq!(palette(&state).selected, 0);
+        assert_eq!(palette(&state).scroll, 0);
     }
 
     #[test]
     fn a_new_query_puts_the_list_back_at_the_top() {
         let mut state = long_palette_state();
         update(&mut state, Message::PaletteSelectPrev);
-        assert!(state.palette_scroll > 0);
+        assert!(palette(&state).scroll > 0);
 
         update(&mut state, Message::PaletteQueryChanged("profile".into()));
-        assert_eq!(state.palette_scroll, 0);
-        assert_eq!(state.palette_selected, 0);
+        assert_eq!(palette(&state).scroll, 0);
+        assert_eq!(palette(&state).selected, 0);
     }
 
     #[test]
     fn scrolling_the_list_leaves_the_selection_where_it_was() {
         let mut state = long_palette_state();
         update(&mut state, Message::PaletteScrollTo(3));
-        assert_eq!(state.palette_scroll, 3);
-        assert_eq!(state.palette_selected, 0, "the wheel selects nothing");
+        assert_eq!(palette(&state).scroll, 3);
+        assert_eq!(palette(&state).selected, 0, "the wheel selects nothing");
+    }
+
+    /// The open palette. Every caller has just opened one.
+    fn palette(state: &App) -> &CommandPalette {
+        state.palette.as_ref().expect("the palette is open")
     }
 
     fn source_stream(id: u32, node_name: &str) -> AudioStream {

@@ -1195,7 +1195,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        app.palette_open = true;
+        app.palette = Some(state::CommandPalette::default());
 
         let f = font();
         let snap = build_snapshot(&app, |_| None);

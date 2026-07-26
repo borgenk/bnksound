@@ -948,7 +948,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        app.palette_open = true;
+        app.palette = Some(state::CommandPalette::default());
         let snap = build_snapshot(&app, |_| None);
         let mut ui = UiState::new();
         ui.focus = Focus::Palette;
@@ -1168,8 +1168,10 @@ mod tests {
     /// A scene with the palette open, so the overlay geometry exists.
     fn palette_scene(query: &str) -> (UiState, Layout, ViewSnapshot) {
         let mut app = state::empty();
-        app.palette_open = true;
-        app.palette_query = query.to_string();
+        app.palette = Some(state::CommandPalette {
+            query: query.to_string(),
+            ..state::CommandPalette::default()
+        });
         let snap = build_snapshot(&app, |_| None);
         let mut ui = UiState::new();
         ui.focus = Focus::Palette;
