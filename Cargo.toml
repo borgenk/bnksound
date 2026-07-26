@@ -2,15 +2,39 @@
 name = "bnksound"
 version = "0.2.0"
 edition = "2024"
+# Two binaries ship, so `cargo run` needs to be told which one it means.
+default-run = "bnksound"
 
+[features]
+# The shipping app is the native Wayland one and pulls in no GTK stack at all.
+# `--features gtk` adds the second binary for anyone who wants GTK to own the
+# window; both paint through the same software renderer.
+default = []
+gtk = ["dep:gtk4", "dep:gdk4-wayland"]
+
+# Development tooling (src/dev/): the perf gate, the Unicode table generator,
+# and the headless frame renderer, reached through flags on the native binary.
+# Off by default so none of it is compiled into what ships.
+dev = []
+# Installs the counting global allocator the perf gate reads. Separate from
+# `dev` because a global allocator taxes every allocation in the process, so
+# only the measuring build should carry it. `make perf` enables both.
+perf-alloc = ["dev"]
+
+# The default, GTK-free native binary.
 [[bin]]
 name = "bnksound"
-path = "src/main.rs"
+path = "src/bin/bnksound.rs"
+
+# The GTK binary needs the gtk feature to build.
+[[bin]]
+name = "bnksound-gtk"
+path = "src/bin/bnksound-gtk.rs"
+required-features = ["gtk"]
 
 [dependencies]
-async-channel = "2"
-gtk4 = { version = "0.11", default-features = false }
-gdk4-wayland = { version = "0.11", default-features = false }
+gtk4 = { version = "0.11", optional = true, default-features = false }
+gdk4-wayland = { version = "0.11", optional = true, default-features = false }
 pipewire = "0.10"
 libspa = "0.10"
 libspa-sys = "0.10"

@@ -7,15 +7,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::domain::{Stream as AudioStream, linear_to_cubic};
 use crate::state;
-use crate::ui::row::AppRowInfo;
-use crate::xdg::XdgInfo;
+use crate::view::rows::AppRowInfo;
 
-/// Precomputed meter routing for one app-stream node: which app_rows entries
-/// its peak feeds. Built by render_plan so apply_peak is a pure lookup.
-/// member_key is Some only while the group is expanded.
+/// Precomputed meter routing for one app-stream node: which rows its peak
+/// feeds. Built by render_plan so applying a peak is a pure lookup.
 pub(crate) struct AppPeakRoute {
     pub(crate) group_key: Box<str>,
-    pub(crate) member_key: Option<Box<str>>,
+    /// Whether the node also has a sub-row of its own, which is true only while
+    /// its group is expanded.
+    pub(crate) has_member_row: bool,
 }
 
 /// One rendered app column: a collapsed group row or a per-member sub-row of
@@ -28,13 +28,8 @@ pub(crate) enum RenderedAppRow<'a> {
         group: &'a AppRowGroup<'a>,
         expanded: bool,
     },
-    /// Sub-row for one stream in an expanded group. parent_key lets the
-    /// collapse button fold back; parent_xdg reuses the group's app icon.
-    Member {
-        parent_key: &'a str,
-        parent_xdg: Option<&'a XdgInfo>,
-        stream: &'a AudioStream,
-    },
+    /// Sub-row for one stream in an expanded group.
+    Member { stream: &'a AudioStream },
 }
 
 /// One collapsed app row: every stream sharing a [`state::app_row_key`] lands
@@ -66,13 +61,6 @@ impl<'a> AppRowGroup<'a> {
         (min_seq, min_id)
     }
 
-    /// Stable representative member (lowest id, so it doesn't flicker on
-    /// registry reorders) sourcing the group's name + xdg icon, reused for
-    /// sub-row icons.
-    fn icon_source(&self) -> Option<&'a AudioStream> {
-        self.members.iter().min_by_key(|s| s.id).copied()
-    }
-
     /// Collapse member state into the aggregate handed to [`update_app_row`].
     /// Master cubic is max-of-members; all_muted requires every member muted;
     /// effective_target resolves only when every member shares one pin.
@@ -100,27 +88,24 @@ impl<'a> AppRowGroup<'a> {
         };
         // Stable representative (lowest id) sources the name + xdg so the label
         // doesn't shuffle on registry reorders.
-        let rep = self
-            .members
-            .iter()
-            .min_by_key(|s| s.id)
-            .copied()
-            .expect("non-empty group");
+        let rep = self.members.iter().copied().min_by_key(|s| s.id);
         // MPRIS enrichment only for single-stream groups (a multi-tab group
         // would mislabel with one tab's title). The title replaces the app name
         // outright since the icon already identifies the app.
-        let display_name = if self.members.len() == 1
-            && let Some(pid) = rep.pid.as_deref().and_then(|p| p.parse::<u32>().ok())
-            && let Some(title) = resolve_title(pid)
-        {
-            title
-        } else {
-            rep.display_name().to_string()
+        let display_name = match rep {
+            Some(rep) if self.members.len() == 1 => rep
+                .pid
+                .as_deref()
+                .and_then(|p| p.parse::<u32>().ok())
+                .and_then(&resolve_title)
+                .unwrap_or_else(|| rep.display_name().to_string()),
+            Some(rep) => rep.display_name().to_string(),
+            None => String::new(),
         };
         AppRowInfo {
             key: &self.key,
             display_name,
-            xdg: rep.xdg.as_ref(),
+            xdg: rep.and_then(|s| s.xdg.as_ref()),
             master_cubic,
             all_muted,
             effective_target,
@@ -156,41 +141,28 @@ pub(crate) fn group_app_streams<'a>(
 /// Flatten ordered groups into the render sequence plus the per-node peak
 /// routes. The group row is always emitted (the proportional master); member
 /// sub-rows are added only when the group is expanded with more than one
-/// stream. Each rendered row is paired with its app_rows key: group rows reuse
-/// their group key, member sub-rows use member:<id> so the two never collide
-/// even for a single-member node:<id> group.
+/// stream.
 pub(crate) fn render_plan<'a>(
     groups: &'a [AppRowGroup<'a>],
     expanded_groups: &HashSet<String>,
-) -> (
-    Vec<(String, RenderedAppRow<'a>)>,
-    HashMap<u32, AppPeakRoute>,
-) {
-    let mut rendered: Vec<(String, RenderedAppRow<'a>)> = Vec::new();
+) -> (Vec<RenderedAppRow<'a>>, HashMap<u32, AppPeakRoute>) {
+    let mut rendered: Vec<RenderedAppRow<'a>> = Vec::new();
     let mut routes: HashMap<u32, AppPeakRoute> = HashMap::new();
     for g in groups {
         let expanded = expanded_groups.contains(&g.key) && g.members.len() > 1;
-        rendered.push((g.key.clone(), RenderedAppRow::Group { group: g, expanded }));
+        rendered.push(RenderedAppRow::Group { group: g, expanded });
         for s in &g.members {
             // Every member feeds the group row; the member sub-row only exists
             // while the group is expanded.
-            let member_key = expanded.then(|| format!("member:{}", s.id));
             routes.insert(
                 s.id,
                 AppPeakRoute {
                     group_key: g.key.as_str().into(),
-                    member_key: member_key.clone().map(String::into_boxed_str),
+                    has_member_row: expanded,
                 },
             );
-            if let Some(member_key) = member_key {
-                rendered.push((
-                    member_key,
-                    RenderedAppRow::Member {
-                        parent_key: g.key.as_str(),
-                        parent_xdg: g.icon_source().and_then(|s| s.xdg.as_ref()),
-                        stream: s,
-                    },
-                ));
+            if expanded {
+                rendered.push(RenderedAppRow::Member { stream: s });
             }
         }
     }
@@ -278,20 +250,29 @@ mod tests {
         // Collapsed: one group row, no members.
         let (rows, routes) = render_plan(&groups, &HashSet::new());
         assert_eq!(rows.len(), 1);
-        assert!(matches!(rows[0].1, RenderedAppRow::Group { .. }));
+        assert!(matches!(
+            rows[0],
+            RenderedAppRow::Group {
+                expanded: false,
+                ..
+            }
+        ));
         // Both nodes route to the group, no member sub-row.
         assert_eq!(routes[&1].group_key.as_ref(), key.as_str());
-        assert!(routes[&1].member_key.is_none());
-        assert!(routes[&2].member_key.is_none());
+        assert!(!routes[&1].has_member_row);
+        assert!(!routes[&2].has_member_row);
 
-        // Expanded: group row + one member row per stream.
+        // Expanded: group row + one member row per stream, in member order.
         let expanded: HashSet<String> = [key.clone()].into_iter().collect();
         let (rows, routes) = render_plan(&groups, &expanded);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].0, key);
-        assert_eq!(rows[1].0, "member:1");
-        assert_eq!(rows[2].0, "member:2");
-        assert_eq!(routes[&1].member_key.as_deref(), Some("member:1"));
+        assert!(
+            matches!(&rows[0], RenderedAppRow::Group { group, expanded: true } if group.key == key)
+        );
+        assert!(matches!(&rows[1], RenderedAppRow::Member { stream } if stream.id == 1));
+        assert!(matches!(&rows[2], RenderedAppRow::Member { stream } if stream.id == 2));
+        assert!(routes[&1].has_member_row);
+        assert!(routes[&2].has_member_row);
     }
 
     #[test]
@@ -304,7 +285,7 @@ mod tests {
         let expanded: HashSet<String> = [groups[0].key.clone()].into_iter().collect();
         let (rows, routes) = render_plan(&groups, &expanded);
         assert_eq!(rows.len(), 1);
-        assert!(routes[&1].member_key.is_none());
+        assert!(!routes[&1].has_member_row);
     }
 
     #[test]

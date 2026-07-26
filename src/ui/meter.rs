@@ -1,208 +1,271 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+//! Meter visual model: the decayed per-row peaks and the pure math that maps a
+//! linear amplitude to a lit segment fraction and a color tier.
+//!
+//! The audio threads fold raw peaks into the shared pool; each frame the shell
+//! decays every bar and folds in the newest reading (decay first, so a fresh
+//! reading lands at full height). Drawing reads the lit fraction and tier from
+//! here, keeping the level scale (dB) distinct from the slider's gain curve.
+
+use std::collections::HashMap;
 use std::time::Duration;
 
-use gtk4 as gtk;
-use gtk4::cairo;
-use gtk4::prelude::*;
+use crate::ui::layout::RowId;
 
-use crate::domain::StreamKind;
-use crate::meter::PeakPool;
-use crate::state::App;
-use crate::ui::Widgets;
-use crate::ui::row::RowWidgets;
-use crate::ui::theme::Palette;
+/// Width of a segmented meter strip, in logical pixels.
+pub const METER_WIDTH: i32 = 18;
+/// Whole pixels from one cell to the next, its gap included.
+///
+/// The pitch is kept whole so every rung is the same size with sharp edges. A
+/// meter's height varies with the window, so a fixed number of cells would put
+/// them on a fractional pitch, which can only be drawn by spreading the edges
+/// over partial rows; at this size that reads as blur.
+///
+/// Whole pixels leave a choice between few thick rungs and many thin ones, and
+/// the rungs are what the meter is read by, so they get the rows: three of cell
+/// to one of gap. Fewer than that and the ladder thins out toward a grid of
+/// lines, which is harder to judge a level from than a stack of blocks.
+pub const CELL_PITCH: i32 = 4;
+/// Rows of background between one cell and the next.
+pub const CELL_GAP: i32 = 1;
+// A gap as wide as the pitch would leave no cell to draw.
+const _: () = assert!(CELL_GAP < CELL_PITCH);
 
-/// Width of the segmented meter strip, in pixels (two stereo bars side-by-side).
-const METER_WIDTH: i32 = 18;
-/// Shared height of the slider track and the meter beside it; the tallest
-/// item in a column, so it sets the window's minimum height.
-pub(super) const SLIDER_TRACK_HEIGHT: i32 = 140;
-/// Segments stacked vertically in each meter (~2 px each over the track height).
-const METER_SEGMENTS: i32 = 72;
+/// How many cells fit a meter `height` rows tall.
+pub fn segments_for(height: i32) -> i32 {
+    (height / CELL_PITCH).max(1)
+}
+/// Bars drawn before a stream has reported how many channels it carries.
+/// Nearly everything is stereo, and a second bar appearing beside the first
+/// once audio starts is more noticeable than one that was always there.
+pub const ASSUMED_CHANNELS: usize = 2;
 /// Bottom of the meter's dB scale, matching consumer level meters.
-const METER_DB_FLOOR: f32 = -60.0;
-/// Decay multiplier per tick: classic PPM ballistic (fast attack, slow
-/// release), dropping the bar to ~10% in roughly 3 seconds.
-pub(super) const PEAK_DECAY: f32 = 0.988;
-/// How often `Widgets::decay_meters` should be called (16 ms ≈ 60 Hz).
+pub const METER_DB_FLOOR: f32 = -60.0;
+/// Decay multiplier per tick: fast attack, slow release, dropping the bar to
+/// about 10% in roughly 3 seconds.
+pub const PEAK_DECAY: f32 = 0.988;
+/// Meter tick interval (16 ms is about 60 Hz).
 pub const PEAK_DECAY_INTERVAL: Duration = Duration::from_millis(16);
+/// Below this the bar is treated as fully decayed and snapped to zero.
+const DECAY_FLOOR: f32 = 0.001;
 
-/// Vertical segmented level meter. Returns the DrawingArea and the
-/// `Vec` that holds the latest per-channel peaks (0.0 – 1.0+ each).
-/// Mutate the vec via the `RefCell` and `queue_draw` to update visually.
-pub(super) fn build_meter(palette: Palette) -> (gtk::DrawingArea, Rc<RefCell<Vec<f32>>>) {
-    let peaks = Rc::new(RefCell::new(Vec::<f32>::new()));
-    let area = gtk::DrawingArea::builder()
-        .content_width(METER_WIDTH)
-        .vexpand(true)
-        .height_request(SLIDER_TRACK_HEIGHT)
-        // Match the slider's thumb-overshoot margins so the meter doesn't
-        // outrun the track. Tuned by eye against the thumb config.
-        .margin_top(12)
-        .margin_bottom(12)
-        .build();
-
-    let peaks_for_draw = peaks.clone();
-    area.set_draw_func(move |_, cr, w, h| {
-        let snap = peaks_for_draw.borrow();
-        draw_meter(&palette, cr, w, h, &snap);
-    });
-
-    (area, peaks)
-}
-
-/// Paint one segmented bar per channel, side-by-side within `w` x `h`.
-/// An empty peaks slice (no peak folded in yet, or worker hasn't
-/// learned the format) renders a single dim bar across the full width.
-fn draw_meter(palette: &Palette, cr: &cairo::Context, w: i32, h: i32, peaks: &[f32]) {
-    let n_bars = peaks.len().max(1);
-    let total_gap = (n_bars - 1) as f64;
-    // 1 px between bars; min bar width 1 px so many channels still draw something.
-    let bar_w = ((w as f64 - total_gap) / n_bars as f64).max(1.0);
-
-    for i in 0..n_bars {
-        let x = i as f64 * (bar_w + 1.0);
-        let peak = peaks.get(i).copied().unwrap_or(0.0);
-        draw_meter_bar(palette, cr, x, bar_w, h, peak);
+/// How many bars a row's meter shows. A row with no readings yet is drawn as
+/// stereo rather than collapsed to one bar it would then have to grow out of.
+pub fn bar_count(channels: usize) -> usize {
+    if channels == 0 {
+        ASSUMED_CHANNELS
+    } else {
+        channels
     }
 }
 
-/// Paint a single segmented bar at horizontal offset `x` with width
-/// `bar_w`. Segments below the current peak light up in neutral /
-/// green / yellow / red tiers; the rest stay dim. The dB level scale here
-/// is intentionally distinct from the slider's cubic gain curve.
-fn draw_meter_bar(palette: &Palette, cr: &cairo::Context, x: f64, bar_w: f64, h: i32, peak: f32) {
-    let segments = METER_SEGMENTS;
-    // Sub-pixel gap keeps the cell:gap proportions readable at 2 px cells.
-    let gap = 0.5;
-    let seg_h = (h as f64 - gap * (segments as f64 - 1.0)) / segments as f64;
-    // Map raw linear amplitude to a dB scale (METER_DB_FLOOR at the bottom,
-    // 0 dB at the top) like a classic VU/PPM meter.
+/// The color tier of a lit segment. Drawing resolves it to a palette color.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    Neutral,
+    Green,
+    Amber,
+    Red,
+}
+
+/// Fraction (0..=1) of the bar that should light for a linear peak, on the dB
+/// scale from METER_DB_FLOOR at the bottom to 0 dB at the top.
+pub fn lit_fraction(peak: f32) -> f32 {
     let db = 20.0 * peak.max(1e-6).log10();
-    let normalized = ((db - METER_DB_FLOOR) / -METER_DB_FLOOR).clamp(0.0, 1.0);
-    // Fractional, not rounded, so the topmost segment fills proportionally
-    // instead of snapping (which produced the stepping/flicker look).
-    let lit_segments_f = normalized * segments as f32;
-    // Tier thresholds: neutral up to 55%, green to 70%, yellow to 90%, red above.
-    let green_threshold = (segments as f32 * 0.55) as i32;
-    let yellow_threshold = (segments as f32 * 0.70) as i32;
-    let red_threshold = (segments as f32 * 0.90) as i32;
+    ((db - METER_DB_FLOOR) / -METER_DB_FLOOR).clamp(0.0, 1.0)
+}
 
-    // The unlit "off" grid is one colour for every segment; resolve once.
-    let (off_r, off_g, off_b, off_a) = palette.dim_grid.rgba_f64();
-
-    for i in 0..segments {
-        // Stack from the bottom up: segment 0 is quiet, last is clipping.
-        let from_bottom = i;
-        let y = h as f64 - (from_bottom as f64 + 1.0) * seg_h - from_bottom as f64 * gap;
-
-        // Dim "off" background for the full segment (shares @bnk_dim_grid
-        // with the slider trough so both read as the same "off" surface).
-        cr.set_source_rgba(off_r, off_g, off_b, off_a);
-        cr.rectangle(x, y, bar_w, seg_h);
-        let _ = cr.fill();
-
-        // Overlay the lit portion: coverage is the fraction of this segment
-        // to fill (rising from its bottom).
-        let coverage = (lit_segments_f - from_bottom as f32).clamp(0.0, 1.0) as f64;
-        if coverage > 0.0 {
-            let (r, g, b, a) = if from_bottom >= red_threshold {
-                palette.meter_red.rgba_f64()
-            } else if from_bottom >= yellow_threshold {
-                palette.meter_amber.rgba_f64()
-            } else if from_bottom >= green_threshold {
-                palette.meter_green.rgba_f64()
-            } else {
-                // Calm gray-blue: clearly lit but quiet, so a meter at
-                // normal level doesn't read as a constant alarm.
-                palette.meter_neutral.rgba_f64()
-            };
-            let fill_h = seg_h * coverage;
-            let fill_y = y + (seg_h - fill_h);
-            cr.set_source_rgba(r, g, b, a);
-            cr.rectangle(x, fill_y, bar_w, fill_h);
-            let _ = cr.fill();
-        }
+/// The tier of segment `from_bottom` (0 = quietest) of `total`. Neutral up to
+/// 55%, green to 70%, amber to 90%, red above.
+pub fn segment_tier(from_bottom: i32, total: i32) -> Tier {
+    let green = (total as f32 * 0.55) as i32;
+    let amber = (total as f32 * 0.70) as i32;
+    let red = (total as f32 * 0.90) as i32;
+    if from_bottom >= red {
+        Tier::Red
+    } else if from_bottom >= amber {
+        Tier::Amber
+    } else if from_bottom >= green {
+        Tier::Green
+    } else {
+        Tier::Neutral
     }
 }
 
-impl Widgets {
-    /// Paint the peaks the audio threads folded into pool, then ease every bar
-    /// down. Decay runs first so a fresh reading lands at full height this frame
-    /// (it wins the max in apply_peak).
-    pub fn pump_meters(&self, state: &App, pool: &PeakPool) {
-        self.decay_meters();
-        pool.drain(|node_id, peaks| self.apply_peak(state, node_id, peaks));
+/// How much of segment `from_bottom` fills for a lit fraction, 0..=1. The top
+/// lit segment fills proportionally rather than snapping, which avoids stepping.
+pub fn segment_coverage(lit: f32, total: i32, from_bottom: i32) -> f32 {
+    let lit_segments = lit * total as f32;
+    (lit_segments - from_bottom as f32).clamp(0.0, 1.0)
+}
+
+/// One decay step for a single bar value.
+fn decayed(v: f32) -> f32 {
+    let next = v * PEAK_DECAY;
+    if next < DECAY_FLOOR { 0.0 } else { next }
+}
+
+/// Per-row decayed peaks: the meter's retained visual state.
+#[derive(Default)]
+pub struct MeterState {
+    rows: HashMap<RowId, Vec<f32>>,
+}
+
+impl MeterState {
+    pub fn new() -> Self {
+        MeterState::default()
     }
 
-    /// Apply fresh per-channel peak readings. Sinks feed at most one row; app
-    /// streams feed their group row, plus the matching member sub-row when the
-    /// group is expanded.
-    pub fn apply_peak(&self, state: &App, node_id: u32, peaks: &[f32]) {
-        let Some(s) = state.streams.get(&node_id) else {
-            return;
-        };
-        match s.kind {
-            StreamKind::Sink => {
-                if let Some(row) = self.sink_rows.get(&node_id) {
-                    Self::feed_meter(row, peaks);
-                }
-            }
-            StreamKind::Source => {
-                if let Some(row) = self.source_rows.get(&node_id) {
-                    Self::feed_meter(row, peaks);
-                }
-            }
-            StreamKind::Application => {
-                // Routing is precomputed by app_group::render_plan.
-                let Some(route) = self.app_peak_routes.get(&node_id) else {
-                    return;
-                };
-                if let Some(row) = self.app_rows.get(route.group_key.as_ref()) {
-                    Self::feed_meter(row, peaks);
-                }
-                if let Some(member_key) = route.member_key.as_deref()
-                    && let Some(row) = self.app_rows.get(member_key)
-                {
-                    Self::feed_meter(row, peaks);
+    /// Ease every bar of every row toward zero. Runs once per tick, before the
+    /// fresh readings are folded in. Reports whether any bar moved, so a silent
+    /// window can skip repainting entirely.
+    pub fn decay(&mut self) -> bool {
+        let mut changed = false;
+        for channels in self.rows.values_mut() {
+            for v in channels.iter_mut() {
+                let next = decayed(*v);
+                if next != *v {
+                    *v = next;
+                    changed = true;
                 }
             }
         }
+        changed
     }
 
-    /// Raise one row's per-channel bars to max(current, incoming) and queue a
-    /// redraw, resizing on channel-count change.
-    fn feed_meter(row: &RowWidgets, peaks: &[f32]) {
-        let mut current = row.peaks.borrow_mut();
-        if current.len() != peaks.len() {
-            current.resize(peaks.len(), 0.0);
+    /// Fold fresh per-channel peaks into a row, keeping the louder of current
+    /// and incoming. Resizes on a channel-count change. Reports whether any bar
+    /// rose.
+    pub fn apply(&mut self, row: &RowId, peaks: &[f32]) -> bool {
+        let channels = self.rows.entry(row.clone()).or_default();
+        let mut changed = false;
+        if channels.len() != peaks.len() {
+            channels.resize(peaks.len(), 0.0);
+            changed = true;
         }
-        for (slot, &incoming) in current.iter_mut().zip(peaks.iter()) {
+        for (slot, &incoming) in channels.iter_mut().zip(peaks) {
             if incoming > *slot {
                 *slot = incoming;
+                changed = true;
             }
         }
-        drop(current);
-        row.meter.queue_draw();
+        changed
     }
 
-    /// Decay every meter's per-channel peaks by PEAK_DECAY and queue a redraw,
-    /// easing the bars back to zero when a node goes quiet.
-    pub fn decay_meters(&self) {
-        for row in self
-            .sink_rows
-            .values()
-            .chain(self.source_rows.values())
-            .chain(self.app_rows.values())
-        {
-            let mut peaks = row.peaks.borrow_mut();
-            for slot in peaks.iter_mut() {
-                let next = *slot * PEAK_DECAY;
-                *slot = if next < 0.001 { 0.0 } else { next };
-            }
-            drop(peaks);
-            row.meter.queue_draw();
+    /// The current per-channel peaks for a row, empty if it has none yet.
+    pub fn channels(&self, row: &RowId) -> &[f32] {
+        self.rows.get(row).map_or(&[], Vec::as_slice)
+    }
+
+    /// Drop rows the predicate rejects, freeing meter state for vanished rows.
+    pub fn retain(&mut self, keep: impl Fn(&RowId) -> bool) {
+        self.rows.retain(|row, _| keep(row));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lit_fraction_spans_the_db_range() {
+        assert_eq!(lit_fraction(0.0), 0.0); // silence
+        assert!(lit_fraction(0.001) < 0.02); // ~ -60 dB, at the floor
+        assert_eq!(lit_fraction(1.0), 1.0); // 0 dB, full
+        assert_eq!(lit_fraction(2.0), 1.0); // above 0 dB clamps
+        // Louder always lights at least as much.
+        assert!(lit_fraction(0.5) > lit_fraction(0.1));
+    }
+
+    #[test]
+    fn cells_tile_a_meter_without_a_fractional_pitch() {
+        // Whatever height a window gives the strip, the cells divide it in
+        // whole pixels, which is what keeps every rung the same and sharp.
+        for height in [40, 80, 140, 141, 300, 721] {
+            let n = segments_for(height);
+            assert!(n >= 1, "a meter always has at least one cell");
+            assert!(
+                n * CELL_PITCH <= height,
+                "{n} cells of {CELL_PITCH} must fit within {height}",
+            );
+            // The leftover is smaller than a cell, so nothing visible is lost.
+            assert!(height - n * CELL_PITCH < CELL_PITCH);
         }
+    }
+
+    #[test]
+    fn a_row_with_no_readings_is_drawn_as_stereo() {
+        assert_eq!(bar_count(0), 2, "assumed rather than collapsed to one bar");
+    }
+
+    #[test]
+    fn reported_channels_always_win_over_the_assumption() {
+        assert_eq!(bar_count(1), 1, "a mono stream stays mono");
+        assert_eq!(bar_count(2), 2);
+        assert_eq!(bar_count(6), 6, "surround is drawn as it comes");
+    }
+
+    #[test]
+    fn segment_tiers_step_up_toward_the_top() {
+        let n = segments_for(144);
+        assert_eq!(segment_tier(0, n), Tier::Neutral);
+        assert_eq!(segment_tier(n - 1, n), Tier::Red);
+        // Boundaries at 55 / 70 / 90 percent.
+        assert_eq!(segment_tier((n as f32 * 0.55) as i32, n), Tier::Green);
+        assert_eq!(segment_tier((n as f32 * 0.70) as i32, n), Tier::Amber);
+        assert_eq!(segment_tier((n as f32 * 0.90) as i32, n), Tier::Red);
+    }
+
+    #[test]
+    fn segment_coverage_fills_below_and_partial_at_the_edge() {
+        // lit halfway: lower segments full, upper empty, one partial at the edge.
+        let total = 10;
+        let lit = 0.55; // 5.5 segments lit
+        assert_eq!(segment_coverage(lit, total, 0), 1.0);
+        assert_eq!(segment_coverage(lit, total, 4), 1.0);
+        let edge = segment_coverage(lit, total, 5);
+        assert!((edge - 0.5).abs() < 1e-6, "edge was {edge}");
+        assert_eq!(segment_coverage(lit, total, 6), 0.0);
+    }
+
+    #[test]
+    fn apply_keeps_the_louder_and_decay_eases_down() {
+        let mut m = MeterState::new();
+        let row = RowId::Sink(1);
+        assert!(m.apply(&row, &[0.5, 0.2]));
+        assert!(m.apply(&row, &[0.3, 0.9])); // max-fold per channel
+        assert_eq!(m.channels(&row), &[0.5, 0.9]);
+        assert!(m.decay());
+        let after = m.channels(&row);
+        assert!(after[0] < 0.5 && after[0] > 0.0);
+        assert!(after[1] < 0.9 && after[1] > 0.0);
+    }
+
+    #[test]
+    fn decay_snaps_a_tiny_value_to_zero() {
+        let mut m = MeterState::new();
+        let row = RowId::Source(2);
+        m.apply(&row, &[DECAY_FLOOR / 2.0]);
+        assert!(m.decay());
+        assert_eq!(m.channels(&row), &[0.0]);
+    }
+
+    #[test]
+    fn apply_resizes_on_channel_count_change() {
+        let mut m = MeterState::new();
+        let row = RowId::AppGroup("app:x".into());
+        m.apply(&row, &[0.5, 0.5]);
+        m.apply(&row, &[0.4]); // mono now
+
+        assert_eq!(m.channels(&row).len(), 1);
+    }
+
+    #[test]
+    fn retain_drops_vanished_rows() {
+        let mut m = MeterState::new();
+        m.apply(&RowId::Sink(1), &[0.5]);
+        m.apply(&RowId::Sink(2), &[0.5]);
+        m.retain(|r| matches!(r, RowId::Sink(1)));
+        assert!(!m.channels(&RowId::Sink(1)).is_empty());
+        assert!(m.channels(&RowId::Sink(2)).is_empty());
     }
 }

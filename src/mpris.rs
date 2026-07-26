@@ -1,383 +1,54 @@
 //! Session-bus MPRIS metadata enrichment.
 //!
-//! Players registering `org.mpris.MediaPlayer2.*` expose "now playing"
-//! metadata (title, artist), letting the UI label a stream "YouTube · Title"
-//! instead of "Stream 113". Streams match players by PID, via
-//! `GetConnectionUnixProcessID`. Caveats:
+//! Players registering org.mpris.MediaPlayer2.* expose "now playing" metadata,
+//! letting the UI label a stream "YouTube · Title" instead of "Stream 113".
+//! Streams match players by PID, via GetConnectionUnixProcessID. Caveats:
 //!
 //! - Chromium-family browsers share one AudioService PID and one MPRIS player
 //!   across tabs, so the title tracks the most recently played media. Still
 //!   beats "Stream <id>".
 //! - Apps with no MPRIS player get no enrichment; the row keeps its label.
 //!
-//! Runs on the GTK main thread via GLib's DBus integration; callbacks update
-//! the cache in place and nudge the UI to repaint with a `state::Message`.
+//! A thread owns the bus connection and writes the player cache; the UI reads
+//! it while projecting a snapshot and is nudged to repaint with a Message. The
+//! thread never holds the cache lock across a bus call, so a slow or wedged
+//! player cannot stall a repaint.
 
 use std::cell::RefCell;
-use std::rc::Rc;
-
-use gtk::gio;
-use gtk::gio::prelude::*;
-use gtk::glib;
-use gtk4 as gtk;
+use std::collections::HashMap;
+use std::io;
+use std::sync::{Arc, Mutex};
 
 use crate::bus::Sender as BusSender;
+use crate::dbus::connection::Connection;
+use crate::dbus::wire::{MethodCall, Value};
 use crate::state::Message;
-
-/// Cache entry, keyed in `players` by bus name (what NameOwnerChanged uses).
-struct CachedPlayer {
-    pid: u32,
-    info: PlayerInfo,
-    /// PropertiesChanged subscription; dropping it deregisters the listener.
-    _props_sub: gio::SignalSubscription,
-}
-
-/// Hard cap on tracked players. A session never runs anywhere near this
-/// many media players; past it, new ones are dropped so a buggy or hostile
-/// peer spamming bus names can't grow the cache without bound.
-const MAX_PLAYERS: usize = 32;
-
-/// Live MPRIS player cache, keyed by bus name. A session runs a handful of
-/// players, so a linear-scan Vec beats a hash map at this size and stays
-/// bounded by MAX_PLAYERS.
-#[derive(Default)]
-struct PlayerCache(Vec<(String, CachedPlayer)>);
-
-impl PlayerCache {
-    /// Insert or replace the entry for `name`. Returns false, dropping
-    /// `player`, when the cache is full and `name` is not already present.
-    fn insert(&mut self, name: String, player: CachedPlayer) -> bool {
-        if let Some(slot) = self.0.iter_mut().find(|(n, _)| *n == name) {
-            slot.1 = player;
-            true
-        } else if self.0.len() < MAX_PLAYERS {
-            self.0.push((name, player));
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Remove the entry for `name`, dropping it (and its subscription).
-    /// True if one existed.
-    fn remove(&mut self, name: &str) -> bool {
-        if let Some(idx) = self.0.iter().position(|(n, _)| n.as_str() == name) {
-            self.0.swap_remove(idx);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Mutable access to the entry for `name`, if present.
-    fn get_mut(&mut self, name: &str) -> Option<&mut CachedPlayer> {
-        self.0
-            .iter_mut()
-            .find(|(n, _)| n.as_str() == name)
-            .map(|(_, p)| p)
-    }
-
-    /// Metadata for the player at `pid`, or `None`. Scans by PID since the
-    /// cache is keyed by bus name.
-    fn by_pid(&self, pid: u32) -> Option<&PlayerInfo> {
-        self.0
-            .iter()
-            .find(|(_, p)| p.pid == pid)
-            .map(|(_, p)| &p.info)
-    }
-}
-
-/// Owns the live player cache and the bus subscription. The UI holds one for
-/// the window's life and queries it with [`Mpris::resolve_title`]; dropping it
-/// tears the listeners down.
-pub struct Mpris {
-    players: Rc<RefCell<PlayerCache>>,
-    /// NameOwnerChanged subscription, `None` when the session bus was
-    /// unavailable. Held so the listener lives as long as `Mpris`.
-    _owner_sub: Option<gio::SignalSubscription>,
-}
-
-impl Mpris {
-    /// Title for the player owning `audio_pid` or one of its `/proc`
-    /// ancestors, or `None` if none matches or it has no title/artist.
-    pub fn resolve_title(&self, audio_pid: u32) -> Option<String> {
-        let players = self.players.borrow();
-        let info = ancestor_pids(audio_pid).find_map(|pid| players.by_pid(pid))?;
-        info.display()
-    }
-}
 
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
 const PLAYER_PATH: &str = "/org/mpris/MediaPlayer2";
 const PLAYER_IFACE: &str = "org.mpris.MediaPlayer2.Player";
+const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
+const BUS_NAME: &str = "org.freedesktop.DBus";
+const BUS_PATH: &str = "/org/freedesktop/DBus";
 
-/// Attach to the session bus and start tracking MPRIS players, returning a
-/// handle the UI queries for titles. If the session bus is unavailable the
-/// handle is inert (every lookup misses) and the app runs without enrichment.
-pub fn init(tx: BusSender<Message>) -> Mpris {
-    let players: Rc<RefCell<PlayerCache>> = Rc::new(RefCell::new(PlayerCache::default()));
+/// Hard cap on tracked players. A session never runs anywhere near this many
+/// media players; past it, new ones are dropped so a buggy or hostile peer
+/// spamming bus names cannot grow the cache without bound.
+const MAX_PLAYERS: usize = 32;
 
-    let connection = match gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("mpris: skip session bus unavailable: {e}");
-            return Mpris {
-                players,
-                _owner_sub: None,
-            };
-        }
-    };
-
-    // Subscribe before priming so a player appearing between ListNames and
-    // the subscription isn't missed. arg0-prefix filtering isn't available,
-    // so we filter in the callback.
-    let conn_for_sub = connection.clone();
-    let players_for_sub = Rc::clone(&players);
-    let tx_for_sub = tx.clone();
-    // Held in the returned Mpris so it lives as long as the handle; dropping
-    // Mpris (on window close) tears the listener down.
-    let owner_sub = connection.subscribe_to_signal(
-        Some("org.freedesktop.DBus"),
-        Some("org.freedesktop.DBus"),
-        Some("NameOwnerChanged"),
-        Some("/org/freedesktop/DBus"),
-        None,
-        gio::DBusSignalFlags::NONE,
-        move |signal| {
-            let Some((name, old_owner, new_owner)) =
-                signal.parameters.get::<(String, String, String)>()
-            else {
-                return;
-            };
-            if !name.starts_with(MPRIS_PREFIX) {
-                return;
-            }
-            if !new_owner.is_empty() {
-                // Player appeared or owner changed: detach then reattach.
-                detach_player(&players_for_sub, &name);
-                attach_player(
-                    &conn_for_sub,
-                    Rc::clone(&players_for_sub),
-                    tx_for_sub.clone(),
-                    name,
-                );
-            } else if !old_owner.is_empty() {
-                // Player went away.
-                if detach_player(&players_for_sub, &name) {
-                    notify(&tx_for_sub);
-                }
-            }
-        },
-    );
-
-    // Initial players: list every bus name, filter to MPRIS, attach each.
-    match connection.call_sync(
-        Some("org.freedesktop.DBus"),
-        "/org/freedesktop/DBus",
-        "org.freedesktop.DBus",
-        "ListNames",
-        None,
-        Some(glib::VariantTy::new("(as)").expect("static signature")),
-        gio::DBusCallFlags::NONE,
-        -1,
-        gio::Cancellable::NONE,
-    ) {
-        Ok(reply) => {
-            if let Some((names,)) = reply.get::<(Vec<String>,)>() {
-                for name in names {
-                    if name.starts_with(MPRIS_PREFIX) {
-                        attach_player(&connection, Rc::clone(&players), tx.clone(), name);
-                    }
-                }
-                notify(&tx);
-            }
-        }
-        Err(e) => {
-            eprintln!("mpris: ListNames failed: {e}");
-        }
-    }
-
-    Mpris {
-        players,
-        _owner_sub: Some(owner_sub),
-    }
-}
-
-/// Bind one player: resolve PID, fetch Metadata, install a PropertiesChanged
-/// listener. Best-effort; any DBus failure leaves the player out of the cache.
-fn attach_player(
-    connection: &gio::DBusConnection,
-    players: Rc<RefCell<PlayerCache>>,
-    tx: BusSender<Message>,
-    name: String,
-) {
-    let pid = match get_connection_pid(connection, &name) {
-        Some(p) => p,
-        None => return,
-    };
-    let info = fetch_metadata(connection, &name).unwrap_or_default();
-
-    let players_for_props = Rc::clone(&players);
-    let tx_for_props = tx.clone();
-    let name_for_props = name.clone();
-    let sub = connection.subscribe_to_signal(
-        Some(&name),
-        Some("org.freedesktop.DBus.Properties"),
-        Some("PropertiesChanged"),
-        Some(PLAYER_PATH),
-        Some(PLAYER_IFACE),
-        gio::DBusSignalFlags::NONE,
-        move |signal| {
-            // Reread full Metadata via Get rather than diffing the signal
-            // payload: players sometimes list Metadata in
-            // invalidated_properties instead of changed_properties.
-            let info = fetch_metadata(signal.connection, &name_for_props).unwrap_or_default();
-            let changed = {
-                let mut map = players_for_props.borrow_mut();
-                if let Some(entry) = map.get_mut(&name_for_props) {
-                    if entry.info != info {
-                        entry.info = info;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            };
-            if changed {
-                notify(&tx_for_props);
-            }
-        },
-    );
-
-    let inserted = players.borrow_mut().insert(
-        name,
-        CachedPlayer {
-            pid,
-            info,
-            _props_sub: sub,
-        },
-    );
-    if inserted {
-        notify(&tx);
-    } else {
-        eprintln!("mpris: player cache full ({MAX_PLAYERS}), ignoring new player");
-    }
-}
-
-/// Drop the cache entry (and its subscription). Returns true if one existed.
-fn detach_player(players: &Rc<RefCell<PlayerCache>>, name: &str) -> bool {
-    players.borrow_mut().remove(name)
-}
-
-/// Nudge the UI to re-read the cache on its next refresh. The cache lives in
-/// the UI's `Mpris` handle, so the message carries no data.
-fn notify(tx: &BusSender<Message>) {
-    let _ = tx.send(Message::MprisChanged);
-}
-
-/// `GetConnectionUnixProcessID` on the bus daemon. `None` on any error (e.g.
-/// the connection vanished, a race on rapid app churn).
-fn get_connection_pid(connection: &gio::DBusConnection, bus_name: &str) -> Option<u32> {
-    let reply = connection
-        .call_sync(
-            Some("org.freedesktop.DBus"),
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus",
-            "GetConnectionUnixProcessID",
-            Some(&(bus_name,).to_variant()),
-            Some(glib::VariantTy::new("(u)").expect("static signature")),
-            gio::DBusCallFlags::NONE,
-            -1,
-            gio::Cancellable::NONE,
-        )
-        .ok()?;
-    reply.get::<(u32,)>().map(|(p,)| p)
-}
-
-/// Read the player's Metadata via `Properties.Get`. `None` if the call fails
-/// or the player lacks the Player interface.
-fn fetch_metadata(connection: &gio::DBusConnection, bus_name: &str) -> Option<PlayerInfo> {
-    let reply = connection
-        .call_sync(
-            Some(bus_name),
-            PLAYER_PATH,
-            "org.freedesktop.DBus.Properties",
-            "Get",
-            Some(&(PLAYER_IFACE, "Metadata").to_variant()),
-            Some(glib::VariantTy::new("(v)").expect("static signature")),
-            gio::DBusCallFlags::NONE,
-            -1,
-            gio::Cancellable::NONE,
-        )
-        .ok()?;
-    let (boxed,) = reply.get::<(glib::Variant,)>()?;
-    Some(parse_metadata_dict(&boxed))
-}
-
-/// Unbox a `v`-typed Variant one level, otherwise return it as-is. gtk-rs
-/// sometimes already hands back the inner value; calling `as_variant` then
-/// would emit a C-level `g_variant_get_variant` CRITICAL to stderr, which
-/// spams on frequent PropertiesChanged.
-fn unbox_variant(v: glib::Variant) -> glib::Variant {
-    if v.type_().as_str() == "v" {
-        v.as_variant().unwrap_or(v)
-    } else {
-        v
-    }
-}
-
-/// Parse the `a{sv}` Metadata dict into `PlayerInfo`, ignoring unused keys.
-/// `xesam:title`/`xesam:artist` are optional; omitting them yields a default.
-fn parse_metadata_dict(boxed: &glib::Variant) -> PlayerInfo {
-    let mut info = PlayerInfo::default();
-    // Properties.Get returns a `v`; unbox once to reach the `a{sv}` dict.
-    let dict = unbox_variant(boxed.clone());
-    let n = dict.n_children();
-    for i in 0..n {
-        let entry = dict.child_value(i);
-        // Each entry is {sv}: child 0 = key, child 1 = value. Skip anything
-        // malformed rather than panic.
-        if entry.n_children() < 2 {
-            continue;
-        }
-        let key = entry.child_value(0).get::<String>().unwrap_or_default();
-        let unboxed = unbox_variant(entry.child_value(1));
-        match key.as_str() {
-            "xesam:title" => {
-                if let Some(s) = unboxed.get::<String>()
-                    && !s.is_empty()
-                {
-                    info.title = Some(s);
-                }
-            }
-            "xesam:artist" => {
-                if let Some(arr) = unboxed.get::<Vec<String>>()
-                    && let Some(first) = arr.into_iter().find(|s| !s.is_empty())
-                {
-                    info.artist = Some(first);
-                }
-            }
-            _ => {}
-        }
-    }
-    info
-}
-
-/// Resolved metadata for one MPRIS player. The row label only needs
-/// title + artist, so other spec fields are discarded at parse time.
+/// Resolved metadata for one MPRIS player. The row label only needs title and
+/// artist, so other spec fields are discarded at parse time.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PlayerInfo {
-    /// `xesam:title`, usually the song / video title.
+    /// xesam:title, usually the song or video title.
     pub title: Option<String>,
-    /// First entry of `xesam:artist` (the spec allows an array).
+    /// First entry of xesam:artist, which the spec defines as an array.
     pub artist: Option<String>,
 }
 
 impl PlayerInfo {
-    /// Label "Title · Artist" / "Title" / "Artist", or `None` if both
-    /// fields are empty. Caller hard-truncates to the label width.
+    /// Label "Title · Artist", or whichever half exists, or None when the
+    /// player reports neither. Caller hard-truncates to the label width.
     pub fn display(&self) -> Option<String> {
         match (self.title.as_deref(), self.artist.as_deref()) {
             (Some(t), Some(a)) => Some(format!("{t} · {a}")),
@@ -388,23 +59,429 @@ impl PlayerInfo {
     }
 }
 
-/// The PIDs to try when matching an audio stream to a player: `audio_pid`
-/// then its `/proc` ancestors, up to [`MAX_ANCESTOR_DEPTH`], stopping before
-/// PID 1 so an unrelated higher-up player can't match. The walk is needed
-/// because Chromium-family browsers route all tab audio through one
-/// AudioService child while registering MPRIS from the main process, so the
-/// player is an ancestor of the audio PID.
+/// A tracked player. The owner is its unique bus name, which is what signals
+/// arrive from, so PropertiesChanged can be routed without asking the bus who
+/// sent it.
+struct CachedPlayer {
+    owner: String,
+    pid: u32,
+    info: PlayerInfo,
+}
+
+/// Live player cache keyed by well-known bus name. A session runs a handful of
+/// players, so a linear-scan Vec beats a hash map at this size and stays
+/// bounded by MAX_PLAYERS.
+#[derive(Default)]
+struct PlayerCache {
+    players: Vec<(String, CachedPlayer)>,
+    /// Bumped on every change. A reader that resolved against one generation
+    /// knows its answer still holds while the number has not moved.
+    generation: u64,
+}
+
+impl PlayerCache {
+    /// Insert or replace the entry for `name`. False when the cache is full
+    /// and `name` is not already present, dropping `player`.
+    fn insert(&mut self, name: String, player: CachedPlayer) -> bool {
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(slot) = self.players.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = player;
+            true
+        } else if self.players.len() < MAX_PLAYERS {
+            self.players.push((name, player));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove the entry for `name`. True if one existed.
+    fn remove(&mut self, name: &str) -> bool {
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(idx) = self.players.iter().position(|(n, _)| n.as_str() == name) {
+            self.players.swap_remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The player whose unique bus name is `owner`. Taking it mutably is a
+    /// change in the making, so the generation moves with it.
+    fn by_owner_mut(&mut self, owner: &str) -> Option<&mut CachedPlayer> {
+        self.generation = self.generation.wrapping_add(1);
+        self.players
+            .iter_mut()
+            .find(|(_, p)| p.owner == owner)
+            .map(|(_, p)| p)
+    }
+
+    /// Metadata for the player at `pid`. Scans by PID since the cache is keyed
+    /// by bus name.
+    fn by_pid(&self, pid: u32) -> Option<&PlayerInfo> {
+        self.players
+            .iter()
+            .find(|(_, p)| p.pid == pid)
+            .map(|(_, p)| &p.info)
+    }
+}
+
+/// Handle on the player cache the worker keeps current. The UI holds one for
+/// the window's life and queries it with [`Mpris::resolve_title`].
+pub struct Mpris {
+    cache: Arc<Mutex<PlayerCache>>,
+    /// What each audio PID last resolved to, and the cache generation it was
+    /// resolved against.
+    ///
+    /// Matching a stream to a player reads a /proc entry per ancestor, and the
+    /// snapshot this feeds is rebuilt on every state change, which includes
+    /// every step of a slider drag. Answers only go stale when the players do,
+    /// so the generation is what decides.
+    resolved: RefCell<HashMap<u32, (u64, Option<String>)>>,
+}
+
+/// Audio PIDs remembered at once. A session has a handful of streams; the cap
+/// is what keeps a long run of short-lived ones from growing the map.
+const MAX_RESOLVED: usize = 64;
+
+impl Mpris {
+    /// Title for the player owning `audio_pid` or one of its /proc ancestors,
+    /// or None if none matches or it reports no title or artist.
+    pub fn resolve_title(&self, audio_pid: u32) -> Option<String> {
+        // A poisoned lock means the worker died mid-write. Enrichment is
+        // optional, so miss rather than take the process down with it.
+        let cache = self.cache.lock().ok()?;
+        let generation = cache.generation;
+
+        let remembered = self.resolved.borrow().get(&audio_pid).cloned();
+        if let Some((against, title)) = remembered
+            && against == generation
+        {
+            return title;
+        }
+
+        let title = ancestor_pids(audio_pid)
+            .find_map(|pid| cache.by_pid(pid))
+            .and_then(PlayerInfo::display);
+        drop(cache);
+
+        let mut resolved = self.resolved.borrow_mut();
+        if resolved.len() >= MAX_RESOLVED {
+            resolved.clear();
+        }
+        resolved.insert(audio_pid, (generation, title.clone()));
+        title
+    }
+}
+
+/// Start tracking MPRIS players on a thread of its own, returning the handle
+/// the UI queries. The handle works either way: if the session bus is
+/// unavailable the cache simply stays empty and every lookup misses.
+pub fn init(tx: BusSender<Message>) -> Mpris {
+    let cache = Arc::new(Mutex::new(PlayerCache::default()));
+    let worker_cache = Arc::clone(&cache);
+
+    let spawned = std::thread::Builder::new()
+        .name("mpris".to_string())
+        .spawn(move || {
+            if let Err(e) = run(worker_cache, tx) {
+                eprintln!("mpris: stopped: {e}");
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("mpris: could not start worker: {e}");
+    }
+
+    Mpris {
+        cache,
+        resolved: RefCell::new(HashMap::new()),
+    }
+}
+
+/// Own the connection: subscribe, prime the cache, then follow signals until
+/// the bus goes away.
+fn run(cache: Arc<Mutex<PlayerCache>>, tx: BusSender<Message>) -> io::Result<()> {
+    let mut conn = Connection::session()?;
+
+    // Subscribe before priming so a player appearing between the two is caught
+    // by a signal rather than missed entirely.
+    conn.add_match(
+        "type='signal',sender='org.freedesktop.DBus',\
+         interface='org.freedesktop.DBus',member='NameOwnerChanged',\
+         arg0namespace='org.mpris.MediaPlayer2'",
+    )?;
+    // One path-scoped rule covers every player, so players need no per-player
+    // subscription as they come and go.
+    conn.add_match(
+        "type='signal',interface='org.freedesktop.DBus.Properties',\
+         member='PropertiesChanged',path='/org/mpris/MediaPlayer2'",
+    )?;
+
+    prime(&mut conn, &cache, &tx);
+
+    loop {
+        let signal = conn.next_signal()?;
+        match signal.member.as_deref() {
+            Some("NameOwnerChanged") => on_name_owner_changed(&mut conn, &cache, &tx, &signal),
+            Some("PropertiesChanged") => on_properties_changed(&mut conn, &cache, &tx, &signal),
+            _ => {}
+        }
+    }
+}
+
+/// Attach every MPRIS player already on the bus.
+fn prime(conn: &mut Connection, cache: &Arc<Mutex<PlayerCache>>, tx: &BusSender<Message>) {
+    let reply = match conn.call(&MethodCall {
+        destination: BUS_NAME,
+        path: BUS_PATH,
+        interface: BUS_NAME,
+        member: "ListNames",
+        args: &[],
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("mpris: ListNames failed: {e}");
+            return;
+        }
+    };
+
+    let names: Vec<String> = reply
+        .body_values()
+        .and_then(|v| v.first().map(collect_strings))
+        .unwrap_or_default();
+
+    let mut any = false;
+    for name in names.iter().filter(|n| n.starts_with(MPRIS_PREFIX)) {
+        any |= attach(conn, cache, name);
+    }
+    if any {
+        notify(tx);
+    }
+}
+
+/// A player appeared, moved, or went away.
+fn on_name_owner_changed(
+    conn: &mut Connection,
+    cache: &Arc<Mutex<PlayerCache>>,
+    tx: &BusSender<Message>,
+    signal: &crate::dbus::wire::Message,
+) {
+    let Some(values) = signal.body_values() else {
+        return;
+    };
+    let (Some(name), Some(old), Some(new)) = (
+        values.first().and_then(Value::as_str),
+        values.get(1).and_then(Value::as_str),
+        values.get(2).and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    if !name.starts_with(MPRIS_PREFIX) {
+        return;
+    }
+
+    if !new.is_empty() {
+        // Appeared, or changed hands: drop what we knew and rebind.
+        detach(cache, name);
+        if attach(conn, cache, name) {
+            notify(tx);
+        }
+    } else if !old.is_empty() && detach(cache, name) {
+        notify(tx);
+    }
+}
+
+/// A tracked player changed a property. Metadata is re-read in full rather
+/// than diffed out of the signal, because players sometimes list it as
+/// invalidated instead of changed.
+fn on_properties_changed(
+    conn: &mut Connection,
+    cache: &Arc<Mutex<PlayerCache>>,
+    tx: &BusSender<Message>,
+    signal: &crate::dbus::wire::Message,
+) {
+    let Some(owner) = signal.sender.as_deref() else {
+        return;
+    };
+    let changed_iface = signal
+        .body_values()
+        .and_then(|v| v.first().and_then(Value::as_str).map(str::to_string));
+    if changed_iface.as_deref() != Some(PLAYER_IFACE) {
+        return;
+    }
+
+    // The lock is taken twice, around the call rather than across it, so a
+    // player that takes its time answering never blocks a repaint.
+    let known = matches!(cache.lock(), Ok(c) if c.players.iter().any(|(_, p)| p.owner == owner));
+    if !known {
+        return;
+    }
+    let info = fetch_metadata(conn, owner);
+
+    let changed = match cache.lock() {
+        Ok(mut c) => match c.by_owner_mut(owner) {
+            Some(player) if player.info != info => {
+                player.info = info;
+                true
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    };
+    if changed {
+        notify(tx);
+    }
+}
+
+/// Bind one player: resolve its owner and PID, read its metadata, cache it.
+/// Best-effort, so any bus failure leaves the player out. True when the cache
+/// changed.
+fn attach(conn: &mut Connection, cache: &Arc<Mutex<PlayerCache>>, name: &str) -> bool {
+    let Some(owner) = get_name_owner(conn, name) else {
+        return false;
+    };
+    let Some(pid) = get_connection_pid(conn, name) else {
+        return false;
+    };
+    let info = fetch_metadata(conn, &owner);
+
+    let inserted = match cache.lock() {
+        Ok(mut c) => c.insert(name.to_string(), CachedPlayer { owner, pid, info }),
+        Err(_) => false,
+    };
+    if !inserted {
+        eprintln!("mpris: player cache full ({MAX_PLAYERS}), ignoring {name}");
+    }
+    inserted
+}
+
+/// Drop a player from the cache. True if one was there.
+fn detach(cache: &Arc<Mutex<PlayerCache>>, name: &str) -> bool {
+    match cache.lock() {
+        Ok(mut c) => c.remove(name),
+        Err(_) => false,
+    }
+}
+
+/// Nudge the UI to re-read the cache on its next refresh. The cache lives
+/// behind the handle, so the message carries no data.
+fn notify(tx: &BusSender<Message>) {
+    let _ = tx.send(Message::MprisChanged);
+}
+
+/// The unique bus name currently owning `name`.
+fn get_name_owner(conn: &mut Connection, name: &str) -> Option<String> {
+    let reply = conn
+        .call(&MethodCall {
+            destination: BUS_NAME,
+            path: BUS_PATH,
+            interface: BUS_NAME,
+            member: "GetNameOwner",
+            args: &[name],
+        })
+        .ok()?;
+    reply
+        .body_values()?
+        .first()
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The PID behind a bus name. None on any error, e.g. the connection vanished
+/// in a race on rapid app churn.
+fn get_connection_pid(conn: &mut Connection, name: &str) -> Option<u32> {
+    let reply = conn
+        .call(&MethodCall {
+            destination: BUS_NAME,
+            path: BUS_PATH,
+            interface: BUS_NAME,
+            member: "GetConnectionUnixProcessID",
+            args: &[name],
+        })
+        .ok()?;
+    reply.body_values()?.first().and_then(Value::as_u32)
+}
+
+/// Read a player's Metadata property. An absent or unreadable property yields
+/// empty info, which is what a player with nothing playing reports anyway.
+fn fetch_metadata(conn: &mut Connection, destination: &str) -> PlayerInfo {
+    let reply = conn.call(&MethodCall {
+        destination,
+        path: PLAYER_PATH,
+        interface: PROPS_IFACE,
+        member: "Get",
+        args: &[PLAYER_IFACE, "Metadata"],
+    });
+    let Ok(reply) = reply else {
+        return PlayerInfo::default();
+    };
+    reply
+        .body_values()
+        .and_then(|v| v.first().map(parse_metadata))
+        .unwrap_or_default()
+}
+
+/// Pull title and artist out of the a{sv} Metadata dict, ignoring every other
+/// key. Both are optional; a player with neither yields a default.
+fn parse_metadata(dict: &Value) -> PlayerInfo {
+    let title = dict
+        .dict_get("xesam:title")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    // The spec types artist as an array, but players have been known to send a
+    // bare string, so accept either.
+    let artist_value = dict.dict_get("xesam:artist");
+    let artist = artist_value
+        .and_then(|v| {
+            v.as_array().map(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .find(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+        })
+        .flatten()
+        .or_else(|| {
+            artist_value
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+
+    PlayerInfo { title, artist }
+}
+
+/// Every string in an array value, skipping anything that is not one.
+fn collect_strings(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+/// The PIDs to try when matching an audio stream to a player: `audio_pid` then
+/// its /proc ancestors, up to [`MAX_ANCESTOR_DEPTH`], stopping before PID 1 so
+/// an unrelated higher-up player cannot match. The walk is needed because
+/// Chromium-family browsers route all tab audio through one AudioService child
+/// while registering MPRIS from the main process, so the player is an ancestor
+/// of the audio PID.
 fn ancestor_pids(audio_pid: u32) -> impl Iterator<Item = u32> {
     std::iter::successors(Some(audio_pid), |&pid| parent_pid(pid).filter(|&p| p > 1))
         .take(MAX_ANCESTOR_DEPTH)
 }
 
-/// Upper bound on `/proc/<pid>/stat` reads per [`ancestor_pids`] walk.
+/// Upper bound on /proc/<pid>/stat reads per [`ancestor_pids`] walk.
 const MAX_ANCESTOR_DEPTH: usize = 8;
 
-/// Read the parent PID from `/proc/<pid>/stat`, `None` if unreadable or
-/// gone. The `comm` field may contain spaces/parens, so split on the
-/// LAST `)` to find the fields that follow.
+/// Read the parent PID from /proc/<pid>/stat, None if unreadable or gone. The
+/// comm field may contain spaces and parens, so split on the LAST ')' to find
+/// the fields that follow.
 fn parent_pid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (_, after_comm) = stat.rsplit_once(')')?;
@@ -417,6 +494,18 @@ fn parent_pid(pid: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dbus::wire::{Decoder, Encoder};
+
+    fn player(owner: &str, pid: u32, title: &str) -> CachedPlayer {
+        CachedPlayer {
+            owner: owner.to_string(),
+            pid,
+            info: PlayerInfo {
+                title: Some(title.to_string()),
+                artist: None,
+            },
+        }
+    }
 
     #[test]
     fn display_combines_title_and_artist() {
@@ -455,9 +544,151 @@ mod tests {
     }
 
     #[test]
+    fn the_cache_replaces_an_existing_name_without_growing() {
+        let mut cache = PlayerCache::default();
+        assert!(cache.insert("a".into(), player(":1.1", 10, "First")));
+        assert!(cache.insert("a".into(), player(":1.2", 11, "Second")));
+        assert_eq!(cache.players.len(), 1);
+        assert_eq!(
+            cache.by_pid(11).and_then(|i| i.display()).as_deref(),
+            Some("Second")
+        );
+        assert!(cache.by_pid(10).is_none(), "the old PID is gone");
+    }
+
+    #[test]
+    fn the_cache_stops_at_its_cap_but_still_updates_known_names() {
+        let mut cache = PlayerCache::default();
+        for i in 0..MAX_PLAYERS {
+            assert!(cache.insert(format!("p{i}"), player(&format!(":1.{i}"), i as u32, "T")));
+        }
+        assert!(
+            !cache.insert("one-too-many".into(), player(":1.99", 999, "T")),
+            "a new name past the cap is refused",
+        );
+        assert!(
+            cache.insert("p0".into(), player(":1.0", 0, "Updated")),
+            "an existing name still updates when full",
+        );
+        assert_eq!(cache.players.len(), MAX_PLAYERS);
+    }
+
+    #[test]
+    fn removing_reports_whether_anything_was_there() {
+        let mut cache = PlayerCache::default();
+        cache.insert("a".into(), player(":1.1", 10, "T"));
+        assert!(cache.remove("a"));
+        assert!(!cache.remove("a"), "second removal is a miss");
+        assert!(cache.by_pid(10).is_none());
+    }
+
+    #[test]
+    fn lookup_by_owner_finds_the_player_a_signal_came_from() {
+        let mut cache = PlayerCache::default();
+        cache.insert("org.mpris.MediaPlayer2.vlc".into(), player(":1.7", 42, "T"));
+        assert!(cache.by_owner_mut(":1.7").is_some());
+        assert!(cache.by_owner_mut(":1.8").is_none());
+    }
+
+    /// Encode an a{sv} metadata dict the way a Properties.Get reply carries it.
+    fn metadata(entries: &[(&str, MetaValue)]) -> Value {
+        let mut e = Encoder::new();
+        e.signature("a{sv}");
+        e.array(8, |e| {
+            for (key, value) in entries {
+                e.align(8);
+                e.string(key);
+                match value {
+                    MetaValue::Str(s) => {
+                        e.signature("s");
+                        e.string(s);
+                    }
+                    MetaValue::Strs(list) => {
+                        e.signature("as");
+                        e.array(4, |e| {
+                            for s in list.iter() {
+                                e.string(s);
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        let bytes = e.into_bytes();
+        Decoder::new(&bytes, true)
+            .read(b"v")
+            .expect("the encoder produced a decodable variant")
+    }
+
+    enum MetaValue {
+        Str(&'static str),
+        Strs(&'static [&'static str]),
+    }
+
+    #[test]
+    fn metadata_parses_title_and_the_first_artist() {
+        let dict = metadata(&[
+            ("xesam:title", MetaValue::Str("Song")),
+            ("xesam:artist", MetaValue::Strs(&["Band", "Guest"])),
+        ]);
+        let info = parse_metadata(&dict);
+        assert_eq!(info.title.as_deref(), Some("Song"));
+        assert_eq!(info.artist.as_deref(), Some("Band"));
+        assert_eq!(info.display().as_deref(), Some("Song · Band"));
+    }
+
+    #[test]
+    fn metadata_skips_empty_strings_rather_than_showing_blanks() {
+        let dict = metadata(&[
+            ("xesam:title", MetaValue::Str("")),
+            ("xesam:artist", MetaValue::Strs(&["", "Real"])),
+        ]);
+        let info = parse_metadata(&dict);
+        assert_eq!(info.title, None, "an empty title is not a title");
+        assert_eq!(
+            info.artist.as_deref(),
+            Some("Real"),
+            "skips to the first real name"
+        );
+    }
+
+    #[test]
+    fn metadata_accepts_an_artist_sent_as_a_bare_string() {
+        // Off-spec, but players do it, and the row should still fill in.
+        let dict = metadata(&[("xesam:artist", MetaValue::Str("Solo"))]);
+        assert_eq!(parse_metadata(&dict).artist.as_deref(), Some("Solo"));
+    }
+
+    #[test]
+    fn metadata_with_no_useful_keys_yields_nothing_to_show() {
+        let dict = metadata(&[("mpris:trackid", MetaValue::Str("/track/1"))]);
+        let info = parse_metadata(&dict);
+        assert_eq!(info, PlayerInfo::default());
+        assert_eq!(info.display(), None);
+    }
+
+    #[test]
+    fn collect_strings_keeps_only_the_strings() {
+        let mut e = Encoder::new();
+        e.array(4, |e| {
+            e.string("org.freedesktop.DBus");
+            e.string("org.mpris.MediaPlayer2.vlc");
+        });
+        let bytes = e.into_bytes();
+        let value = Decoder::new(&bytes, true).read(b"as").expect("an array");
+        assert_eq!(
+            collect_strings(&value),
+            vec!["org.freedesktop.DBus", "org.mpris.MediaPlayer2.vlc"],
+        );
+        assert!(
+            collect_strings(&Value::U32(1)).is_empty(),
+            "a non-array is empty"
+        );
+    }
+
+    #[test]
     fn parent_pid_resolves_for_self() {
-        // Parses a real /proc/self/stat to prove the parser handles
-        // live input.
+        // Parses a real /proc/self/stat to prove the parser handles live input.
         let me = std::process::id();
         let parent = parent_pid(me).expect("parent_pid of self resolves");
         assert!(parent > 0, "parent PID must be positive");
@@ -465,7 +696,7 @@ mod tests {
 
     #[test]
     fn parent_pid_handles_comm_with_paren() {
-        // comm with parens/spaces must survive the rsplit-on-')' parse.
+        // comm with parens and spaces must survive the rsplit-on-')' parse.
         // Format: "<pid> (<comm>) <state> <ppid> ..."
         let fake = "42 (a (tricky) name) S 17 1 1 0 -1 ...";
         let (_, after) = fake.rsplit_once(')').unwrap();
@@ -475,11 +706,74 @@ mod tests {
     }
 
     #[test]
+    fn parent_pid_misses_on_a_pid_that_does_not_exist() {
+        // PID 0 is never a live process, so /proc has no entry for it.
+        assert_eq!(parent_pid(0), None);
+    }
+
+    #[test]
     fn ancestor_pids_starts_at_self_and_stays_bounded() {
         let me = std::process::id();
         let chain: Vec<u32> = ancestor_pids(me).collect();
         assert_eq!(chain.first(), Some(&me), "walk starts at the given PID");
         assert!(chain.len() <= MAX_ANCESTOR_DEPTH, "respects the depth cap");
         assert!(chain.iter().all(|&p| p > 1), "never includes PID 1 or 0");
+    }
+
+    fn inert_handle() -> Mpris {
+        Mpris {
+            cache: Arc::new(Mutex::new(PlayerCache::default())),
+            resolved: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Resolving walks /proc, and the snapshot it feeds is rebuilt on every
+    /// state change, so the answer is remembered. What it must never do is go
+    /// on repeating an answer the players have moved past.
+    #[test]
+    fn a_resolved_title_is_remembered_until_the_players_change() {
+        let mpris = inert_handle();
+        let me = std::process::id();
+        let name = "org.mpris.MediaPlayer2.test";
+
+        {
+            let mut cache = mpris.cache.lock().expect("lock");
+            cache.insert(name.into(), player(":1.1", me, "First"));
+        }
+        assert_eq!(mpris.resolve_title(me).as_deref(), Some("First"));
+        // Asked again with nothing changed, and answered from memory.
+        assert_eq!(mpris.resolve_title(me).as_deref(), Some("First"));
+        assert_eq!(mpris.resolved.borrow().len(), 1, "one PID remembered");
+
+        // The player starts a new track, which moves the cache on.
+        {
+            let mut cache = mpris.cache.lock().expect("lock");
+            cache.insert(name.into(), player(":1.1", me, "Second"));
+        }
+        assert_eq!(
+            mpris.resolve_title(me).as_deref(),
+            Some("Second"),
+            "a changed player is resolved afresh rather than answered from memory",
+        );
+
+        // And a player going away stops the row claiming a title.
+        {
+            let mut cache = mpris.cache.lock().expect("lock");
+            assert!(cache.remove(name));
+        }
+        assert_eq!(mpris.resolve_title(me), None);
+    }
+
+    #[test]
+    fn an_unreachable_bus_leaves_an_inert_handle() {
+        // No worker can connect with the address pointing nowhere, so every
+        // lookup must miss instead of blocking or panicking.
+        let (tx, _rx) = crate::bus::channel::<Message>(8).expect("bus");
+        let mpris = Mpris {
+            cache: Arc::new(Mutex::new(PlayerCache::default())),
+            resolved: RefCell::new(HashMap::new()),
+        };
+        drop(tx);
+        assert_eq!(mpris.resolve_title(std::process::id()), None);
     }
 }

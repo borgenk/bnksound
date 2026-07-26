@@ -4,6 +4,10 @@ set -eu
 # Downloads a release from GitHub and installs it into ~/.local/bin, along with
 # the desktop entry and icon theme so it shows up in your app menu.
 # Pin a specific version with BNKSOUND_VERSION=v0.1.0.
+#
+# The released bnksound is the GTK build, so it needs GTK 4 installed. For a
+# build that needs no toolkit at all, build the native one from source:
+# `make install` in a checkout installs it under the same name.
 
 REPO="borgenk/bnksound"
 APP_ID="io.github.borgenk.BnkSound"
@@ -75,6 +79,21 @@ main() {
     chmod +x "$INSTALL_DIR/bnksound"
 
     echo "Installed bnksound ${VERSION} to ${INSTALL_DIR}/bnksound"
+
+    # Name what the loader cannot find. Launched from the app menu a missing
+    # library is a window that never appears, so say it here instead. GTK 4 is
+    # the one most likely to be absent, this build being the GTK one.
+    if command -v ldd > /dev/null 2>&1; then
+        missing="$(ldd "$INSTALL_DIR/bnksound" 2>/dev/null | grep 'not found' || true)"
+        if [ -n "$missing" ]; then
+            echo ""
+            echo "Warning: bnksound will not start, these libraries are missing:"
+            echo "$missing" | awk '{print "  " $1}'
+            echo ""
+            echo "GTK 4 is usually the one: install libgtk-4-1 (Debian, Ubuntu)"
+            echo "or gtk4 (Arch, Fedora), or build the native variant from source."
+        fi
+    fi
 
     # Desktop entry + icon theme, bundled in the tarball. Best-effort: a missing
     # piece or absent cache tool never fails the binary install.

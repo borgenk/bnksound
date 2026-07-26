@@ -1,7 +1,8 @@
 // Derived from `freedesktop-icons` v0.4.0
 //   https://github.com/oknozor/freedesktop-icons
-// The upstream crate was vendored into this tree and stripped down to just
-// the hicolor name+size lookup path the resolver uses. Its MIT notice:
+// The upstream crate was vendored into this tree and stripped down to the
+// name+size lookup path the resolver uses, then extended to follow theme
+// inheritance. Its MIT notice:
 //
 //   MIT License
 //
@@ -25,13 +26,14 @@
 //   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 //   DEALINGS IN THE SOFTWARE.
 
-//! Minimal freedesktop icon lookup: app icons in the hicolor theme by name and
-//! size. Walks hicolor dirs (exact size match, then nearest), then falls back
-//! to `$base/<name>.{png,svg,xpm}` and `/usr/share/pixmaps/`.
+//! Minimal freedesktop icon lookup: app icons by name and size. Searches the
+//! configured theme, then whatever it inherits, then hicolor, taking an exact
+//! size match in each before the nearest. Falls back to
+//! `$base/<name>.{png,svg,xpm}` and `/usr/share/pixmaps/`.
 //!
 //! Spec: https://specifications.freedesktop.org/icon-theme-spec/latest/
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
@@ -69,8 +71,14 @@ fn find_uncached(name: &str, size: u16) -> Option<PathBuf> {
     if let Some(absolute) = absolute_passthrough(name) {
         return Some(absolute);
     }
+    // Two passes over the whole search order. Strict theme priority would let a
+    // vector-only theme shadow a raster the renderer can actually draw, so
+    // rasters win everywhere first; vectors still resolve to a path.
+    search(name, size, &["png"]).or_else(|| search(name, size, &["svg", "xpm"]))
+}
 
-    for theme in hicolor_themes() {
+fn search(name: &str, size: u16, exts: &[&str]) -> Option<PathBuf> {
+    for theme in themes() {
         // Exact size match first, then nearest, per the spec.
         let exact: Vec<&IconDir> = theme
             .dirs
@@ -78,7 +86,7 @@ fn find_uncached(name: &str, size: u16) -> Option<PathBuf> {
             .filter(|d| d.matches_size(size, 1))
             .collect();
         for dir in &exact {
-            if let Some(p) = try_extensions(&theme.path.join(dir.name.as_str()), name) {
+            if let Some(p) = try_extensions(&theme.path.join(dir.name.as_str()), name, exts) {
                 return Some(p);
             }
         }
@@ -91,18 +99,18 @@ fn find_uncached(name: &str, size: u16) -> Option<PathBuf> {
             .collect();
         by_distance.sort_by_key(|(_, dist)| *dist);
         for (dir, _) in by_distance {
-            if let Some(p) = try_extensions(&theme.path.join(dir.name.as_str()), name) {
+            if let Some(p) = try_extensions(&theme.path.join(dir.name.as_str()), name, exts) {
                 return Some(p);
             }
         }
     }
 
     for base in icon_base_paths() {
-        if let Some(p) = try_extensions(&base, name) {
+        if let Some(p) = try_extensions(&base, name, exts) {
             return Some(p);
         }
     }
-    try_extensions(Path::new("/usr/share/pixmaps"), name)
+    try_extensions(Path::new("/usr/share/pixmaps"), name, exts)
 }
 
 fn absolute_passthrough(name: &str) -> Option<PathBuf> {
@@ -114,8 +122,8 @@ fn absolute_passthrough(name: &str) -> Option<PathBuf> {
     }
 }
 
-fn try_extensions(dir: &Path, name: &str) -> Option<PathBuf> {
-    for ext in ["png", "svg", "xpm"] {
+fn try_extensions(dir: &Path, name: &str, exts: &[&str]) -> Option<PathBuf> {
+    for ext in exts {
         let candidate = dir.join(format!("{name}.{ext}"));
         if candidate.is_file() {
             return Some(candidate);
@@ -128,26 +136,114 @@ fn try_extensions(dir: &Path, name: &str) -> Option<PathBuf> {
 // Themes
 // ---------------------------------------------------------------------------
 
-struct HicolorTheme {
+struct Theme {
     path: PathBuf,
     dirs: Vec<IconDir>,
 }
 
-fn hicolor_themes() -> &'static [HicolorTheme] {
-    static C: OnceLock<Vec<HicolorTheme>> = OnceLock::new();
-    C.get_or_init(|| {
-        let mut out = Vec::new();
-        for base in icon_base_paths() {
-            let theme = base.join("hicolor");
-            let index = theme.join("index.theme");
-            if !index.is_file() {
+/// The search order: the configured theme, then what it inherits breadth
+/// first, then hicolor. A theme present under several base paths contributes
+/// one entry per base, in base priority order.
+fn themes() -> &'static [Theme] {
+    static C: OnceLock<Vec<Theme>> = OnceLock::new();
+    C.get_or_init(build_chain)
+}
+
+fn build_chain() -> Vec<Theme> {
+    let bases = icon_base_paths();
+    let mut out = Vec::new();
+    let mut queue: VecDeque<String> = configured_theme().into_iter().collect();
+    let mut seen: Vec<String> = Vec::new();
+
+    while let Some(name) = queue.pop_front() {
+        // hicolor closes the chain below whatever any theme inherits.
+        if name == "hicolor" || seen.contains(&name) {
+            continue;
+        }
+        seen.push(name.clone());
+        for base in &bases {
+            let path = base.join(&name);
+            let index_path = path.join("index.theme");
+            if !index_path.is_file() {
                 continue;
             }
-            let dirs = parse_index(&index);
-            out.push(HicolorTheme { path: theme, dirs });
+            let index = parse_index(&index_path);
+            queue.extend(index.inherits);
+            out.push(Theme {
+                path,
+                dirs: index.dirs,
+            });
         }
-        out
-    })
+    }
+
+    for base in &bases {
+        let path = base.join("hicolor");
+        let index_path = path.join("index.theme");
+        if index_path.is_file() {
+            out.push(Theme {
+                path,
+                dirs: parse_index(&index_path).dirs,
+            });
+        }
+    }
+    out
+}
+
+/// The icon theme the desktop is set to. The spec leaves this to the desktop
+/// environment, so this reads the GTK and KDE settings files in turn and takes
+/// the first that names one.
+fn configured_theme() -> Option<String> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+
+    let sources = [
+        (
+            config.join("gtk-4.0/settings.ini"),
+            Some("Settings"),
+            "gtk-icon-theme-name",
+        ),
+        (
+            config.join("gtk-3.0/settings.ini"),
+            Some("Settings"),
+            "gtk-icon-theme-name",
+        ),
+        (home.join(".gtkrc-2.0"), None, "gtk-icon-theme-name"),
+        (config.join("kdeglobals"), Some("Icons"), "Theme"),
+    ];
+    sources
+        .into_iter()
+        .find_map(|(path, section, key)| read_setting(&path, section, key))
+}
+
+/// One `key=value` from an ini-shaped file, scoped to `section` when the file
+/// has them. Values keep their case but lose any surrounding quotes, which is
+/// how gtkrc writes them.
+fn read_setting(path: &Path, section: Option<&str>, key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut current: Option<&str> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix('[') {
+            current = Some(rest.rsplit_once(']').map(|(n, _)| n).unwrap_or(rest));
+            continue;
+        }
+        if section.is_some() && current != section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() != key {
+            continue;
+        }
+        let v = v.trim().trim_matches('"').trim();
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 /// Returns the XDG icon base paths in priority order, deduplicated and
@@ -289,12 +385,21 @@ impl PendingDir<'_> {
     }
 }
 
-fn parse_index(path: &Path) -> Vec<IconDir> {
+/// What one `index.theme` declares: its icon directories, and the themes it
+/// falls back to.
+#[derive(Default)]
+struct ThemeIndex {
+    dirs: Vec<IconDir>,
+    inherits: Vec<String>,
+}
+
+fn parse_index(path: &Path) -> ThemeIndex {
     let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
+        return ThemeIndex::default();
     };
 
     let mut out = Vec::new();
+    let mut inherits = Vec::new();
     let mut cur = PendingDir::default();
 
     for raw in content.lines() {
@@ -309,14 +414,21 @@ fn parse_index(path: &Path) -> Vec<IconDir> {
             continue;
         }
         let Some(name) = cur.section else { continue };
-        if name == "Icon Theme" {
-            continue;
-        }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        let key = key.trim();
-        let value = value.trim();
+        let (key, value) = (key.trim(), value.trim());
+        if name == "Icon Theme" {
+            if key == "Inherits" {
+                inherits = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            continue;
+        }
         match key {
             "Size" => cur.size = value.parse().ok(),
             "Scale" => cur.scale = value.parse().ok(),
@@ -338,7 +450,10 @@ fn parse_index(path: &Path) -> Vec<IconDir> {
     // We don't enforce the `Directories=` list under `[Icon Theme]`; every
     // section past it is a declared dir per the spec, and sections without a
     // `Size=` get filtered out above.
-    out
+    ThemeIndex {
+        dirs: out,
+        inherits,
+    }
 }
 
 #[cfg(test)]
@@ -393,7 +508,7 @@ mod tests {
              MaxSize=512\n\
              Type=Scalable\n",
         );
-        let dirs = parse_index(&path);
+        let dirs = parse_index(&path).dirs;
         assert_eq!(dirs.len(), 2);
         assert_eq!(dirs[0].name, "48x48/apps");
         assert_eq!(dirs[0].size, 48);
@@ -402,6 +517,67 @@ mod tests {
         assert_eq!(dirs[1].min_size, 8);
         assert_eq!(dirs[1].max_size, 512);
         assert!(matches!(dirs[1].type_, DirType::Scalable));
+    }
+
+    #[test]
+    fn parse_index_reads_the_inherited_themes() {
+        let tmp = fresh_tmp();
+        let path = tmp.0.join("index.theme");
+        write_file(
+            &path,
+            "[Icon Theme]\n\
+             Name=Adwaita\n\
+             Inherits=AdwaitaLegacy, hicolor\n\
+             \n\
+             [48x48/apps]\n\
+             Size=48\n",
+        );
+        let index = parse_index(&path);
+        assert_eq!(index.inherits, ["AdwaitaLegacy", "hicolor"]);
+        // A key in the header section must not be mistaken for a directory.
+        assert_eq!(index.dirs.len(), 1);
+    }
+
+    #[test]
+    fn an_index_without_inherits_leaves_the_chain_empty() {
+        let tmp = fresh_tmp();
+        let path = tmp.0.join("index.theme");
+        write_file(
+            &path,
+            "[Icon Theme]\nName=hicolor\n\n[48x48/apps]\nSize=48\n",
+        );
+        assert!(parse_index(&path).inherits.is_empty());
+    }
+
+    #[test]
+    fn a_setting_is_read_from_its_own_section_only() {
+        let tmp = fresh_tmp();
+        let path = tmp.0.join("kdeglobals");
+        write_file(
+            &path,
+            "[General]\n\
+             Theme=not-the-icon-theme\n\
+             \n\
+             [Icons]\n\
+             Theme=breeze\n",
+        );
+        assert_eq!(
+            read_setting(&path, Some("Icons"), "Theme").as_deref(),
+            Some("breeze")
+        );
+        assert_eq!(read_setting(&path, Some("Sound"), "Theme"), None);
+    }
+
+    #[test]
+    fn a_setting_loses_the_quotes_gtkrc_writes() {
+        let tmp = fresh_tmp();
+        let path = tmp.0.join(".gtkrc-2.0");
+        write_file(&path, "gtk-icon-theme-name=\"breeze\"\n");
+        assert_eq!(
+            read_setting(&path, None, "gtk-icon-theme-name").as_deref(),
+            Some("breeze")
+        );
+        assert_eq!(read_setting(&path, None, "gtk-theme-name"), None);
     }
 
     #[test]
@@ -446,12 +622,15 @@ mod tests {
     }
 
     #[test]
-    fn try_extensions_prefers_png() {
+    fn try_extensions_takes_the_first_that_exists_in_order() {
         let tmp = fresh_tmp();
         let dir = &tmp.0;
         write_file(&dir.join("foo.svg"), "<svg/>");
         write_file(&dir.join("foo.png"), "");
-        let got = super::try_extensions(dir, "foo").unwrap();
+        let got = super::try_extensions(dir, "foo", &["png", "svg"]).unwrap();
         assert!(got.ends_with("foo.png"), "got {got:?}");
+        let got = super::try_extensions(dir, "foo", &["svg"]).unwrap();
+        assert!(got.ends_with("foo.svg"), "got {got:?}");
+        assert!(super::try_extensions(dir, "foo", &["xpm"]).is_none());
     }
 }

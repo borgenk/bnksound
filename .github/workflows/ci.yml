@@ -11,26 +11,34 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
-  rust:
-    name: Rust
+  # The shipping binary. GTK is deliberately not installed here: if anything in
+  # the shared code starts reaching for the GTK stack, this job stops building,
+  # which is the whole point of keeping the default feature set empty.
+  native:
+    name: Native (no GTK)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # gtk4 + gdk4-wayland need the GTK and Wayland dev packages; pipewire
-      # and libspa link against the PipeWire dev packages; libspa-sys runs
-      # bindgen at build time, which needs libclang.
+      # pipewire and libspa link against the PipeWire dev packages; libspa-sys
+      # runs bindgen at build time, which needs libclang. Text and keyboard
+      # handling link freetype, fontconfig, harfbuzz, and xkbcommon directly.
+      # The emoji tests skip themselves when no colour emoji font is installed,
+      # so fonts-noto-color-emoji is what makes them actually run here.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
-            libgtk-4-dev \
-            libwayland-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libharfbuzz-dev \
+            libxkbcommon-dev \
+            fonts-noto-color-emoji \
             clang \
             libclang-dev
 
@@ -46,10 +54,66 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --all-targets
 
       - name: Test
         run: cargo test
+
+      # A GTK-free binary should link no GTK, GDK, GLib, or Pango of its own, so
+      # check the artifact rather than trusting the feature flags. The test is
+      # the binary's own DT_NEEDED list: those are the libraries bnksound asks
+      # for. What those libraries then pull in is theirs to choose, and one of
+      # them does pull GLib: HarfBuzz is built with GLib support on the usual
+      # distributions, so libglib loads behind it whatever we ask for. Hence the
+      # whole ldd closure is printed for the record but not gated on.
+      - name: Assert the binary links no GTK stack
+        run: |
+          needed=$(readelf -d target/debug/bnksound | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
+          echo "$needed"
+          if echo "$needed" | grep -Ei 'libgtk|libgdk|libglib|libgobject|libgio|libcairo|libpango'; then
+            echo "::error::the native binary links part of the GTK stack"
+            exit 1
+          fi
+          ldd target/debug/bnksound
+
+  gtk:
+    name: GTK shell
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgtk-4-dev \
+            libwayland-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libfreetype6-dev \
+            libxkbcommon-dev \
+            clang \
+            libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --all-targets --all-features
+
+      - name: Test
+        run: cargo test --all-features

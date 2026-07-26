@@ -1,9 +1,9 @@
 //! Fixed-capacity peak-meter storage shared between the realtime
-//! PipeWire capture callbacks (the writers) and the GTK decay tick
+//! PipeWire capture callbacks (the writers) and the main-thread decay tick
 //! (the reader).
 //!
 //! ```text
-//!   RT audio thread(s)          GTK main thread (~60Hz tick)
+//!   RT audio thread(s)          main thread (~60Hz tick)
 //!   ┌────────────────┐          ┌─────────────────────────┐
 //!   │ process cb      │          │ PeakPool::drain         │
 //!   │  fold(&peaks)   │──┐    ┌─▶│  swap-read every live   │
@@ -15,7 +15,7 @@
 //! ```
 //!
 //! Each monitored node owns one Slot for its capture stream's life.
-//! The audio thread folds buffers in with an atomic max; the GTK thread
+//! The audio thread folds buffers in with an atomic max; the main thread
 //! reads-and-clears to paint the bars. Peaks are |sample| (>= 0), so
 //! the IEEE-754 bit pattern is monotonic and a raw-bits
 //! AtomicU32::fetch_max is a correct float max in one instruction.
@@ -92,7 +92,7 @@ impl PeakPool {
     /// Read-and-clear every live slot, invoking sink with the node id
     /// and its per-channel peaks. Clearing resets each interval so no
     /// transient is double-counted. Silent slots are skipped (the
-    /// caller's decay step eases their bars down). Runs on the GTK thread.
+    /// caller's decay step eases their bars down). Runs on the main thread.
     pub fn drain(&self, mut sink: impl FnMut(u32, &[f32])) {
         for slot in &self.slots {
             let node_id = slot.node_id.load(Ordering::Acquire);

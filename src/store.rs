@@ -61,7 +61,6 @@ pub enum Error {
         source: std::io::Error,
     },
     NoParentDir(PathBuf),
-    NoStatePath,
     InvalidMagic([u8; 4]),
     UnsupportedVersion {
         got: u8,
@@ -97,7 +96,6 @@ impl fmt::Display for Error {
         match self {
             Self::Io { op, path, .. } => write!(f, "{op} {}", path.display())?,
             Self::NoParentDir(p) => write!(f, "state path has no parent: {}", p.display())?,
-            Self::NoStatePath => f.write_str("no XDG_CONFIG_HOME or HOME cannot persist state")?,
             Self::InvalidMagic(b) => write!(f, "invalid state magic: {b:?}")?,
             Self::UnsupportedVersion { got, want } => {
                 write!(f, "unsupported state version {got} (expected {want})")?
@@ -159,6 +157,22 @@ pub fn load_from(path: &Path) -> Result<State> {
             source,
         }),
     }
+}
+
+/// Move a file that would not decode aside, and report where it went.
+///
+/// The app keeps running from defaults after a failed load, and the first thing
+/// it changes would be saved straight over the file it could not read. That
+/// file is the only copy of whatever the user had, including after a downgrade
+/// to a build that predates the current version, so it is kept.
+pub fn quarantine(path: &Path) -> Result<PathBuf> {
+    let kept = path.with_extension("bin.bad");
+    fs::rename(path, &kept).map_err(|source| Error::Io {
+        op: "set aside unreadable state",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(kept)
 }
 
 /// Atomic save: write to a sibling temp file, fsync, rename over the

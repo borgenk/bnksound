@@ -1,7 +1,7 @@
-//! Application-wide visual / behavioral settings, loaded from
-//! `settings.conf`. Missing file means first-run defaults; a malformed
-//! line is an error. Format: one `field value` per line. Unknown fields
-//! are tolerated for forward-compat. Atomic save (temp file + rename).
+//! Application-wide visual / behavioral settings, read from settings.conf.
+//! Missing file means first-run defaults; a malformed line is an error. Format
+//! is one "field value" per line, and unknown fields are tolerated so a config
+//! written by a later build still loads. Hand-edited: nothing writes it back.
 
 use std::fmt;
 use std::fs;
@@ -13,51 +13,82 @@ const FILENAME: &str = "settings.conf";
 /// `parse_lines`; missing fields fall back to the [`Default`] value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
-    /// Whether the window draws a hairline border + drop shadow.
+    /// Whether the window draws a hairline border around its edge.
     pub show_window_border: bool,
-    /// Whether the left action-bar (IN/OUT/APP + M/R strip) is shown.
+    /// Whether the toolbar (IN/OUT/APP filters + M/R actions) is shown.
     pub show_sidebar: bool,
-    /// Per-button visibility for the action bar. Each hides just that one
-    /// button; the sidebar itself stays unless `show_sidebar` is false.
+    /// Per-button visibility for the toolbar. Each hides just that one button;
+    /// the toolbar itself stays unless `show_sidebar` is false.
     pub show_input_button: bool,
     pub show_output_button: bool,
     pub show_apps_button: bool,
     pub show_mute_button: bool,
     pub show_reset_button: bool,
-    /// Large volume `%` readout above each slider. Independent of
-    /// [`Self::percent_on_slider`].
-    pub percent_above: bool,
-    /// Volume `%` drawn on the slider knob itself.
-    pub percent_on_slider: bool,
-    /// How the window's top chrome is drawn. See [`TitlebarMode`].
-    pub titlebar: TitlebarMode,
+    /// Who draws the window's chrome. See [`Decorations`].
+    pub decorations: Decorations,
+    /// Which colours the GTK build's own chrome takes. See [`GtkChrome`]. The
+    /// native shell paints no GTK widgets and ignores it.
+    pub gtk_chrome: GtkChrome,
 }
 
-/// Strategy for the window's top chrome. `HeaderBar` is the default;
-/// `GTK_CSD=0` forces `Strip` at the call site regardless of the setting.
+/// Which colours GTK's chrome takes in the GTK build: the header bar, the
+/// window, and the menus.
+///
+/// `Palette` is the default: the chrome takes the mixer's own colours, so the
+/// two shells look like one app rather than the GTK one looking like whatever
+/// desktop it happens to be on. `Theme` hands the chrome back to the desktop
+/// for anyone who would rather the window matched their other GTK apps. There
+/// is no third option that gets both, so this is the switch between them.
+///
+/// The colours are dark whichever desktop this runs on, since the palette has
+/// no light variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TitlebarMode {
-    /// `gtk::HeaderBar` as the window titlebar.
+pub enum GtkChrome {
     #[default]
-    HeaderBar,
-    /// No GTK titlebar; profile selector in an in-window strip.
-    Strip,
+    Palette,
+    Theme,
 }
 
-impl TitlebarMode {
-    /// Config-file token for this mode, the inverse of [`Self::parse`].
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::HeaderBar => "headerbar",
-            Self::Strip => "strip",
-        }
-    }
-
+impl GtkChrome {
     /// Parse a config-file token. `None` for anything unrecognized.
     fn parse(s: &str) -> Option<Self> {
         match s {
-            "headerbar" => Some(Self::HeaderBar),
-            "strip" => Some(Self::Strip),
+            "theme" => Some(Self::Theme),
+            "palette" => Some(Self::Palette),
+            _ => None,
+        }
+    }
+}
+
+/// Who draws the window's titlebar and borders.
+///
+/// `Server` asks the compositor for them and is the default; `Client` draws them
+/// in-window. A compositor that refuses server-side decorations gets `Client`
+/// regardless, since the alternative is a window with no chrome at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Decorations {
+    #[default]
+    Server,
+    Client,
+}
+
+impl Decorations {
+    /// Parse a config-file token. `None` for anything unrecognized.
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "server" => Some(Self::Server),
+            "client" => Some(Self::Client),
+            _ => None,
+        }
+    }
+
+    /// Read the retired `titlebar` field. A GTK header bar was the app drawing
+    /// its own chrome; dropping it for an in-window strip left the chrome to
+    /// the compositor.
+    fn from_titlebar(s: &str) -> Option<Self> {
+        match s {
+            "headerbar" => Some(Self::Client),
+            "strip" => Some(Self::Server),
             _ => None,
         }
     }
@@ -65,7 +96,7 @@ impl TitlebarMode {
 
 impl Default for Settings {
     fn default() -> Self {
-        // Not derived: the sidebar and its buttons default on (only
+        // Not derived: the toolbar and its buttons default on (only
         // `show_window_border` defaults off).
         Self {
             show_window_border: false,
@@ -75,9 +106,8 @@ impl Default for Settings {
             show_apps_button: true,
             show_mute_button: true,
             show_reset_button: true,
-            percent_above: false,
-            percent_on_slider: true,
-            titlebar: TitlebarMode::HeaderBar,
+            decorations: Decorations::default(),
+            gtk_chrome: GtkChrome::default(),
         }
     }
 }
@@ -89,8 +119,6 @@ pub enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
-    NoParentDir(PathBuf),
-    NoSettingsPath,
     /// A line couldn't be parsed. `line_no` is 1-indexed.
     BadLine {
         line_no: usize,
@@ -105,10 +133,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { op, path, .. } => write!(f, "{op} {}", path.display())?,
-            Self::NoParentDir(p) => write!(f, "settings path has no parent: {}", p.display())?,
-            Self::NoSettingsPath => {
-                f.write_str("no XDG_CONFIG_HOME or HOME cannot persist settings")?
-            }
             Self::BadLine {
                 line_no,
                 content,
@@ -169,58 +193,6 @@ pub fn load_from(path: &Path) -> Result<Settings> {
     }
 }
 
-/// Atomic save: write to a sibling temp file, fsync, rename over the
-/// target. A crash mid-write leaves the previous good file intact.
-pub fn save_to(path: &Path, settings: &Settings) -> Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| Error::NoParentDir(path.to_path_buf()))?;
-    fs::create_dir_all(dir).map_err(|source| Error::Io {
-        op: "mkdir",
-        path: dir.to_path_buf(),
-        source,
-    })?;
-
-    let body = encode(settings);
-    let tmp = path.with_extension("conf.tmp");
-    crate::atomic_write(path, &tmp, body.as_bytes()).map_err(|e| Error::Io {
-        op: e.op,
-        path: e.path,
-        source: e.source,
-    })?;
-    Ok(())
-}
-
-fn encode(settings: &Settings) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "show_window_border {}\n",
-        settings.show_window_border
-    ));
-    out.push_str(&format!("show_sidebar {}\n", settings.show_sidebar));
-    out.push_str(&format!(
-        "show_input_button {}\n",
-        settings.show_input_button
-    ));
-    out.push_str(&format!(
-        "show_output_button {}\n",
-        settings.show_output_button
-    ));
-    out.push_str(&format!("show_apps_button {}\n", settings.show_apps_button));
-    out.push_str(&format!("show_mute_button {}\n", settings.show_mute_button));
-    out.push_str(&format!(
-        "show_reset_button {}\n",
-        settings.show_reset_button
-    ));
-    out.push_str(&format!("percent_above {}\n", settings.percent_above));
-    out.push_str(&format!(
-        "percent_on_slider {}\n",
-        settings.percent_on_slider
-    ));
-    out.push_str(&format!("titlebar {}\n", settings.titlebar.as_str()));
-    out
-}
-
 fn parse_lines(text: &str) -> Result<Settings> {
     let mut settings = Settings::default();
     for (i, raw) in text.lines().enumerate() {
@@ -247,11 +219,19 @@ fn parse_lines(text: &str) -> Result<Settings> {
             })
         };
         // Same shape as `want_bool`, but for the one enum-valued field.
-        let want_titlebar = |value: &str| -> Result<TitlebarMode> {
-            TitlebarMode::parse(value).ok_or_else(|| Error::BadLine {
+        let want_decorations = |value: &str| -> Result<Decorations> {
+            Decorations::parse(value).ok_or_else(|| Error::BadLine {
                 line_no,
                 content: raw.to_string(),
-                reason: format!("expected `headerbar` or `strip`, got `{value}`"),
+                reason: format!("expected `server` or `client`, got `{value}`"),
+            })
+        };
+        // Same shape again, for the GTK build's chrome colours.
+        let want_gtk_chrome = |value: &str| -> Result<GtkChrome> {
+            GtkChrome::parse(value).ok_or_else(|| Error::BadLine {
+                line_no,
+                content: raw.to_string(),
+                reason: format!("expected `theme` or `palette`, got `{value}`"),
             })
         };
         // Each known field gets one arm; unknown fields are tolerated
@@ -264,9 +244,16 @@ fn parse_lines(text: &str) -> Result<Settings> {
             "show_apps_button" => settings.show_apps_button = want_bool(value)?,
             "show_mute_button" => settings.show_mute_button = want_bool(value)?,
             "show_reset_button" => settings.show_reset_button = want_bool(value)?,
-            "percent_above" => settings.percent_above = want_bool(value)?,
-            "percent_on_slider" => settings.percent_on_slider = want_bool(value)?,
-            "titlebar" => settings.titlebar = want_titlebar(value)?,
+            "decorations" => settings.decorations = want_decorations(value)?,
+            "gtk_chrome" => settings.gtk_chrome = want_gtk_chrome(value)?,
+            // Retired in favour of `decorations`. Still read so an existing
+            // config keeps the chrome it asked for; an unreadable value falls
+            // back to the default rather than refusing to start.
+            "titlebar" => {
+                if let Some(mode) = Decorations::from_titlebar(value) {
+                    settings.decorations = mode;
+                }
+            }
             _ => {}
         }
     }
@@ -356,33 +343,6 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_through_encode_and_parse() {
-        for original in [
-            Settings::default(),
-            Settings {
-                show_window_border: true,
-                ..Settings::default()
-            },
-            Settings {
-                show_window_border: false,
-                show_sidebar: false,
-                show_input_button: false,
-                show_output_button: true,
-                show_apps_button: false,
-                show_mute_button: true,
-                show_reset_button: false,
-                percent_above: true,
-                percent_on_slider: false,
-                titlebar: TitlebarMode::Strip,
-            },
-        ] {
-            let encoded = encode(&original);
-            let decoded = parse_lines(&encoded).expect("re-parses");
-            assert_eq!(decoded, original);
-        }
-    }
-
-    #[test]
     fn sidebar_and_buttons_default_on() {
         let d = Settings::default();
         assert!(d.show_sidebar);
@@ -411,25 +371,67 @@ mod tests {
     }
 
     #[test]
-    fn titlebar_defaults_to_headerbar() {
-        assert_eq!(Settings::default().titlebar, TitlebarMode::HeaderBar);
-        assert_eq!(parse_lines("").unwrap().titlebar, TitlebarMode::HeaderBar);
+    fn decorations_default_to_server_side() {
+        assert_eq!(Settings::default().decorations, Decorations::Server);
+        assert_eq!(parse_lines("").unwrap().decorations, Decorations::Server);
     }
 
     #[test]
-    fn parses_titlebar_mode() {
+    fn parses_decorations() {
         for (input, expected) in [
-            ("headerbar", TitlebarMode::HeaderBar),
-            ("strip", TitlebarMode::Strip),
+            ("server", Decorations::Server),
+            ("client", Decorations::Client),
         ] {
-            let s = parse_lines(&format!("titlebar {input}")).unwrap();
-            assert_eq!(s.titlebar, expected, "input `{input}`");
+            let s = parse_lines(&format!("decorations {input}")).unwrap();
+            assert_eq!(s.decorations, expected, "input `{input}`");
         }
-        for bad in ["HeaderBar", "STRIP", "bar", "true", "none", "1"] {
+        for bad in ["Server", "CLIENT", "headerbar", "true", "none", "1"] {
             let err =
-                parse_lines(&format!("titlebar {bad}")).expect_err("should reject unknown mode");
+                parse_lines(&format!("decorations {bad}")).expect_err("should reject unknown mode");
             assert!(matches!(err, Error::BadLine { .. }), "input `{bad}`");
         }
+    }
+
+    /// The two shells look like one app out of the box, so handing the chrome
+    /// back to the desktop takes an explicit `theme`.
+    #[test]
+    fn gtk_chrome_defaults_to_the_mixer_palette() {
+        assert_eq!(Settings::default().gtk_chrome, GtkChrome::Palette);
+        assert_eq!(parse_lines("").unwrap().gtk_chrome, GtkChrome::Palette);
+    }
+
+    #[test]
+    fn parses_gtk_chrome() {
+        for (input, expected) in [("theme", GtkChrome::Theme), ("palette", GtkChrome::Palette)] {
+            let s = parse_lines(&format!("gtk_chrome {input}")).unwrap();
+            assert_eq!(s.gtk_chrome, expected, "input `{input}`");
+        }
+        for bad in ["Theme", "PALETTE", "native", "true", "dark", "1"] {
+            let err =
+                parse_lines(&format!("gtk_chrome {bad}")).expect_err("should reject unknown mode");
+            assert!(matches!(err, Error::BadLine { .. }), "input `{bad}`");
+        }
+    }
+
+    /// A config written before `decorations` existed still says what chrome the
+    /// user wanted, so it keeps working without them editing anything.
+    #[test]
+    fn the_retired_titlebar_field_migrates_to_decorations() {
+        // A header bar was chrome the app drew; a bare strip left it to the
+        // compositor. Getting this backwards hands the window the wrong chrome.
+        for (input, expected) in [
+            ("headerbar", Decorations::Client),
+            ("strip", Decorations::Server),
+        ] {
+            let s = parse_lines(&format!("titlebar {input}")).unwrap();
+            assert_eq!(s.decorations, expected, "input `{input}`");
+        }
+        // An unreadable legacy value is tolerated, not fatal.
+        let s = parse_lines("titlebar nonsense").expect("legacy junk does not refuse to start");
+        assert_eq!(s.decorations, Decorations::Server);
+        // An explicit `decorations` line wins when both appear.
+        let s = parse_lines("titlebar headerbar\ndecorations server").unwrap();
+        assert_eq!(s.decorations, Decorations::Server);
     }
 
     #[test]
@@ -438,21 +440,5 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let s = load_from(&path).expect("missing file ok");
         assert_eq!(s, Settings::default());
-    }
-
-    #[test]
-    fn save_then_load_roundtrip() {
-        let tmpdir = std::env::temp_dir().join("bnksound_settings_roundtrip");
-        std::fs::create_dir_all(&tmpdir).expect("mkdir");
-        let path = tmpdir.join("settings.conf");
-        let original = Settings {
-            show_window_border: true,
-            show_sidebar: false,
-            ..Settings::default()
-        };
-        save_to(&path, &original).expect("save");
-        let loaded = load_from(&path).expect("load");
-        assert_eq!(loaded, original);
-        std::fs::remove_file(&path).expect("cleanup");
     }
 }

@@ -164,19 +164,19 @@ pub fn filter_commands(commands: &[PaletteCommand], query: &str) -> Vec<usize> {
 ///   2 = every query character appears in order somewhere in the label
 ///   None = no match
 fn score_match(label: &str, query: &str) -> Option<u8> {
-    let label_words: Vec<&str> = label
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
-    let query_words: Vec<&str> = query.split_whitespace().collect();
-
-    if !query_words.is_empty() {
-        let all_prefix = query_words
-            .iter()
-            .all(|qw| label_words.iter().any(|lw| lw.starts_with(qw)));
-        if all_prefix {
-            return Some(0);
-        }
+    // The label is re-split per query word rather than collected once: both
+    // sides are a handful of short slices, and this runs over every command on
+    // every keystroke, so the two Vecs cost more than the repeated walk.
+    let label_words = || {
+        label
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+    };
+    let mut query_words = query.split_whitespace().peekable();
+    if query_words.peek().is_some()
+        && query_words.all(|qw| label_words().any(|lw| lw.starts_with(qw)))
+    {
+        return Some(0);
     }
 
     if label.contains(query) {
@@ -195,6 +195,25 @@ fn score_match(label: &str, query: &str) -> Option<u8> {
 /// Hard cap on visible rows so a runaway list (lots of apps × lots of
 /// sinks) doesn't blow up the panel height.
 pub const MAX_VISIBLE: usize = 40;
+
+/// How many rows the list shows at once. Anything past this scrolls, so the
+/// panel keeps a fixed height whatever the query matches. Layout shows fewer
+/// when the window is too short for all of them.
+pub const VISIBLE_ROWS: usize = 12;
+
+/// The scroll offset that keeps `selected` on screen, moving the list the
+/// least it can: rows above the window pull it up, rows below push it down,
+/// and a selection already inside leaves it where it is.
+pub fn scroll_into_view(scroll: usize, selected: usize, capacity: usize) -> usize {
+    let capacity = capacity.max(1);
+    if selected < scroll {
+        selected
+    } else if selected >= scroll + capacity {
+        selected + 1 - capacity
+    } else {
+        scroll
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -220,9 +239,7 @@ mod tests {
             geometry: Geometry::default(),
             geometry_dirty: false,
             store_path: None,
-            palette_open: false,
-            palette_query: String::new(),
-            palette_selected: 0,
+            palette: None,
             section_filter: crate::domain::SectionFilter::default(),
         }
     }
@@ -513,5 +530,33 @@ mod tests {
         assert!(!labels.iter().any(|l| l.starts_with("input: make default")));
         // The mute command is still offered for the default source.
         assert!(labels.iter().any(|l| l.starts_with("input: mute")));
+    }
+
+    #[test]
+    fn a_selection_inside_the_window_leaves_the_scroll_alone() {
+        for selected in 3..=7 {
+            assert_eq!(scroll_into_view(3, selected, 5), 3, "selected {selected}");
+        }
+    }
+
+    #[test]
+    fn a_selection_above_the_window_pulls_it_up_to_that_row() {
+        assert_eq!(scroll_into_view(3, 2, 5), 2);
+        // Wrapping from the first row to the last lands the window on the top.
+        assert_eq!(scroll_into_view(9, 0, 5), 0);
+    }
+
+    #[test]
+    fn a_selection_below_the_window_pushes_it_down_by_the_overshoot() {
+        // Window 3..8 and a selection at 8 moves it exactly one row.
+        assert_eq!(scroll_into_view(3, 8, 5), 4);
+        // Wrapping from the last row to the first shows the end of the list.
+        assert_eq!(scroll_into_view(0, 39, 5), 35);
+    }
+
+    #[test]
+    fn a_window_with_no_room_still_shows_the_selected_row() {
+        // Capacity 0 would divide the list into nothing; one row is the floor.
+        assert_eq!(scroll_into_view(0, 4, 0), 4);
     }
 }

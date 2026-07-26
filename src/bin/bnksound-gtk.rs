@@ -1,9 +1,8 @@
-use bnksound::app;
+use bnksound::APP_ID;
+use bnksound::gtk_shell::app;
 use gtk4 as gtk;
 use gtk4::glib;
 use gtk4::prelude::*;
-
-const APP_ID: &str = "io.github.borgenk.BnkSound";
 
 fn main() -> glib::ExitCode {
     gtk4::gdk::set_allowed_backends("wayland");
