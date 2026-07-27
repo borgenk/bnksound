@@ -74,15 +74,24 @@ jobs:
       # them does pull GLib: HarfBuzz is built with GLib support on the usual
       # distributions, so libglib loads behind it whatever we ask for. Hence the
       # whole ldd closure is printed for the record but not gated on.
+      # .cargo/config.toml names a target, so artifacts live under the triple
+      # rather than straight in target/. Missing the binary is its own error:
+      # readelf on a path that does not exist reads as a linkage failure
+      # otherwise.
       - name: Assert the binary links no GTK stack
         run: |
-          needed=$(readelf -d target/debug/bnksound | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
+          bin=target/x86_64-unknown-linux-gnu/debug/bnksound
+          if [ ! -f "$bin" ]; then
+            echo "::error::$bin not found, the build layout moved"
+            exit 1
+          fi
+          needed=$(readelf -d "$bin" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
           echo "$needed"
           if echo "$needed" | grep -Ei 'libgtk|libgdk|libglib|libgobject|libgio|libcairo|libpango'; then
             echo "::error::the native binary links part of the GTK stack"
             exit 1
           fi
-          ldd target/debug/bnksound
+          ldd "$bin"
 
   gtk:
     name: GTK shell
