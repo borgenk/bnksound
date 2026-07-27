@@ -1,6 +1,6 @@
 [package]
 name = "bnksound"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # Two binaries ship, so `cargo run` needs to be told which one it means.
 default-run = "bnksound"
