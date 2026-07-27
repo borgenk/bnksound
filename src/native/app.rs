@@ -498,8 +498,10 @@ impl App {
                 let states = toplevel_states(raw_states);
                 if debug_enabled() {
                     let listed: Vec<u32> = raw_states
-                        .chunks_exact(4)
-                        .filter_map(|c| c.try_into().ok().map(u32::from_ne_bytes))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|&c| u32::from_ne_bytes(c))
                         .collect();
                     eprintln!(
                         "{:>6}ms toplevel configure: {w}x{h} states={listed:?} \
@@ -1486,8 +1488,10 @@ impl ToplevelStates {
 fn toplevel_states(bytes: &[u8]) -> ToplevelStates {
     let mut out = ToplevelStates::default();
     for state in bytes
-        .chunks_exact(4)
-        .filter_map(|c| c.try_into().ok().map(u32::from_ne_bytes))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| u32::from_ne_bytes(c))
     {
         match state {
             TOPLEVEL_STATE_MAXIMIZED | TOPLEVEL_STATE_FULLSCREEN => out.maximized = true,

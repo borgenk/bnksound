@@ -49,33 +49,40 @@ jobs:
             clang \
             libclang-dev
 
+      # Nightly, with the standard library source: rust-toolchain.toml pins the
+      # channel and .cargo/config.toml builds std from source with the app.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # The tarball holds the GTK build under the name bnksound. The native one
-      # is built too but not published: a tag should not be the moment we find
-      # out it stopped compiling.
-      - name: Build the native binary
-        run: cargo build --release --bin bnksound
-
+      # Builds both binaries and stages them: bnksound is the GTK build,
+      # bnksound-undecorated the one with no decorations and no GTK.
       - name: Build release tarball
         run: make build-linux
 
-      # The published binary is the GTK one whatever the file is called, so
-      # check the artifact says so before it goes out.
-      - name: Verify the tarball holds the GTK build
+      # install.sh picks a file out of the tarball by name, so check that each
+      # name holds the build it claims before the release goes out. The GTK one
+      # must link GTK, and the native one must link no part of the GTK stack.
+      - name: Verify both builds in the tarball
         run: |
-          tar -xzf dist/*.tar.gz -O ./bnksound > /tmp/shipped
-          chmod +x /tmp/shipped
-          needed=$(readelf -d /tmp/shipped | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
-          echo "$needed"
-          echo "$needed" | grep -q '^libgtk-4' || {
+          tar -xzf dist/*.tar.gz -O ./bnksound > /tmp/shipped-gtk
+          tar -xzf dist/*.tar.gz -O ./bnksound-undecorated > /tmp/shipped-native
+          needed_gtk=$(readelf -d /tmp/shipped-gtk | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
+          needed_native=$(readelf -d /tmp/shipped-native | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
+          echo "gtk: $needed_gtk"
+          echo "native: $needed_native"
+          if ! echo "$needed_gtk" | grep -q '^libgtk-4'; then
             echo "::error::the tarball's bnksound does not link GTK"
             exit 1
-          }
+          fi
+          if echo "$needed_native" | grep -qE '^lib(gtk|gdk|glib|gio|gobject|cairo|pango|gdk_pixbuf)'; then
+            echo "::error::the tarball's bnksound-undecorated links the GTK stack"
+            exit 1
+          fi
 
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2

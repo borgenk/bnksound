@@ -3,11 +3,19 @@
 	build-native build-native-release run-native \
 	build-gtk build-gtk-release run-gtk test-matrix tables perf perf-save frame
 
+# The toolchain is nightly (rust-toolchain.toml) and .cargo/config.toml builds
+# the standard library from source alongside the app. Release binaries come out
+# around a third smaller than a stable build and paint a few percent faster,
+# because LTO reaches std and release panics abort where they happen instead of
+# unwinding through a formatter. The cost is that a release panic prints
+# nothing at all. Debug builds and the test harness are untouched: the panic
+# strategy is set on the release profile only.
 APP_NAME := bnksound
 APP_ID := io.github.borgenk.BnkSound
-BUILD_PATH := target/release
 VERSION := $(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 LINUX_TARGET := x86_64-unknown-linux-gnu
+# Everything lands under the target triple, since .cargo/config.toml names one.
+BUILD_PATH := target/$(LINUX_TARGET)/release
 BIN_DIR := ~/.local/bin
 APPS_DIR := ~/.local/share/applications
 ICON_DIR := ~/.local/share/icons/hicolor
@@ -115,18 +123,23 @@ bump:
 	@echo "Bumped to v$(V). Push with: git push origin main --tags"
 
 # Build a release tarball into dist/ for upload to a GitHub Release.
-# Bundles the binary, desktop entry, and icon tree so install.sh can place them all.
+# Bundles both binaries, the desktop entry, and the icon tree so install.sh can
+# place any of them.
 #
-# What ships is the GTK build, staged under the plain name bnksound: a download
-# gets the GTK shell and needs GTK 4 at runtime. Building from source is the
-# other way round, `cargo build` with no features gives the native binary under
-# that same name.
+# Both variants ship. bnksound in the tarball is the GTK build, which is what
+# install.sh takes by default and what needs GTK 4 at runtime;
+# bnksound-undecorated beside it draws no window decorations and needs no GTK,
+# which install.sh --undecorated takes instead. Whichever is chosen installs
+# under the plain name bnksound.
 build-linux:
 	RUSTFLAGS="--remap-path-prefix=$(HOME)=[home]" \
-		cargo build --release --features gtk --bin $(APP_NAME)-gtk --target $(LINUX_TARGET)
+		cargo build --release --features gtk --bin $(APP_NAME)-gtk
+	RUSTFLAGS="--remap-path-prefix=$(HOME)=[home]" \
+		cargo build --release --bin $(APP_NAME)
 	rm -rf dist/stage
 	mkdir -p dist/stage/icons
-	cp target/$(LINUX_TARGET)/release/$(APP_NAME)-gtk dist/stage/$(APP_NAME)
+	cp $(BUILD_PATH)/$(APP_NAME)-gtk dist/stage/$(APP_NAME)
+	cp $(BUILD_PATH)/$(APP_NAME) dist/stage/$(APP_NAME)-undecorated
 	cp assets/$(APP_ID).desktop dist/stage/$(APP_ID).desktop
 	cp -r assets/icons/hicolor dist/stage/icons/hicolor
 	tar czf dist/$(APP_NAME)-v$(VERSION)-$(LINUX_TARGET).tar.gz -C dist/stage .

@@ -249,8 +249,8 @@ fn collect_fds(mut ctrl: &[u8], out: &mut Vec<OwnedFd>) {
         }
         if hdr.level == SOL_SOCKET && hdr.kind == SCM_RIGHTS {
             let data = &ctrl[CMSG_HDR_LEN..hdr.len];
-            for fd_bytes in data.chunks_exact(size_of::<RawFd>()) {
-                let fd = RawFd::from_ne_bytes(fd_bytes.try_into().unwrap_or_default());
+            for &fd_bytes in data.as_chunks::<{ size_of::<RawFd>() }>().0 {
+                let fd = RawFd::from_ne_bytes(fd_bytes);
                 // SAFETY: the kernel passed us an owned fd via SCM_RIGHTS.
                 out.push(unsafe { OwnedFd::from_raw_fd(fd) });
             }

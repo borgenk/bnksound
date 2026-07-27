@@ -5,14 +5,41 @@ set -eu
 # the desktop entry and icon theme so it shows up in your app menu.
 # Pin a specific version with BNKSOUND_VERSION=v0.1.0.
 #
-# The released bnksound is the GTK build, so it needs GTK 4 installed. For a
-# build that needs no toolkit at all, build the native one from source:
-# `make install` in a checkout installs it under the same name.
+# Two builds ship in the same tarball and both install as bnksound:
+#
+#   sh install.sh                  the GTK build, needs GTK 4 at runtime
+#   sh install.sh --undecorated    no window decorations, no GTK
+#
+# Through a pipe the flag goes after -s --:
+#   curl -fsSL <url> | sh -s -- --undecorated
 
 REPO="borgenk/bnksound"
 APP_ID="io.github.borgenk.BnkSound"
 
+# Which file inside the tarball to install. The flag swaps it for the other one.
+VARIANT="bnksound"
+VARIANT_NAME="GTK"
+
 main() {
+    for arg in "$@"; do
+        case "$arg" in
+            --undecorated)
+                VARIANT="bnksound-undecorated"
+                VARIANT_NAME="undecorated" ;;
+            --gtk)
+                VARIANT="bnksound"
+                VARIANT_NAME="GTK" ;;
+            -h | --help)
+                echo "Usage: install.sh [--gtk | --undecorated]"
+                echo "  --gtk          the GTK build (default), needs GTK 4"
+                echo "  --undecorated  no window decorations, no GTK"
+                exit 0 ;;
+            *)
+                echo "Error: unknown option: $arg (try --help)"
+                exit 1 ;;
+        esac
+    done
+
     platform="$(uname -s)"
     arch="$(uname -m)"
 
@@ -67,31 +94,38 @@ main() {
     fi
     trap 'rm -rf "$TMP_DIR"' EXIT
 
-    echo "Downloading bnksound ${VERSION} for ${TARGET}..."
+    echo "Downloading bnksound ${VERSION} for ${TARGET} (${VARIANT_NAME} build)..."
     fetch "$URL" "$TMP_DIR/$FILENAME"
 
     echo "Extracting..."
     tar -xzf "$TMP_DIR/$FILENAME" -C "$TMP_DIR"
 
+    if [ ! -f "$TMP_DIR/$VARIANT" ]; then
+        echo "Error: this release has no ${VARIANT_NAME} build (${VARIANT} is not"
+        echo "in the tarball). Older releases shipped the GTK build only."
+        exit 1
+    fi
+
     INSTALL_DIR="${HOME}/.local/bin"
     mkdir -p "$INSTALL_DIR"
-    mv "$TMP_DIR/bnksound" "$INSTALL_DIR/bnksound"
+    mv "$TMP_DIR/$VARIANT" "$INSTALL_DIR/bnksound"
     chmod +x "$INSTALL_DIR/bnksound"
 
-    echo "Installed bnksound ${VERSION} to ${INSTALL_DIR}/bnksound"
+    echo "Installed bnksound ${VERSION} (${VARIANT_NAME} build) to ${INSTALL_DIR}/bnksound"
 
     # Name what the loader cannot find. Launched from the app menu a missing
-    # library is a window that never appears, so say it here instead. GTK 4 is
-    # the one most likely to be absent, this build being the GTK one.
+    # library is a window that never appears, so say it here instead.
     if command -v ldd > /dev/null 2>&1; then
         missing="$(ldd "$INSTALL_DIR/bnksound" 2>/dev/null | grep 'not found' || true)"
         if [ -n "$missing" ]; then
             echo ""
             echo "Warning: bnksound will not start, these libraries are missing:"
             echo "$missing" | awk '{print "  " $1}'
-            echo ""
-            echo "GTK 4 is usually the one: install libgtk-4-1 (Debian, Ubuntu)"
-            echo "or gtk4 (Arch, Fedora), or build the native variant from source."
+            if [ "$VARIANT" = "bnksound" ]; then
+                echo ""
+                echo "GTK 4 is usually the one: install libgtk-4-1 (Debian, Ubuntu)"
+                echo "or gtk4 (Arch, Fedora), or reinstall with --undecorated."
+            fi
         fi
     fi
 

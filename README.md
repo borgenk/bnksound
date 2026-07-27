@@ -20,6 +20,14 @@ curl -fsSL https://raw.githubusercontent.com/borgenk/bnksound/main/install.sh | 
 
 This drops the binary in `~/.local/bin` and installs the desktop entry and icon.
 
+### Undecorated build
+
+Without window decorations or GTK, for tiling compositors and similar:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/borgenk/bnksound/main/install.sh | sh -s -- --undecorated
+```
+
 ## Configuration
 
 State lives under the XDG config dir (`$XDG_CONFIG_HOME/bnksound`, falling back

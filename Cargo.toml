@@ -1,3 +1,7 @@
+# panic = "immediate-abort" on the release profile is still unstable, so the
+# manifest has to opt in. That is what pins this project to nightly.
+cargo-features = ["panic-immediate-abort"]
+
 [package]
 name = "bnksound"
 version = "0.3.0"
@@ -39,10 +43,19 @@ pipewire = "0.10"
 libspa = "0.10"
 libspa-sys = "0.10"
 
+# opt-level stays at 3: "s" costs the paint scenarios 13% to 24% and "z" costs
+# them 78% to 91%, which the perf gate rejects.
+#
+# immediate-abort is where most of the size goes: no unwinding, no panic
+# formatter, and none of std's backtrace symbolizer. A release panic prints
+# nothing, which is the whole cost of it. Debug builds and the test harness keep
+# unwinding panics, since the strategy is set here rather than in RUSTFLAGS.
+#
+# For a profile with symbols, build with --config profile.release.strip=false
+# --config profile.release.debug=1. A readable panic needs a debug build.
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
-debug = 1
-strip = "debuginfo"
+panic = "immediate-abort"
+strip = true

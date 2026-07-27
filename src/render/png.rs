@@ -649,7 +649,9 @@ fn build_palette(plte: &[u8], trns: &[u8]) -> Result<Vec<u32>, DecodeError> {
         return Err(DecodeError::MissingPalette);
     }
     Ok(plte
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .enumerate()
         .map(|(i, c)| pack(trns.get(i).copied().unwrap_or(0xff), c[0], c[1], c[2]))
         .collect())

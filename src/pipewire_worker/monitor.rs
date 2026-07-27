@@ -144,15 +144,13 @@ pub(crate) fn start_monitor_stream(
                 let chunk_size = d.chunk().size() as usize;
                 let Some(bytes) = d.data() else { continue };
                 let bytes = &bytes[..chunk_size.min(bytes.len())];
-                for (idx, sample_bytes) in
-                    bytes.chunks_exact(std::mem::size_of::<f32>()).enumerate()
+                for (idx, &sample_bytes) in bytes
+                    .as_chunks::<{ std::mem::size_of::<f32>() }>()
+                    .0
+                    .iter()
+                    .enumerate()
                 {
-                    let s = f32::from_le_bytes([
-                        sample_bytes[0],
-                        sample_bytes[1],
-                        sample_bytes[2],
-                        sample_bytes[3],
-                    ]);
+                    let s = f32::from_le_bytes(sample_bytes);
                     let a = s.abs();
                     let ch = if collapse_extra { 0 } else { idx % track };
                     if a > peaks_buf[ch] {

@@ -43,9 +43,9 @@ jobs:
             libclang-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, rust-src
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -102,9 +102,9 @@ jobs:
             libclang-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          components: clippy
+          components: clippy, rust-src
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

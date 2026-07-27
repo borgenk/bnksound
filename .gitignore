@@ -1,7 +1,6 @@
 # Build artifacts
 debug/
 target/
-.cargo/
 
 # Release output
 dist/
