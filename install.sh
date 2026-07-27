@@ -16,6 +16,42 @@ set -eu
 REPO="borgenk/bnksound"
 APP_ID="io.github.borgenk.BnkSound"
 
+# Check a download against the sha256 published beside it. A mismatch stops the
+# install; anything else that goes wrong only warns, since a release from before
+# checksums existed, or a machine with no digest tool, should still install.
+verify_checksum() {
+    file="$1"
+    sums_url="$2"
+
+    if ! fetch "$sums_url" "$file.sha256" 2> /dev/null; then
+        echo "Note: this release publishes no checksum, skipping verification"
+        return 0
+    fi
+
+    if command -v sha256sum > /dev/null 2>&1; then
+        actual="$(sha256sum "$file" | cut -d' ' -f1)"
+    elif command -v shasum > /dev/null 2>&1; then
+        actual="$(shasum -a 256 "$file" | cut -d' ' -f1)"
+    elif command -v openssl > /dev/null 2>&1; then
+        actual="$(openssl dgst -sha256 "$file" | awk '{print $NF}')"
+    else
+        echo "Note: no sha256 tool found, skipping verification"
+        return 0
+    fi
+
+    # The published file is `sha256sum` output, so the digest is its first field.
+    expected="$(cut -d' ' -f1 < "$file.sha256")"
+
+    if [ "$expected" != "$actual" ]; then
+        echo "Error: checksum mismatch, refusing to install"
+        echo "  expected: $expected"
+        echo "  actual:   $actual"
+        exit 1
+    fi
+
+    echo "Checksum verified"
+}
+
 # Which file inside the tarball to install. The flag swaps it for the other one.
 VARIANT="bnksound"
 VARIANT_NAME="GTK"
@@ -96,6 +132,8 @@ main() {
 
     echo "Downloading bnksound ${VERSION} for ${TARGET} (${VARIANT_NAME} build)..."
     fetch "$URL" "$TMP_DIR/$FILENAME"
+
+    verify_checksum "$TMP_DIR/$FILENAME" "${URL}.sha256"
 
     echo "Extracting..."
     tar -xzf "$TMP_DIR/$FILENAME" -C "$TMP_DIR"

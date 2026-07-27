@@ -1,5 +1,8 @@
 # BNK Sound
 
+[![CI](https://github.com/borgenk/bnksound/actions/workflows/ci.yml/badge.svg)](https://github.com/borgenk/bnksound/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/borgenk/bnksound)](https://github.com/borgenk/bnksound/releases/latest)
+
 A native audio mixer for Wayland, with per-app volume and savable profiles.
 
 _Disclaimer: personal project, built mainly for my own use, partly AI-assisted._

@@ -131,6 +131,12 @@ bump:
 # bnksound-undecorated beside it draws no window decorations and needs no GTK,
 # which install.sh --undecorated takes instead. Whichever is chosen installs
 # under the plain name bnksound.
+#
+# The tarball ships with a sha256 file beside it, which install.sh checks
+# before it unpacks anything. The digest names the bare tarball, so
+# `sha256sum -c` works by hand in dist/ too.
+TARBALL := $(APP_NAME)-v$(VERSION)-$(LINUX_TARGET).tar.gz
+
 build-linux:
 	RUSTFLAGS="--remap-path-prefix=$(HOME)=[home]" \
 		cargo build --release --features gtk --bin $(APP_NAME)-gtk
@@ -142,10 +148,11 @@ build-linux:
 	cp $(BUILD_PATH)/$(APP_NAME) dist/stage/$(APP_NAME)-undecorated
 	cp assets/$(APP_ID).desktop dist/stage/$(APP_ID).desktop
 	cp -r assets/icons/hicolor dist/stage/icons/hicolor
-	tar czf dist/$(APP_NAME)-v$(VERSION)-$(LINUX_TARGET).tar.gz -C dist/stage .
+	tar czf dist/$(TARBALL) -C dist/stage .
 	rm -rf dist/stage
-	@echo "Built dist/$(APP_NAME)-v$(VERSION)-$(LINUX_TARGET).tar.gz"
-	@echo "Publish with: gh release create v$(VERSION) dist/$(APP_NAME)-v$(VERSION)-$(LINUX_TARGET).tar.gz"
+	cd dist && sha256sum $(TARBALL) > $(TARBALL).sha256
+	@echo "Built dist/$(TARBALL) and dist/$(TARBALL).sha256"
+	@echo "Publish with: gh release create v$(VERSION) dist/$(TARBALL) dist/$(TARBALL).sha256"
 
 run:
 	cargo run
