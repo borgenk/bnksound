@@ -5,7 +5,7 @@ set -eu
 # the desktop entry and icon theme so it shows up in your app menu.
 # Pin a specific version with BNKSOUND_VERSION=v0.1.0.
 #
-# Two builds ship in the same tarball and both install as bnksound:
+# Two builds ship, one archive each, and both install as bnksound:
 #
 #   sh install.sh                  the GTK build, needs GTK 4 at runtime
 #   sh install.sh --undecorated    no window decorations, no GTK
@@ -52,18 +52,19 @@ verify_checksum() {
     echo "Checksum verified"
 }
 
-# Which file inside the tarball to install. The flag swaps it for the other one.
-VARIANT="bnksound"
+# Which archive to fetch. Each holds its binary under the plain name bnksound,
+# so only the name of the download changes with the flag.
+ARCHIVE="bnksound"
 VARIANT_NAME="GTK"
 
 main() {
     for arg in "$@"; do
         case "$arg" in
             --undecorated)
-                VARIANT="bnksound-undecorated"
+                ARCHIVE="bnksound-undecorated"
                 VARIANT_NAME="undecorated" ;;
             --gtk)
-                VARIANT="bnksound"
+                ARCHIVE="bnksound"
                 VARIANT_NAME="GTK" ;;
             -h | --help)
                 echo "Usage: install.sh [--gtk | --undecorated]"
@@ -120,7 +121,7 @@ main() {
         fi
     fi
 
-    FILENAME="bnksound-${VERSION}-${TARGET}.tar.gz"
+    FILENAME="${ARCHIVE}-${VERSION}-${TARGET}.tar.gz"
     URL="https://github.com/${REPO}/releases/download/${VERSION}/${FILENAME}"
 
     if [ -n "${TMPDIR:-}" ] && [ -d "${TMPDIR}" ]; then
@@ -131,22 +132,28 @@ main() {
     trap 'rm -rf "$TMP_DIR"' EXIT
 
     echo "Downloading bnksound ${VERSION} for ${TARGET} (${VARIANT_NAME} build)..."
-    fetch "$URL" "$TMP_DIR/$FILENAME"
+    if ! fetch "$URL" "$TMP_DIR/$FILENAME"; then
+        echo "Error: could not download the ${VARIANT_NAME} build of ${VERSION}"
+        echo "  $URL"
+        if [ "$ARCHIVE" != "bnksound" ]; then
+            echo "Releases before v0.3.3 shipped one archive holding both builds."
+        fi
+        exit 1
+    fi
 
     verify_checksum "$TMP_DIR/$FILENAME" "${URL}.sha256"
 
     echo "Extracting..."
     tar -xzf "$TMP_DIR/$FILENAME" -C "$TMP_DIR"
 
-    if [ ! -f "$TMP_DIR/$VARIANT" ]; then
-        echo "Error: this release has no ${VARIANT_NAME} build (${VARIANT} is not"
-        echo "in the tarball). Older releases shipped the GTK build only."
+    if [ ! -f "$TMP_DIR/bnksound" ]; then
+        echo "Error: the archive holds no bnksound binary"
         exit 1
     fi
 
     INSTALL_DIR="${HOME}/.local/bin"
     mkdir -p "$INSTALL_DIR"
-    mv "$TMP_DIR/$VARIANT" "$INSTALL_DIR/bnksound"
+    mv "$TMP_DIR/bnksound" "$INSTALL_DIR/bnksound"
     chmod +x "$INSTALL_DIR/bnksound"
 
     echo "Installed bnksound ${VERSION} (${VARIANT_NAME} build) to ${INSTALL_DIR}/bnksound"
@@ -159,7 +166,7 @@ main() {
             echo ""
             echo "Warning: bnksound will not start, these libraries are missing:"
             echo "$missing" | awk '{print "  " $1}'
-            if [ "$VARIANT" = "bnksound" ]; then
+            if [ "$ARCHIVE" = "bnksound" ]; then
                 echo ""
                 echo "GTK 4 is usually the one: install libgtk-4-1 (Debian, Ubuntu)"
                 echo "or gtk4 (Arch, Fedora), or reinstall with --undecorated."

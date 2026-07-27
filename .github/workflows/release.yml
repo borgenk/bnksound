@@ -59,28 +59,29 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # Builds both binaries and stages them: bnksound is the GTK build,
-      # bnksound-undecorated the one with no decorations and no GTK.
-      - name: Build release tarball
+      # One archive per variant, each holding its binary as bnksound.
+      - name: Build release tarballs
         run: make build-linux
 
-      # install.sh picks a file out of the tarball by name, so check that each
-      # name holds the build it claims before the release goes out. The GTK one
-      # must link GTK, and the native one must link no part of the GTK stack.
-      - name: Verify both builds in the tarball
+      # install.sh picks an archive by name and trusts the binary inside it, so
+      # check that each archive holds the build its name claims. The GTK one
+      # must link GTK, the undecorated one must link no part of that stack.
+      - name: Verify each archive holds the build it claims
         run: |
-          tar -xzf dist/*.tar.gz -O ./bnksound > /tmp/shipped-gtk
-          tar -xzf dist/*.tar.gz -O ./bnksound-undecorated > /tmp/shipped-native
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          target=x86_64-unknown-linux-gnu
+          tar -xzf "dist/bnksound-v$version-$target.tar.gz" -O ./bnksound > /tmp/shipped-gtk
+          tar -xzf "dist/bnksound-undecorated-v$version-$target.tar.gz" -O ./bnksound > /tmp/shipped-und
           needed_gtk=$(readelf -d /tmp/shipped-gtk | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
-          needed_native=$(readelf -d /tmp/shipped-native | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
+          needed_und=$(readelf -d /tmp/shipped-und | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
           echo "gtk: $needed_gtk"
-          echo "native: $needed_native"
+          echo "undecorated: $needed_und"
           if ! echo "$needed_gtk" | grep -q '^libgtk-4'; then
-            echo "::error::the tarball's bnksound does not link GTK"
+            echo "::error::the GTK archive's bnksound does not link GTK"
             exit 1
           fi
-          if echo "$needed_native" | grep -qE '^lib(gtk|gdk|glib|gio|gobject|cairo|pango|gdk_pixbuf)'; then
-            echo "::error::the tarball's bnksound-undecorated links the GTK stack"
+          if echo "$needed_und" | grep -qE '^lib(gtk|gdk|glib|gio|gobject|cairo|pango|gdk_pixbuf)'; then
+            echo "::error::the undecorated archive's bnksound links the GTK stack"
             exit 1
           fi
 

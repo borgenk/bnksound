@@ -122,20 +122,19 @@ bump:
 	git tag "v$(V)"
 	@echo "Bumped to v$(V). Push with: git push origin main --tags"
 
-# Build a release tarball into dist/ for upload to a GitHub Release.
-# Bundles both binaries, the desktop entry, and the icon tree so install.sh can
-# place any of them.
+# Build the release tarballs into dist/ for upload to a GitHub Release.
 #
-# Both variants ship. bnksound in the tarball is the GTK build, which is what
-# install.sh takes by default and what needs GTK 4 at runtime;
-# bnksound-undecorated beside it draws no window decorations and needs no GTK,
-# which install.sh --undecorated takes instead. Whichever is chosen installs
-# under the plain name bnksound.
+# One archive per variant, so a download carries the build it is for and not
+# both. Each holds its binary under the plain name bnksound, alongside the same
+# desktop entry and icon tree, which is why the staging tree is built once and
+# only the binary swapped. The GTK archive keeps the unsuffixed name it has
+# always had, so an installer from before the split still resolves it.
 #
-# The tarball ships with a sha256 file beside it, which install.sh checks
-# before it unpacks anything. The digest names the bare tarball, so
-# `sha256sum -c` works by hand in dist/ too.
-TARBALL := $(APP_NAME)-v$(VERSION)-$(LINUX_TARGET).tar.gz
+# Each archive ships with a sha256 beside it, which install.sh checks before it
+# unpacks anything. The digest names the bare file, so `sha256sum -c` works by
+# hand in dist/ too.
+TARBALL_GTK := $(APP_NAME)-v$(VERSION)-$(LINUX_TARGET).tar.gz
+TARBALL_UND := $(APP_NAME)-undecorated-v$(VERSION)-$(LINUX_TARGET).tar.gz
 
 build-linux:
 	RUSTFLAGS="--remap-path-prefix=$(HOME)=[home]" \
@@ -144,15 +143,17 @@ build-linux:
 		cargo build --release --bin $(APP_NAME)
 	rm -rf dist/stage
 	mkdir -p dist/stage/icons
-	cp $(BUILD_PATH)/$(APP_NAME)-gtk dist/stage/$(APP_NAME)
-	cp $(BUILD_PATH)/$(APP_NAME) dist/stage/$(APP_NAME)-undecorated
 	cp assets/$(APP_ID).desktop dist/stage/$(APP_ID).desktop
 	cp -r assets/icons/hicolor dist/stage/icons/hicolor
-	tar czf dist/$(TARBALL) -C dist/stage .
+	cp $(BUILD_PATH)/$(APP_NAME)-gtk dist/stage/$(APP_NAME)
+	tar czf dist/$(TARBALL_GTK) -C dist/stage .
+	cp $(BUILD_PATH)/$(APP_NAME) dist/stage/$(APP_NAME)
+	tar czf dist/$(TARBALL_UND) -C dist/stage .
 	rm -rf dist/stage
-	cd dist && sha256sum $(TARBALL) > $(TARBALL).sha256
-	@echo "Built dist/$(TARBALL) and dist/$(TARBALL).sha256"
-	@echo "Publish with: gh release create v$(VERSION) dist/$(TARBALL) dist/$(TARBALL).sha256"
+	cd dist && sha256sum $(TARBALL_GTK) > $(TARBALL_GTK).sha256
+	cd dist && sha256sum $(TARBALL_UND) > $(TARBALL_UND).sha256
+	@echo "Built dist/$(TARBALL_GTK) and dist/$(TARBALL_UND), each with a .sha256"
+	@echo "Publish with: gh release create v$(VERSION) dist/$(TARBALL_GTK)* dist/$(TARBALL_UND)*"
 
 run:
 	cargo run
