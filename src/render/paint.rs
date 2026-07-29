@@ -110,6 +110,11 @@ pub fn paint_frame(
         };
         let mut strip = p.clipped(layout.strip);
         for col in &layout.columns {
+            // Looking a row up scans the snapshot, so a column scrolled out of
+            // the strip or outside the damage is skipped before that cost.
+            if !strip.intersects(col.rect) {
+                continue;
+            }
             if let Some(row) = row_draw(snapshot, &col.id) {
                 paint_column(&mut strip, col, &row, &mut cx);
             }
@@ -146,6 +151,35 @@ pub fn paint_frame(
     }
 }
 
+/// Repaint only what a meter step can have changed.
+///
+/// Each of the layout's meter rectangles gets the whole frame painted through a
+/// clip, so what lands inside one is what a full repaint would have left there,
+/// including whatever the slider, its ring, or an overlay puts on top. Pixels
+/// outside every rectangle keep what the buffer already held, which makes this
+/// correct only on a buffer already holding the rest of that frame.
+pub fn paint_meters(
+    p: &mut Painter,
+    snapshot: &ViewSnapshot,
+    ui: &UiState,
+    layout: &Layout,
+    font: &Font,
+    palette: &Palette,
+    icons: &mut IconCache,
+) {
+    for rect in layout.meter_damage() {
+        paint_frame(
+            &mut p.clipped(rect),
+            snapshot,
+            ui,
+            layout,
+            font,
+            palette,
+            icons,
+        );
+    }
+}
+
 /// Draw the window's own titlebar: the app name and the three window buttons.
 fn paint_titlebar(
     p: &mut Painter,
@@ -154,6 +188,9 @@ fn paint_titlebar(
     palette: &Palette,
 ) {
     use crate::ui::layout::HitTarget;
+    if !p.intersects(bar.bar) {
+        return;
+    }
     p.fill(bar.bar, palette.titlebar);
     p.hline(bar.bar.x, bar.bar.bottom() - 1, bar.bar.w, palette.border);
     // The title's space belongs to the profile chip, which paint_chrome draws.
@@ -266,6 +303,9 @@ fn paint_chrome(
 
     use crate::ui::layout::HitTarget::*;
     for hit in &layout.hits {
+        if !p.intersects(hit.rect) {
+            continue;
+        }
         let hovered = ui.hover.as_ref() == Some(&hit.target);
         match &hit.target {
             // Filters light up solid when their section is showing.
@@ -1381,6 +1421,128 @@ mod tests {
         let a = render(&app, 560, 720);
         let b = render(&app, 560, 720);
         assert_eq!(a.pixels(), b.pixels(), "rendering is deterministic");
+    }
+
+    /// Paint a frame, step the meters, and repaint through the damage gate.
+    /// Returns the gated buffer beside the full repaint it has to match, and
+    /// the layout both were painted from.
+    fn gated_and_full(
+        app: &state::App,
+        mut ui: UiState,
+    ) -> (PixelBuffer, PixelBuffer, crate::ui::layout::Layout) {
+        let (f, palette) = (font(), Palette::dark());
+        let (w, h) = (560, 720);
+        let snap = build_snapshot(app, |_| None);
+
+        let rows: Vec<_> = snap.meter_routes.values().flatten().cloned().collect();
+        assert!(!rows.is_empty(), "the scene routes no meters to draw");
+        for row in &rows {
+            ui.meters.apply(row, &[0.15, 0.1]);
+        }
+
+        let layout = crate::ui::layout::project(&snap, &ui, Rect::new(0, 0, w, h));
+        assert!(
+            layout.meter_damage().next().is_some(),
+            "the layout offers no meter rectangles to repaint",
+        );
+
+        let mut gated = PixelBuffer::new(w as u32, h as u32);
+        paint_frame(
+            &mut gated.painter(),
+            &snap,
+            &ui,
+            &layout,
+            &f,
+            &palette,
+            &mut IconCache::new(),
+        );
+
+        // One tick: every bar decays, then the newest peaks fold in. That pair
+        // is the only thing a meter step does to the frame.
+        assert!(ui.meters.decay(), "the decay moved nothing");
+        for row in &rows {
+            assert!(
+                ui.meters.apply(row, &[0.95, 0.8]),
+                "the peaks moved nothing"
+            );
+        }
+
+        let mut full = PixelBuffer::new(w as u32, h as u32);
+        paint_frame(
+            &mut full.painter(),
+            &snap,
+            &ui,
+            &layout,
+            &f,
+            &palette,
+            &mut IconCache::new(),
+        );
+        assert!(
+            gated.pixels() != full.pixels(),
+            "the step changed nothing, so there is nothing to catch",
+        );
+
+        paint_meters(
+            &mut gated.painter(),
+            &snap,
+            &ui,
+            &layout,
+            &f,
+            &palette,
+            &mut IconCache::new(),
+        );
+        (gated, full, layout)
+    }
+
+    /// The index of the first pixel two buffers disagree on.
+    fn first_difference(a: &PixelBuffer, b: &PixelBuffer) -> Option<(i32, i32)> {
+        let w = a.width() as i32;
+        a.pixels()
+            .iter()
+            .zip(b.pixels())
+            .position(|(x, y)| x != y)
+            .map(|i| (i as i32 % w, i as i32 / w))
+    }
+
+    /// The claim the shell bets a frame on: repainting only the meter
+    /// rectangles over the frame before leaves the pixels a full repaint would.
+    /// If these ever part, a window shows a mixer that has moved on.
+    #[test]
+    fn a_meters_repaint_matches_a_full_one() {
+        let (gated, full, _) = gated_and_full(&scene(), UiState::new());
+        assert_eq!(first_difference(&gated, &full), None);
+    }
+
+    /// The same with the profile menu open, which hangs over the top of the
+    /// columns. A meter it half covers is the case that would show a gate
+    /// painting straight through an overlay.
+    #[test]
+    fn a_meters_repaint_keeps_an_overlay_on_top() {
+        let mut app = scene();
+        for i in 0..6 {
+            app.profiles.profiles.push(crate::profile::Profile {
+                name: format!("p{i}"),
+                ..Default::default()
+            });
+        }
+        let ui = UiState {
+            profile_menu_open: true,
+            ..UiState::new()
+        };
+        let (gated, full, layout) = gated_and_full(&app, ui);
+
+        let panel = layout
+            .profile_menu
+            .as_ref()
+            .expect("the menu is open")
+            .panel;
+        assert!(
+            layout
+                .meter_damage()
+                .any(|r| !r.intersect(panel).is_empty()),
+            "the menu hangs over no meter, so it covers nothing to get wrong",
+        );
+        assert_eq!(first_difference(&gated, &full), None);
     }
 
     #[test]

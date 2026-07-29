@@ -1039,6 +1039,19 @@ impl Layout {
             Focus::Body => None,
         }
     }
+
+    /// The rectangles a meter step can change.
+    ///
+    /// Meter levels reach the frame through one drawing call, a column's meter,
+    /// so two frames that differ by a decay step differ only inside these. They
+    /// are clipped to the strip because a scrolled column hangs past its edge,
+    /// and one scrolled fully out contributes nothing.
+    pub fn meter_damage(&self) -> impl Iterator<Item = Rect> + '_ {
+        self.columns
+            .iter()
+            .map(|col| col.meter.intersect(self.strip))
+            .filter(|r| !r.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -1269,6 +1282,40 @@ mod tests {
             .rect;
         assert!(chip.y >= bar.y && chip.bottom() <= bar.bottom());
         assert!(chip.x < bar.x + bar.w / 2, "it sits at the left");
+    }
+
+    /// The damage set is one rectangle per column, held inside the strip. A
+    /// meter that spilled past it would repaint over the toolbar.
+    #[test]
+    fn meter_damage_is_every_column_meter_inside_the_strip() {
+        let snap = mixer_scene();
+        let ui = UiState::new();
+        let layout = project(&snap, &ui, Rect::new(0, 0, 560, 720));
+        assert!(!layout.columns.is_empty(), "the scene lays out no columns");
+
+        let damage: Vec<Rect> = layout.meter_damage().collect();
+        assert_eq!(damage.len(), layout.columns.len());
+        for (rect, col) in damage.iter().zip(&layout.columns) {
+            assert_eq!(*rect, col.meter.intersect(layout.strip));
+            assert_eq!(*rect, rect.intersect(layout.strip), "inside the strip");
+        }
+    }
+
+    /// A column scrolled out of sight contributes no damage, so a mixer with
+    /// more columns than fit repaints only the ones on screen.
+    #[test]
+    fn meter_damage_drops_a_column_scrolled_out_of_the_strip() {
+        let snap = mixer_scene();
+        let mut ui = UiState::new();
+        let layout = project(&snap, &ui, Rect::new(0, 0, 560, 720));
+        let visible = layout.meter_damage().count();
+
+        ui.scroll_x = layout.strip.w + metrics::COLUMN_WIDTH;
+        let scrolled = project(&snap, &ui, Rect::new(0, 0, 560, 720));
+        assert!(
+            scrolled.meter_damage().count() < visible,
+            "scrolling the strip past its columns still damages {visible} of them",
+        );
     }
 
     /// The meter and the fader run the column's whole depth, so a taller window

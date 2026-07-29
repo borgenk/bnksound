@@ -24,7 +24,7 @@ use crate::platform::sys::{PollFd, poll};
 use crate::platform::wire::{Arg, Message, encode};
 use crate::platform::xkb::Keyboard;
 use crate::render::image::IconCache;
-use crate::render::paint::paint_frame;
+use crate::render::paint::{paint_frame, paint_meters};
 use crate::render::primitives::{Painter, Rect};
 use crate::render::screenshot;
 use crate::render::text::Font;
@@ -46,6 +46,36 @@ use crate::ui::{CARET_BLINK, Chrome, Drag};
 struct BufferSlot {
     obj: u32,
     busy: bool,
+    /// How far this buffer's pixels have fallen behind the current frame.
+    owed: Owed,
+}
+
+/// Charge both buffers with what changed this turn, and take what the one about
+/// to be painted owes. Painting settles that buffer's debt and leaves the other
+/// carrying it until its own turn comes round.
+fn take_owed(buffers: &mut [BufferSlot; 2], slot: usize, change: Owed) -> Owed {
+    for b in buffers.iter_mut() {
+        b.owed = b.owed.max(change);
+    }
+    std::mem::take(&mut buffers[slot].owed)
+}
+
+/// What a buffer must be given before it can be presented.
+///
+/// Frames alternate between two buffers, so the one being painted holds the
+/// frame before last, not the last one. A repaint that covers only what changed
+/// since the last frame would leave everything that changed the frame before it
+/// showing stale pixels. Each buffer therefore carries its own debt, and paying
+/// it means painting the wider of what it owes and what this turn changed.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Owed {
+    /// The buffer holds the last frame presented.
+    #[default]
+    Nothing,
+    /// Only the meter rectangles have moved since it was painted.
+    Meters,
+    /// It is behind everywhere.
+    All,
 }
 
 /// Running totals of what the exchange with the compositor produced. Read by
@@ -1278,7 +1308,13 @@ impl App {
                     Arg::Uint(SHM_FORMAT_ARGB8888),
                 ],
             );
-            self.buffers[i] = BufferSlot { obj, busy: false };
+            // Fresh memory holds no frame at all, so neither buffer can be
+            // presented until it has been painted whole.
+            self.buffers[i] = BufferSlot {
+                obj,
+                busy: false,
+                owed: Owed::All,
+            };
         }
         self.pool = Some(pool);
         self.buffer_dims = (dw, dh);
@@ -1317,18 +1353,33 @@ impl App {
             return Ok(());
         };
 
+        let change = if self.shell.ui.dirty.full {
+            Owed::All
+        } else {
+            Owed::Meters
+        };
+
         let layout = self.layout();
         let (dw, dh) = self.device_size();
         let scale = self.scale;
         let frame_px = (dw * dh) as usize;
+        // Settled only once there is memory to paint into. Clearing the debt on
+        // a turn that painted nothing would leave the buffer looking current.
+        let owed;
         {
             let Some(pool) = self.pool.as_mut() else {
                 return Ok(());
             };
+            owed = take_owed(&mut self.buffers, slot, change);
             let start = slot * frame_px;
             let pixels = &mut pool.pixels()[start..start + frame_px];
             let mut painter = Painter::scaled(pixels, dw as u32, dh as u32, scale);
-            paint_frame(
+            let paint = if owed == Owed::All {
+                paint_frame
+            } else {
+                paint_meters
+            };
+            paint(
                 &mut painter,
                 &self.shell.snapshot,
                 &self.shell.ui,
@@ -1345,16 +1396,24 @@ impl App {
             req::SURFACE_ATTACH,
             &[Arg::Object(buffer), Arg::Int(0), Arg::Int(0)],
         );
-        self.send(
-            surface,
-            req::SURFACE_DAMAGE,
-            &[
-                Arg::Int(0),
-                Arg::Int(0),
-                Arg::Int(self.width),
-                Arg::Int(self.height),
-            ],
-        );
+        // Damage is what the compositor has to recomposite. Reporting only the
+        // meters is what keeps a decay step off the rest of the screen.
+        if owed == Owed::All {
+            let (w, h) = (self.width, self.height);
+            self.send(
+                surface,
+                req::SURFACE_DAMAGE,
+                &[Arg::Int(0), Arg::Int(0), Arg::Int(w), Arg::Int(h)],
+            );
+        } else {
+            for r in layout.meter_damage() {
+                self.send(
+                    surface,
+                    req::SURFACE_DAMAGE,
+                    &[Arg::Int(r.x), Arg::Int(r.y), Arg::Int(r.w), Arg::Int(r.h)],
+                );
+            }
+        }
         self.send(surface, req::SURFACE_COMMIT, &[]);
         self.buffers[slot].busy = true;
         self.last_painted = slot;
@@ -1451,7 +1510,7 @@ impl App {
         if Instant::now() >= self.meter_deadline {
             self.meter_deadline = Instant::now() + PEAK_DECAY_INTERVAL;
             if self.shell.tick_meters() {
-                self.shell.ui.dirty.mark_full();
+                self.shell.ui.dirty.mark_meters();
             }
         }
 
@@ -1707,6 +1766,32 @@ mod tests {
     /// Outputs and the scales they reported.
     fn scales(pairs: &[(u32, i32)]) -> HashMap<u32, i32> {
         pairs.iter().copied().collect()
+    }
+
+    /// The debt a buffer carries is everything that changed while the other one
+    /// was on screen. Getting this wrong shows the frame before last in
+    /// whatever a partial repaint did not cover.
+    #[test]
+    fn a_buffer_owes_every_change_it_sat_out() {
+        let mut buffers = [BufferSlot {
+            owed: Owed::All,
+            ..Default::default()
+        }; 2];
+
+        // Neither has held a frame, so the first two paints are whole ones
+        // however little changed.
+        assert_eq!(take_owed(&mut buffers, 0, Owed::All), Owed::All);
+        assert_eq!(take_owed(&mut buffers, 1, Owed::Meters), Owed::All);
+
+        // Both current now, so a meter step costs only the meters.
+        assert_eq!(take_owed(&mut buffers, 0, Owed::Meters), Owed::Meters);
+        assert_eq!(take_owed(&mut buffers, 1, Owed::Meters), Owed::Meters);
+
+        // One full frame, and the buffer that missed it owes all of it again
+        // even though the turn it lands on only stepped the meters.
+        assert_eq!(take_owed(&mut buffers, 0, Owed::All), Owed::All);
+        assert_eq!(take_owed(&mut buffers, 1, Owed::Meters), Owed::All);
+        assert_eq!(take_owed(&mut buffers, 0, Owed::Meters), Owed::Meters);
     }
 
     #[test]

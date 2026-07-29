@@ -1,11 +1,14 @@
 # bnksound perf: scenario, ns/op, allocs/op (lower is better)
-build_snapshot	2285	113
-hit_test	1639	0
-layout_project	1096	64
-meter_decay	16	0
-paint_frame	562268	0
-paint_frame_24_apps	675354	0
-paint_frame_64_apps	891965	0
-paint_frame_grouped	599132	0
-paint_frame_large	727761	0
-paint_frame_scale2	2187954	0
+build_snapshot	2252	113
+hit_test	1908	0
+layout_project	1046	64
+meter_decay	23	0
+paint_frame	545043	0
+paint_frame_24_apps	526736	0
+paint_frame_64_apps	540945	0
+paint_frame_grouped	553831	0
+paint_frame_large	722274	0
+paint_frame_scale2	2183679	0
+paint_meters	57331	0
+paint_meters_24_apps	57257	0
+paint_meters_scale2	151298	0

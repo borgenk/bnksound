@@ -29,7 +29,7 @@ use std::time::Instant;
 use crate::dev::{Result, alloc, scene};
 use crate::render::buffer::PixelBuffer;
 use crate::render::image::IconCache;
-use crate::render::paint::paint_frame;
+use crate::render::paint::{paint_frame, paint_meters};
 use crate::render::primitives::{Painter, Rect};
 use crate::render::text::Font;
 use crate::ui::UiState;
@@ -158,6 +158,37 @@ fn measure(font: &Font, palette: &Palette) -> Vec<Sample> {
             let (pixels, bw, bh) = buffer.parts();
             let mut painter = Painter::scaled(pixels, bw, bh, scale);
             paint_frame(
+                &mut painter,
+                &snapshot,
+                &ui,
+                &ui_layout,
+                font,
+                palette,
+                &mut icons,
+            );
+        }));
+    }
+
+    // The same scenes repainted through the damage gate, which is what a decay
+    // step costs. The pairing with the full frames above is the point: the two
+    // numbers side by side are what the gate is worth, and the app counts are
+    // what shows it staying flat as the mixer fills up.
+    for (name, apps, scale) in [
+        ("paint_meters", 2, 1.0),
+        ("paint_meters_scale2", 2, 2.0),
+        ("paint_meters_24_apps", 24, 1.0),
+    ] {
+        let (w, h) = WINDOW;
+        let app = scene::mixer(apps);
+        let snapshot = build_snapshot(&app, |_| None);
+        let ui = UiState::new();
+        let ui_layout = layout::project(&snapshot, &ui, Rect::new(0, 0, w, h));
+        let mut buffer = PixelBuffer::new((w as f32 * scale) as u32, (h as f32 * scale) as u32);
+        let mut icons = IconCache::new();
+        samples.push(bench(name, 64, || {
+            let (pixels, bw, bh) = buffer.parts();
+            let mut painter = Painter::scaled(pixels, bw, bh, scale);
+            paint_meters(
                 &mut painter,
                 &snapshot,
                 &ui,

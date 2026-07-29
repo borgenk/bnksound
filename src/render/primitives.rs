@@ -118,6 +118,13 @@ impl<'a> Painter<'a> {
         self.clip
     }
 
+    /// Whether a logical rectangle has any pixel inside the clip. Drawing it
+    /// when this is false paints nothing, so a caller with work to do first can
+    /// stop here instead.
+    pub fn intersects(&self, rect: Rect) -> bool {
+        !self.device(rect).intersect(self.clip).is_empty()
+    }
+
     /// A sub-painter over the same pixels, clipped to the overlap of the
     /// current clip and `rect`. Drawing through it never escapes either.
     pub fn clipped(&mut self, rect: Rect) -> Painter<'_> {
