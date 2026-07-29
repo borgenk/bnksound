@@ -425,13 +425,11 @@ impl App {
             &[Arg::Int(min_w), Arg::Int(min_h)],
         );
 
-        // Compositor-drawn chrome unless the user asked for ours, and with no
-        // manager at all there is nothing to negotiate.
-        let want_client = self.shell.ui.settings.decorations == Decorations::Client;
-        if want_client {
-            self.shell.ui.chrome = Chrome::Client;
-        }
-        if self.decoration_mgr != 0 && !want_client {
+        let chrome = initial_chrome(self.shell.ui.settings.decorations, self.decoration_mgr != 0);
+        self.shell.ui.chrome = chrome;
+        // Only a compositor with a manager gets asked, and its answer arrives as
+        // a decoration configure that may still say client.
+        if chrome == Chrome::Server {
             self.decoration = self.new_id();
             let (mgr, deco) = (self.decoration_mgr, self.decoration);
             self.send(
@@ -1724,6 +1722,22 @@ fn resize_cursor(edge: ResizeEdge) -> u32 {
     }
 }
 
+/// Who draws the titlebar before anything has been negotiated.
+///
+/// Server means there is a manager to ask, and the answer arrives later as a
+/// decoration configure that may still hand the job back. Client means no
+/// answer is coming: either the settings already refused server-side chrome, or
+/// the compositor offers no manager, which the protocol reads as the client
+/// decorating. Treating a missing manager as server-side would leave the window
+/// with a titlebar from neither side, and so with no close, drag, or edges.
+fn initial_chrome(decorations: Decorations, has_manager: bool) -> Chrome {
+    if decorations == Decorations::Client || !has_manager {
+        Chrome::Client
+    } else {
+        Chrome::Server
+    }
+}
+
 /// The scale for a window shown on `entered`: the largest of those outputs'
 /// scales, so one straddling a 1x and a 2x screen stays sharp on the denser.
 /// An output with no scale reported, or none entered at all, counts as 1.
@@ -1792,6 +1806,31 @@ mod tests {
         assert_eq!(take_owed(&mut buffers, 0, Owed::All), Owed::All);
         assert_eq!(take_owed(&mut buffers, 1, Owed::Meters), Owed::All);
         assert_eq!(take_owed(&mut buffers, 0, Owed::Meters), Owed::Meters);
+    }
+
+    /// A compositor offering no decoration manager is the case that reads as a
+    /// broken window: nothing negotiates, so a server-side default means no
+    /// titlebar from either side.
+    #[test]
+    fn no_decoration_manager_leaves_the_window_to_draw_its_own() {
+        assert_eq!(
+            initial_chrome(Decorations::Server, false),
+            Chrome::Client,
+            "with no manager the protocol says the client decorates"
+        );
+        assert_eq!(
+            initial_chrome(Decorations::Server, true),
+            Chrome::Server,
+            "a manager is there to be asked"
+        );
+    }
+
+    /// The setting refuses server-side chrome outright, so no decoration object
+    /// is created even where one could be.
+    #[test]
+    fn asking_for_client_chrome_negotiates_nothing() {
+        assert_eq!(initial_chrome(Decorations::Client, true), Chrome::Client);
+        assert_eq!(initial_chrome(Decorations::Client, false), Chrome::Client);
     }
 
     #[test]

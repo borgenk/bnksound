@@ -212,18 +212,17 @@ fn the_settings_file_can_take_the_chrome_back_from_the_compositor() {
 
 #[test]
 #[ignore = "needs a compositor; run with make test-compositor"]
-fn with_no_decoration_manager_nothing_is_negotiated() {
-    // weston offers no manager at all. What the app does with that is the row
-    // recorded in baseline.md: it keeps the server default, so neither side
-    // draws a titlebar. Pinned here so the day it changes is a day someone
-    // meant it to.
+fn with_no_decoration_manager_the_window_draws_its_own() {
+    // weston offers no manager at all, and the protocol reads that as the
+    // client decorating. Nothing arrives to say so, so the window has to
+    // decide for itself; the alternative is a titlebar from neither side.
     let rig = Rig::new("no-deco");
     let report = rig.run(Compositor::Weston, PROBE_MS);
     assert!(
         !report.flag("decoration"),
         "weston offers no decoration manager: {report}"
     );
-    assert_eq!(report.text("chrome"), "server", "{report}");
+    assert_eq!(report.text("chrome"), "client", "{report}");
 }
 
 // --- Activation and the one-window lock ------------------------------------
