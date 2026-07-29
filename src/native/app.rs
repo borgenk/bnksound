@@ -6,6 +6,7 @@
 //! no work beyond the tick.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
@@ -45,6 +46,20 @@ use crate::ui::{CARET_BLINK, Chrome, Drag};
 struct BufferSlot {
     obj: u32,
     busy: bool,
+}
+
+/// Running totals of what the exchange with the compositor produced. Read by
+/// [`App::facts`] and nothing else.
+#[derive(Clone, Copy, Default)]
+struct Counts {
+    /// Toplevel configures taken.
+    configures: u32,
+    /// Frames attached and committed.
+    frames: u32,
+    /// Activation tokens the compositor handed back.
+    tokens: u32,
+    /// Later launches that handed themselves over on the lock socket.
+    handovers: u32,
 }
 
 /// How often state is flushed to disk while the app runs. Matches the interval
@@ -140,8 +155,11 @@ pub struct App {
     /// Last size the window had while not maximized, which is what a relaunch
     /// restores to.
     normal_size: (i32, i32),
+    /// The states the latest configure carried.
+    states: ToplevelStates,
     configured: bool,
     pub closed: bool,
+    counts: Counts,
 
     /// The core, the retained UI, and the projection, which is everything this
     /// shell shares with the GTK one.
@@ -239,8 +257,10 @@ impl App {
             width: startup_size.0,
             height: startup_size.1,
             normal_size: startup_size,
+            states: ToplevelStates::default(),
             configured: false,
             closed: false,
+            counts: Counts::default(),
             shell,
             font,
             palette: Palette::dark(),
@@ -496,6 +516,8 @@ impl App {
                 // The states trail the size as an array of u32 enum values.
                 let raw_states = r.array().unwrap_or_default();
                 let states = toplevel_states(raw_states);
+                self.states = states;
+                self.counts.configures += 1;
                 if debug_enabled() {
                     let listed: Vec<u32> = raw_states
                         .as_chunks::<4>()
@@ -554,8 +576,11 @@ impl App {
                     );
                 }
                 // Without a viewport there is nothing to map the scaled buffer
-                // back onto the logical window, so stay at 1.
-                let scale = if self.viewport == 0 { 1.0 } else { scale };
+                // back onto the logical window, so the preferred scale is not
+                // ours to take and the wl_output scale is what runs instead.
+                if !self.fractional_drives() {
+                    return Ok(());
+                }
                 if scale > 0.0 && (scale - self.scale).abs() > f32::EPSILON {
                     self.scale = scale;
                     // The buffers hold device pixels, so ensure_buffers will see
@@ -573,6 +598,7 @@ impl App {
                 let obj = self.activation_token;
                 self.send(obj, req::ACTIVATION_TOKEN_DESTROY, &[]);
                 self.activation_token = 0;
+                self.counts.tokens += 1;
                 if debug_enabled() {
                     eprintln!(
                         "{:>6}ms activation token: {token:?}",
@@ -830,15 +856,24 @@ impl App {
         );
     }
 
+    /// Whether the fractional scale is what sets the buffer size.
+    ///
+    /// It takes both halves: the scale says how many device pixels a logical
+    /// one is worth, and the viewport is what maps the buffer painted at that
+    /// scale back onto the logical window. With only one of them there is
+    /// nothing to follow, and the integer wl_output scale is the scale.
+    fn fractional_drives(&self) -> bool {
+        self.fractional != 0 && self.viewport != 0
+    }
+
     /// Follow the integer scale of the outputs the window is on.
     ///
-    /// Only for compositors without fractional scaling: with a viewport in
-    /// hand the fractional scale is finer and already drives the buffer size,
-    /// and mixing the two would scale the frame twice.
+    /// Only for compositors without fractional scaling, since the fractional
+    /// scale is finer and mixing the two would scale the frame twice.
     fn apply_output_scale(&mut self) {
         // Outputs are bound during the registry roundtrip, so their scales can
         // arrive before there is a surface to set one on.
-        if self.viewport != 0 || self.surface == 0 {
+        if self.fractional_drives() || self.surface == 0 {
             return;
         }
         let want = preferred_scale(&self.entered_outputs, &self.output_scales);
@@ -1323,6 +1358,7 @@ impl App {
         self.send(surface, req::SURFACE_COMMIT, &[]);
         self.buffers[slot].busy = true;
         self.last_painted = slot;
+        self.counts.frames += 1;
         self.shell.ui.dirty.clear();
         self.flush()
     }
@@ -1392,6 +1428,7 @@ impl App {
         // leave the window to us.
         if fds[3].is_ready() {
             while let Some(token) = self.handed_over() {
+                self.counts.handovers += 1;
                 self.raise(&token);
             }
         }
@@ -1458,11 +1495,103 @@ impl App {
         });
     }
 
+    /// What this run saw of the compositor it ran against.
+    pub fn facts(&self) -> Facts {
+        Facts {
+            compositor: self.compositor != 0,
+            shm: self.shm != 0,
+            wm_base: self.wm_base != 0,
+            seat: self.seat != 0,
+            decoration: self.decoration_mgr != 0,
+            activation: self.activation != 0,
+            fractional: self.fractional_mgr != 0,
+            viewport: self.viewporter != 0,
+            size: (self.width, self.height),
+            normal: self.normal_size,
+            states: self.states,
+            chrome: self.shell.ui.chrome,
+            scale: self.scale,
+            buffer_scale: self.buffer_scale,
+            buffer: self.buffer_dims,
+            counts: self.counts,
+        }
+    }
+
     /// Persist geometry and flush a final save.
     pub fn shutdown(&mut self) {
         let (w, h) = self.normal_size;
         self.shell
             .shutdown(w.max(0) as u32, h.max(0) as u32, self.shell.ui.maximized);
+    }
+}
+
+/// What one run against a compositor saw: which globals it offered, where the
+/// window ended up, and how much of the exchange happened.
+///
+/// The [`fmt::Display`] output is the format the probe prints and the
+/// compositor tests parse, so it is a contract between the two: one fact per
+/// line, every key present on every run, and presence written as 1 or 0 rather
+/// than an object id, which moves with bind order.
+pub struct Facts {
+    compositor: bool,
+    shm: bool,
+    wm_base: bool,
+    seat: bool,
+    decoration: bool,
+    activation: bool,
+    fractional: bool,
+    viewport: bool,
+    size: (i32, i32),
+    normal: (i32, i32),
+    states: ToplevelStates,
+    chrome: Chrome,
+    scale: f32,
+    buffer_scale: i32,
+    buffer: (i32, i32),
+    counts: Counts,
+}
+
+impl fmt::Display for Facts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bit = |present: bool| u8::from(present);
+        writeln!(
+            f,
+            "probe globals compositor={} shm={} wm_base={} seat={} \
+             decoration={} activation={} fractional={} viewport={}",
+            bit(self.compositor),
+            bit(self.shm),
+            bit(self.wm_base),
+            bit(self.seat),
+            bit(self.decoration),
+            bit(self.activation),
+            bit(self.fractional),
+            bit(self.viewport),
+        )?;
+        writeln!(
+            f,
+            "probe window {}x{} normal={}x{} maximized={} tiled={} chrome={}",
+            self.size.0,
+            self.size.1,
+            self.normal.0,
+            self.normal.1,
+            self.states.maximized,
+            self.states.tiled,
+            match self.chrome {
+                Chrome::Server => "server",
+                Chrome::Client => "client",
+                Chrome::Toolkit => "toolkit",
+            },
+        )?;
+        writeln!(
+            f,
+            "probe scale factor={} buffer_scale={} buffer={}x{}",
+            self.scale, self.buffer_scale, self.buffer.0, self.buffer.1,
+        )?;
+        writeln!(
+            f,
+            "probe counts configures={} frames={} tokens={} handovers={}",
+            self.counts.configures, self.counts.frames, self.counts.tokens, self.counts.handovers,
+        )
     }
 }
 
@@ -1654,6 +1783,71 @@ mod tests {
             toplevel_states(&ragged).tiled,
             "the whole value still counts"
         );
+    }
+
+    /// Facts as a compositor with everything would leave them.
+    fn facts() -> Facts {
+        Facts {
+            compositor: true,
+            shm: true,
+            wm_base: true,
+            seat: true,
+            decoration: true,
+            activation: true,
+            fractional: true,
+            viewport: true,
+            size: (638, 692),
+            normal: (560, 720),
+            states: ToplevelStates {
+                maximized: false,
+                tiled: true,
+            },
+            chrome: Chrome::Server,
+            scale: 1.5,
+            buffer_scale: 1,
+            buffer: (957, 1038),
+            counts: Counts {
+                configures: 2,
+                frames: 3,
+                tokens: 1,
+                handovers: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn the_probe_report_is_four_lines_of_key_values() {
+        // The compositor tests parse this, so the shape is the contract: one
+        // fact per line, every key on every run.
+        let lines: Vec<String> = facts().to_string().lines().map(str::to_string).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "probe globals compositor=1 shm=1 wm_base=1 seat=1 decoration=1 activation=1 \
+                 fractional=1 viewport=1",
+                "probe window 638x692 normal=560x720 maximized=false tiled=true chrome=server",
+                "probe scale factor=1.5 buffer_scale=1 buffer=957x1038",
+                "probe counts configures=2 frames=3 tokens=1 handovers=1",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_global_the_compositor_never_offered_reads_as_zero() {
+        let bare = Facts {
+            seat: false,
+            decoration: false,
+            activation: false,
+            fractional: false,
+            chrome: Chrome::Client,
+            ..facts()
+        };
+        let printed = bare.to_string();
+        assert!(
+            printed.contains("seat=0 decoration=0 activation=0 fractional=0 viewport=1"),
+            "absence is a zero rather than a missing key: {printed}"
+        );
+        assert!(printed.contains("chrome=client"));
     }
 
     #[test]

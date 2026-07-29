@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use core::ffi::c_int;
@@ -84,6 +84,11 @@ impl Connection {
             })?;
             PathBuf::from(dir).join(display)
         };
+        Self::connect_at(&path)
+    }
+
+    /// Connect to the compositor listening on `path`.
+    pub fn connect_at(path: &Path) -> io::Result<Self> {
         let sock = UnixStream::connect(path)?;
         sock.set_nonblocking(true)?;
         Ok(Connection {

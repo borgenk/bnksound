@@ -1,7 +1,8 @@
 .PHONY: fmt clippy build build-release build-linux install install-gtk \
 	install-assets run test check bump \
 	build-native build-native-release run-native \
-	build-gtk build-gtk-release run-gtk test-matrix tables perf perf-save frame
+	build-gtk build-gtk-release run-gtk test-matrix tables perf perf-save frame \
+	test-compositor
 
 # The toolchain is nightly (rust-toolchain.toml) and .cargo/config.toml builds
 # the standard library from source alongside the app. Release binaries come out
@@ -84,6 +85,13 @@ perf-save:
 # Pass a path, width, and height: make frame ARGS="out.png 800 900"
 frame:
 	cargo run --features dev -- --render-frame $(ARGS)
+
+# The Wayland protocol code against real compositors: headless weston, labwc
+# and cage, each running the shipped window through --probe. Ignored by default
+# so a machine without those three still passes cargo test, and serial because
+# every test boots a compositor. Not run in CI, which has no compositor at all.
+test-compositor:
+	cargo test --features dev --test compositor -- --ignored --test-threads=1
 
 # Install the release binary, desktop entry, and icons under ~/.local, the same
 # per-user location install.sh uses.
