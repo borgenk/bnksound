@@ -24,6 +24,7 @@ const EVDEV_OFFSET: u32 = 8;
 
 const PROT_READ: c_int = 0x1;
 const MAP_PRIVATE: c_int = 0x02;
+const SEEK_END: c_int = 2;
 
 unsafe extern "C" {
     fn mmap(
@@ -35,6 +36,7 @@ unsafe extern "C" {
         offset: i64,
     ) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
+    fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
 }
 
 #[link(name = "xkbcommon")]
@@ -86,6 +88,16 @@ impl Keyboard {
         if len == 0 {
             return Err(io::Error::other("empty keymap"));
         }
+        // The length is the compositor's claim about another process's file, and
+        // mmap will happily map past the end of a shorter one. Reading a page
+        // beyond the last byte then raises SIGBUS, which no Result catches, so
+        // the file is measured before a byte of it is mapped.
+        let end = Self::file_size(&fd)?;
+        if size as i64 > end {
+            return Err(io::Error::other(format!(
+                "keymap claims {size} bytes over a file holding {end}"
+            )));
+        }
         // SAFETY: a private read-only mapping of the whole keymap.
         let ptr = unsafe {
             mmap(
@@ -112,6 +124,22 @@ impl Keyboard {
         }
         let text = String::from_utf8(bytes).map_err(io::Error::other)?;
         Self::from_keymap_text(&text)
+    }
+
+    /// How many bytes the file behind `fd` actually holds.
+    ///
+    /// A seek is enough: what arrives here is a memfd or a shm segment, both
+    /// seekable, and the compositor leaves the offset at the end already, so
+    /// moving it there changes nothing for anyone else holding the same open
+    /// file. The mapping names its offset explicitly.
+    fn file_size(fd: &OwnedFd) -> io::Result<i64> {
+        // SAFETY: the descriptor is live for this call and lseek touches no
+        // memory of ours.
+        let end = unsafe { lseek(fd.as_raw_fd(), 0, SEEK_END) };
+        if end < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(end)
     }
 
     /// Build from keymap text. Split out from the fd path so the decoding rules
@@ -315,5 +343,42 @@ xkb_keymap {
     fn a_modifier_key_produces_no_character() {
         let kb = keyboard();
         assert_eq!(kb.character(EVDEV_LEFTCTRL), None);
+    }
+
+    /// A keymap fd whose length is a lie is refused before it is mapped.
+    ///
+    /// The size comes from the compositor, and mapping past the end of a
+    /// shorter file turns the first read of that page into SIGBUS, which no
+    /// error type can carry. Without the guard this test kills the runner
+    /// rather than failing.
+    #[test]
+    fn a_keymap_longer_than_its_file_is_refused() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!("bnksound-keymap-{}", std::process::id()));
+        let mut file = std::fs::File::create(&path).expect("create fixture");
+        file.write_all(MINIMAL_KEYMAP.as_bytes())
+            .expect("write fixture");
+        drop(file);
+
+        let honest = std::fs::File::open(&path).expect("open fixture");
+        let len = MINIMAL_KEYMAP.len() as u32;
+        assert!(
+            Keyboard::from_keymap_fd(honest.into(), len).is_ok(),
+            "the true length still maps"
+        );
+
+        let lying = std::fs::File::open(&path).expect("open fixture");
+        let refused = Keyboard::from_keymap_fd(lying.into(), len + 4096);
+        let err = match refused {
+            Ok(_) => panic!("a length past the end must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("claims"),
+            "the error should name the claim, got {err}"
+        );
+
+        std::fs::remove_file(&path).expect("clean up fixture");
     }
 }
