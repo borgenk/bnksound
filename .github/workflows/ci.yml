@@ -131,3 +131,59 @@ jobs:
 
       - name: Test
         run: cargo test --all-features
+
+  # The Flatpak, built from the manifest that ships. Nothing else exercises
+  # cargo-sources.json, so a dependency added without regenerating it surfaces
+  # here and only here: the manifest builds with `cargo --offline --locked`,
+  # which fails on a crate the vendored sources do not carry. Regenerate with
+  # flatpak-cargo-generator.py against Cargo.lock when that happens.
+  #
+  # The published images stop at freedesktop-24.08, so this one supplies the
+  # tooling only and flatpak-builder pulls the 25.08 Platform, Sdk, and both
+  # SDK extensions from Flathub itself. The container is privileged because
+  # bwrap needs user namespaces the runner does not otherwise hand out.
+  flatpak:
+    name: Flatpak
+    runs-on: ubuntu-latest
+    # Longer than the cargo jobs: the runtime, the SDK, and the two SDK
+    # extensions are a multi-gigabyte download before any code compiles.
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: io.github.borgenk.BnkSound.yml
+          bundle: bnksound.flatpak
+          artifact-name: bnksound-flatpak-x86_64
+          # The manifest copies the checkout in as a source and skips the two
+          # names below, so the build cannot fold its own output back into the
+          # app. The action's defaults (flatpak_app, repo) are not on that list.
+          build-dir: build-dir
+          repo-dir: flatpak-repo
+          # The action's only restore-key is the literal prefix
+          # "flatpak-builder-<arch>", so a key without it never falls back to
+          # the previous run and every build re-downloads all of crates.io.
+          cache-key: flatpak-builder-${{ github.sha }}
+
+      # Flathub's linter, which the image already carries. Its rules are
+      # Flathub's submission policy rather than a claim about whether the app
+      # works, and a few of them land on choices made deliberately: the host
+      # read access the row labels need, and being Wayland-only. Those are in
+      # flatpak-lint-allowed.json with their reasons. Every other error fails,
+      # and so does an accepted one that stopped being reported.
+      #
+      # The linter exits non-zero whenever it reports anything, so its own
+      # status says only that the file has content.
+      - name: Lint against Flathub's rules
+        run: |
+          out="${RUNNER_TEMP:-/tmp}"
+          flatpak-builder-lint manifest io.github.borgenk.BnkSound.yml > "$out/lint-manifest.json" || true
+          flatpak-builder-lint repo flatpak-repo > "$out/lint-repo.json" || true
+          python3 .github/flatpak-lint-diff.py .github/flatpak-lint-allowed.json \
+            "$out/lint-manifest.json" "$out/lint-repo.json"

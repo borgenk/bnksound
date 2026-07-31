@@ -1,0 +1,7 @@
+{
+  "finish-args-flatpak-system-folder-exports-share-ro-access": "A Flatpak-installed app's icon is exported here and nowhere a sandbox can otherwise read. Flatpak binds the host's own icon themes for free but not its own exports. Read-only.",
+  "finish-args-unnecessary-xdg-data-flatpak-ro-access": "As above, for apps the user installed rather than the system.",
+  "finish-args-only-wayland": "The app is a Wayland client end to end, talking the protocol directly. There is no X11 path to fall back to.",
+  "appstream-external-screenshot-url": "Screenshots are mirrored by Flathub's own build, so this cannot pass anywhere else.",
+  "appstream-screenshots-not-mirrored-in-ostree": "As above."
+}
