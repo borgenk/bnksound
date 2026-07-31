@@ -4,3 +4,12 @@ target/
 
 # Release output
 dist/
+
+# Flatpak build output
+.flatpak-builder/
+build-dir/
+flatpak-repo/
+
+# Bytecode from the CI lint helper
+__pycache__/
+*.pyc

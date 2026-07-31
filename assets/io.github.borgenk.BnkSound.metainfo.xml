@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.borgenk.BnkSound</id>
+  <name>BNK Sound</name>
+  <summary>Control PipeWire devices and application volumes</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.borgenk">
+    <name>BNK Sound contributors</name>
+  </developer>
+
+  <description>
+    <p>
+      BNK Sound is a native audio mixer for Wayland and PipeWire. It controls
+      output and input devices, application volumes, mute state, and default
+      devices.
+    </p>
+    <p>
+      Mixer states can be saved as profiles. Application streams can be pinned
+      to output devices, and supported media players show current MPRIS track
+      information.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.borgenk.BnkSound.desktop</launchable>
+  <provides>
+    <binary>bnksound</binary>
+  </provides>
+  <url type="homepage">https://github.com/borgenk/bnksound</url>
+  <url type="bugtracker">https://github.com/borgenk/bnksound/issues</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/borgenk/bnksound/main/assets/screenshot.png</image>
+      <caption>Audio devices and application volume controls</caption>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="0.3.3" date="2026-07-27"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>
