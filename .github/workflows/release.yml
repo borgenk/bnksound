@@ -12,24 +12,74 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: Build and publish
+  # The release tarballs are named from the Cargo.toml version, and install.sh
+  # fetches them by the release tag. A mismatch would publish assets the
+  # installer cannot find, so both build jobs wait on this one rather than
+  # finding out after a Flatpak build.
+  version:
+    name: Verify tag matches Cargo.toml version
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # The release tarball is named from the Cargo.toml version, and
-      # install.sh fetches it by the release tag. A mismatch would publish
-      # an asset the installer cannot find, so fail fast before building.
-      - name: Verify tag matches Cargo.toml version
+      - name: Compare tag against Cargo.toml
         run: |
           cargo_version="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           if [ "$cargo_version" != "$GITHUB_REF_NAME" ]; then
             echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version" >&2
             exit 1
           fi
+
+  # The Flatpak bundle, from the manifest CI builds on every push. A job of its
+  # own for the flatpak tooling and the GNOME runtime the image carries. The
+  # container is privileged because bwrap needs user namespaces the runner does
+  # not otherwise hand out.
+  flatpak:
+    name: Flatpak bundle
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: io.github.borgenk.BnkSound.yml
+          bundle: bnksound-${{ github.ref_name }}-x86_64.flatpak
+          artifact-name: bnksound-flatpak-x86_64
+          # The manifest copies the checkout in as a source and skips the two
+          # names below, so the build cannot fold its own output back into the
+          # app. The action's defaults (flatpak_app, repo) are not on that list.
+          build-dir: build-dir
+          repo-dir: flatpak-repo
+          # What ships is built from the checkout and nothing else.
+          cache: false
+
+      # The tarballs get the same treatment further down, and for the same
+      # reason: the binary is installed under the plain name, so its own
+      # linkage is what says which of the two builds is inside.
+      - name: Verify the bundle holds the GTK build
+        run: |
+          if ! grep -aq 'libgtk-4\.so' build-dir/files/bin/bnksound; then
+            echo "::error::the Flatpak's bnksound does not link GTK"
+            exit 1
+          fi
+
+  release:
+    name: Build and publish
+    needs: [version, flatpak]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
 
       # Both variants are built here, so this is the union of what each needs:
       # the GTK packages for the binary that ships, the rest for both.
@@ -85,11 +135,29 @@ jobs:
             exit 1
           fi
 
+      # Built in the job above, which needs a container the tarballs do not.
+      - name: Collect the Flatpak bundle
+        uses: actions/download-artifact@v5
+        with:
+          name: bnksound-flatpak-x86_64
+          path: dist
+
+      # make build-linux writes one of these per tarball; the bundle arrives
+      # without one.
+      - name: Checksum the Flatpak bundle
+        run: |
+          cd dist
+          for bundle in *.flatpak; do
+            sha256sum "$bundle" > "$bundle.sha256"
+          done
+
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/*.flatpak
+            dist/*.flatpak.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true

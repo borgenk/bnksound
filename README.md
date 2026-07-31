@@ -31,6 +31,18 @@ Without window decorations or GTK, for tiling compositors and similar:
 curl -fsSL https://raw.githubusercontent.com/borgenk/bnksound/main/install.sh | sh -s -- --undecorated
 ```
 
+### Flatpak
+
+Each release carries a bundle of the GTK build. Download it from the
+[releases page](https://github.com/borgenk/bnksound/releases/latest) and:
+
+```sh
+flatpak install --user ./bnksound-*.flatpak
+```
+
+The GNOME runtime it needs comes from Flathub, so that remote has to be
+configured.
+
 ## Configuration
 
 State lives under the XDG config dir (`$XDG_CONFIG_HOME/bnksound`, falling back

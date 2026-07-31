@@ -1,7 +1,12 @@
 id: io.github.borgenk.BnkSound
-runtime: org.freedesktop.Platform
-runtime-version: '25.08'
-sdk: org.freedesktop.Sdk
+# The GTK build is what ships here, the same one install.sh installs by
+# default. GTK4 comes from the GNOME runtime; the freedesktop runtime carries
+# none of it. The undecorated build stays a tarball on the releases page.
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+# Both resolve to their 25.08 branch, the freedesktop base the GNOME 50 SDK is
+# built on.
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-nightly
   - org.freedesktop.Sdk.Extension.llvm21
@@ -9,6 +14,9 @@ command: bnksound
 
 finish-args:
   - --socket=wayland
+  # GTK puts the frame on screen through GSK, which renders on the GPU when it
+  # can reach a render node and in software when it cannot.
+  - --device=dri
   - --filesystem=xdg-run/pipewire-0
   - --talk-name=org.mpris.MediaPlayer2.*
   # Row labels come off the stream's own application.name, and icons are
@@ -39,8 +47,10 @@ modules:
   - name: bnksound
     buildsystem: simple
     build-commands:
-      - cargo --offline --locked build --release --bin bnksound --target x86_64-unknown-linux-gnu
-      - install -Dm755 target/x86_64-unknown-linux-gnu/release/bnksound /app/bin/bnksound
+      # The binary lands under the plain name, which is what the desktop entry
+      # and the metainfo name and what the tarballs hold.
+      - cargo --offline --locked build --release --features gtk --bin bnksound-gtk --target x86_64-unknown-linux-gnu
+      - install -Dm755 target/x86_64-unknown-linux-gnu/release/bnksound-gtk /app/bin/bnksound
       - install -Dm644 assets/io.github.borgenk.BnkSound.desktop /app/share/applications/io.github.borgenk.BnkSound.desktop
       - install -Dm644 assets/io.github.borgenk.BnkSound.metainfo.xml /app/share/metainfo/io.github.borgenk.BnkSound.metainfo.xml
       - cp -r assets/icons /app/share/

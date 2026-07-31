@@ -138,18 +138,18 @@ jobs:
   # which fails on a crate the vendored sources do not carry. Regenerate with
   # flatpak-cargo-generator.py against Cargo.lock when that happens.
   #
-  # The published images stop at freedesktop-24.08, so this one supplies the
-  # tooling only and flatpak-builder pulls the 25.08 Platform, Sdk, and both
-  # SDK extensions from Flathub itself. The container is privileged because
-  # bwrap needs user namespaces the runner does not otherwise hand out.
+  # The image carries the tooling and the GNOME 50 runtime the manifest builds
+  # against, so flatpak-builder only fetches the two SDK extensions from
+  # Flathub. The container is privileged because bwrap needs user namespaces
+  # the runner does not otherwise hand out.
   flatpak:
     name: Flatpak
     runs-on: ubuntu-latest
-    # Longer than the cargo jobs: the runtime, the SDK, and the two SDK
-    # extensions are a multi-gigabyte download before any code compiles.
+    # Longer than the cargo jobs: the SDK extensions download before any code
+    # compiles, and the release profile links with LTO afterwards.
     timeout-minutes: 45
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
       options: --privileged
     steps:
       - name: Checkout
@@ -170,6 +170,16 @@ jobs:
           # "flatpak-builder-<arch>", so a key without it never falls back to
           # the previous run and every build re-downloads all of crates.io.
           cache-key: flatpak-builder-${{ github.sha }}
+
+      # The manifest builds bnksound-gtk and installs it under the plain name,
+      # so what the app holds is only visible in the binary's own linkage. The
+      # undecorated build links no part of the GTK stack.
+      - name: Verify the app holds the GTK build
+        run: |
+          if ! grep -aq 'libgtk-4\.so' build-dir/files/bin/bnksound; then
+            echo "::error::the Flatpak's bnksound does not link GTK"
+            exit 1
+          fi
 
       # Flathub's linter, which the image already carries. Its rules are
       # Flathub's submission policy rather than a claim about whether the app
