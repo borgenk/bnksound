@@ -31,6 +31,7 @@ use std::thread;
 use libspa::pod::serialize::GenError;
 use pipewire as pw;
 use pw::node::{Node, NodeListener};
+use pw::properties::properties;
 use pw::proxy::ProxyListener;
 use pw::types::ObjectType;
 
@@ -216,10 +217,16 @@ fn run(
             stage: "create Context",
             source,
         })?;
-    let core = context.connect_rc(None).map_err(|source| Error::PwInit {
-        stage: "connect Core",
-        source,
-    })?;
+    let core_properties = properties! {
+        *pw::keys::APP_NAME => "BNK Sound",
+        *pw::keys::MEDIA_CATEGORY => "Manager",
+    };
+    let core = context
+        .connect_rc(Some(core_properties))
+        .map_err(|source| Error::PwInit {
+            stage: "connect Core",
+            source,
+        })?;
     let registry = core.get_registry_rc().map_err(|source| Error::PwInit {
         stage: "get Registry",
         source,

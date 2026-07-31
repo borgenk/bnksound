@@ -19,7 +19,7 @@ use pw::proxy::ProxyT;
 use crate::bus::Sender as BusSender;
 use crate::domain::{Stream, StreamKind};
 use crate::meter::PeakPool;
-use crate::pipewire_worker::client::apply_client_props_map;
+use crate::pipewire_worker::client::{PORTAL_APP_ID, app_id_from, apply_client_props_map};
 use crate::pipewire_worker::device::recompute_device_forms_for_device;
 use crate::pipewire_worker::monitor::start_monitor_stream;
 use crate::pipewire_worker::{
@@ -128,17 +128,17 @@ pub(crate) fn bind_node(
         }
     };
 
-    let app_id = props.get("application.id").map(str::to_string);
+    let app_id = app_id_from(|key| props.get(key)).map(str::to_string);
     let binary = props.get("application.process.binary").map(str::to_string);
     // Unique per object; the only differentiator when app streams share a
     // node.name (every Chromium browser tab does).
     let object_serial = props.get("object.serial").map(str::to_string);
 
-    // XDG lookup only applies to app streams; sinks are devices.
-    let xdg = match kind {
-        StreamKind::Application => crate::xdg::lookup(&crate::xdg::Hints {
+    // Only app streams get an icon; sinks are devices and draw by form.
+    let icon_path = match kind {
+        StreamKind::Application => crate::xdg::icon_for(&crate::xdg::Hints {
             app_id: app_id.as_deref(),
-            portal_app_id: props.get("pipewire.access.portal.app_id"),
+            portal_app_id: props.get(PORTAL_APP_ID),
             binary: binary.as_deref(),
             wm_class: props.get("window.x11.wm_class"),
             app_name: props.get("application.name"),
@@ -158,7 +158,7 @@ pub(crate) fn bind_node(
         media_role: props.get("media.role").map(str::to_string),
         channel_volumes: Vec::new(),
         muted: false,
-        xdg,
+        icon_path,
         // Resolved later by `recompute_device_forms_for_device` once the
         // Device info + routes arrive.
         form: None,

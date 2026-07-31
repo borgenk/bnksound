@@ -49,6 +49,8 @@ fn stream(
     volume: f32,
     is_default: bool,
 ) -> Stream {
+    // Not a test fixture: this ships behind the `dev` feature, so it cannot
+    // reach the `cfg(test)` builder and spells the struct out.
     Stream {
         id,
         kind,
@@ -61,7 +63,7 @@ fn stream(
         media_role: None,
         channel_volumes: vec![volume, volume],
         muted: false,
-        xdg: None,
+        icon_path: None,
         form,
         is_default,
         target_sink_name: None,

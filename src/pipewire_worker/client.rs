@@ -86,6 +86,17 @@ pub(crate) fn bind_client(
     }
 }
 
+/// The prop a portal sets on the Client of the app behind it, naming that app
+/// rather than the portal. Nodes never carry it.
+pub(crate) const PORTAL_APP_ID: &str = "pipewire.access.portal.app_id";
+
+/// The app id to believe: what the portal vouched for, else the app's own
+/// claim. Both Node and Client props are read through this so a stream cannot
+/// end up with one or the other depending on which arrived last.
+pub(crate) fn app_id_from<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<&'a str> {
+    get(PORTAL_APP_ID).or_else(|| get("application.id"))
+}
+
 /// Merge Client props into a Stream and re-run XDG lookup. Returns `true` if
 /// anything actually changed.
 pub(crate) fn apply_client_props_map(
@@ -93,44 +104,43 @@ pub(crate) fn apply_client_props_map(
     props: &BTreeMap<String, String>,
 ) -> bool {
     let mut changed = false;
+    let get = |key: &str| props.get(key).map(String::as_str);
 
-    let merge = |slot: &mut Option<String>, key: &str, changed: &mut bool| {
-        if let Some(v) = props.get(key)
-            && slot.as_deref() != Some(v.as_str())
+    let merge = |slot: &mut Option<String>, value: Option<&str>, changed: &mut bool| {
+        if let Some(v) = value
+            && slot.as_deref() != Some(v)
         {
-            *slot = Some(v.clone());
+            *slot = Some(v.to_string());
             *changed = true;
         }
     };
 
-    merge(&mut stream.app_id, "application.id", &mut changed);
+    merge(&mut stream.app_id, app_id_from(get), &mut changed);
     merge(
         &mut stream.binary,
-        "application.process.binary",
+        get("application.process.binary"),
         &mut changed,
     );
-    merge(&mut stream.pid, "application.process.id", &mut changed);
+    merge(&mut stream.pid, get("application.process.id"), &mut changed);
 
     // Upgrade "audio-src" to the Client's application.name (e.g. "spotify").
-    if let Some(app_name) = props.get("application.name")
-        && stream.name.as_str() != app_name.as_str()
+    if let Some(app_name) = get("application.name")
+        && stream.name.as_str() != app_name
     {
-        stream.name = app_name.clone();
+        stream.name = app_name.to_string();
         changed = true;
     }
 
     if matches!(stream.kind, StreamKind::Application) {
-        let new_xdg = crate::xdg::lookup(&crate::xdg::Hints {
+        let icon_path = crate::xdg::icon_for(&crate::xdg::Hints {
             app_id: stream.app_id.as_deref(),
-            portal_app_id: props
-                .get("pipewire.access.portal.app_id")
-                .map(String::as_str),
+            portal_app_id: get(PORTAL_APP_ID),
             binary: stream.binary.as_deref(),
-            wm_class: props.get("window.x11.wm_class").map(String::as_str),
-            app_name: props.get("application.name").map(String::as_str),
+            wm_class: get("window.x11.wm_class"),
+            app_name: get("application.name"),
         });
-        if stream.xdg != new_xdg {
-            stream.xdg = new_xdg;
+        if stream.icon_path != icon_path {
+            stream.icon_path = icon_path;
             changed = true;
         }
     }

@@ -70,7 +70,7 @@ impl<'a> AppRowGroup<'a> {
         &self,
         tombstoned: &HashSet<u32>,
         is_expanded: bool,
-        resolve_title: impl Fn(u32) -> Option<String>,
+        resolve_title: impl Fn(&AudioStream) -> Option<String>,
     ) -> AppRowInfo<'_> {
         let master_cubic = self
             .members
@@ -93,19 +93,16 @@ impl<'a> AppRowGroup<'a> {
         // would mislabel with one tab's title). The title replaces the app name
         // outright since the icon already identifies the app.
         let display_name = match rep {
-            Some(rep) if self.members.len() == 1 => rep
-                .pid
-                .as_deref()
-                .and_then(|p| p.parse::<u32>().ok())
-                .and_then(&resolve_title)
-                .unwrap_or_else(|| rep.display_name().to_string()),
+            Some(rep) if self.members.len() == 1 => {
+                resolve_title(rep).unwrap_or_else(|| rep.display_name().to_string())
+            }
             Some(rep) => rep.display_name().to_string(),
             None => String::new(),
         };
         AppRowInfo {
             key: &self.key,
             display_name,
-            xdg: rep.and_then(|s| s.xdg.as_ref()),
+            icon_path: rep.and_then(|s| s.icon_path.as_deref()),
             master_cubic,
             all_muted,
             effective_target,
@@ -176,25 +173,12 @@ mod tests {
 
     fn app_stream(id: u32) -> AudioStream {
         AudioStream {
-            id,
-            kind: StreamKind::Application,
             name: format!("stream-{id}"),
-            app_id: None,
-            binary: None,
-            pid: None,
-            node_name: None,
-            media_name: None,
-            media_role: None,
-            channel_volumes: vec![0.5, 0.5],
-            muted: false,
-            xdg: None,
-            form: None,
-            is_default: false,
-            target_sink_name: None,
+            ..crate::domain::sample_stream(id, StreamKind::Application)
         }
     }
 
-    fn no_titles(_pid: u32) -> Option<String> {
+    fn no_titles(_stream: &AudioStream) -> Option<String> {
         None
     }
 
@@ -366,8 +350,8 @@ mod tests {
         solo.pid = Some("4242".into());
 
         let groups = group_app_streams(&[&solo], &BTreeMap::new());
-        let info = groups[0].to_info(&HashSet::new(), false, |pid| {
-            (pid == 4242).then(|| "Spotify · Track".to_string())
+        let info = groups[0].to_info(&HashSet::new(), false, |stream| {
+            (stream.pid.as_deref() == Some("4242")).then(|| "Spotify · Track".to_string())
         });
         assert_eq!(info.display_name, "Spotify · Track");
     }

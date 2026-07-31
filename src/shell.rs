@@ -45,7 +45,7 @@ impl Shell {
     /// Rebuild the render-ready projection after a state change.
     pub fn refresh(&mut self) {
         let mpris = &self.mpris;
-        self.snapshot = build_snapshot(self.runtime.state(), |pid| mpris.resolve_title(pid));
+        self.snapshot = build_snapshot(self.runtime.state(), |stream| mpris.resolve_title(stream));
         // Rows that no longer exist stop being animated and stop being kept.
         // Nothing else drops them, and every reconnect mints a fresh node id,
         // so without this the decay walks a growing list of dead rows forever.

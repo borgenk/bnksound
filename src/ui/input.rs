@@ -745,21 +745,9 @@ mod tests {
         app.streams.insert(
             1,
             Stream {
-                id: 1,
-                kind: StreamKind::Sink,
                 name: "Speaker".into(),
-                app_id: None,
-                binary: None,
-                pid: None,
                 node_name: Some("node.1".into()),
-                media_name: None,
-                media_role: None,
-                channel_volumes: vec![0.5, 0.5],
-                muted: false,
-                xdg: None,
-                form: None,
-                is_default: false,
-                target_sink_name: None,
+                ..crate::domain::sample_stream(1, StreamKind::Sink)
             },
         );
         let snap = build_snapshot(&app, |_| None);
@@ -816,21 +804,9 @@ mod tests {
             app.streams.insert(
                 id,
                 Stream {
-                    id,
-                    kind: StreamKind::Sink,
                     name: format!("Speaker {id}"),
-                    app_id: None,
-                    binary: None,
-                    pid: None,
                     node_name: Some(format!("node.{id}")),
-                    media_name: None,
-                    media_role: None,
-                    channel_volumes: vec![0.5, 0.5],
-                    muted: false,
-                    xdg: None,
-                    form: None,
-                    is_default: false,
-                    target_sink_name: None,
+                    ..crate::domain::sample_stream(id, StreamKind::Sink)
                 },
             );
         }

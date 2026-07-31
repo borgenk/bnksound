@@ -2,11 +2,15 @@
 //!
 //! Players registering org.mpris.MediaPlayer2.* expose "now playing" metadata,
 //! letting the UI label a stream "YouTube · Title" instead of "Stream 113".
-//! Streams match players by PID, via GetConnectionUnixProcessID. Caveats:
+//! Streams match players by PID when process visibility permits it, then by
+//! application identity. Caveats:
 //!
 //! - Chromium-family browsers share one AudioService PID and one MPRIS player
 //!   across tabs, so the title tracks the most recently played media. Still
 //!   beats "Stream <id>".
+//! - Several players can answer to one identity, since two windows of the same
+//!   browser each register their own bus name. The first cached one wins, and
+//!   which that is moves as players come and go.
 //! - Apps with no MPRIS player get no enrichment; the row keeps its label.
 //!
 //! A thread owns the bus connection and writes the player cache; the UI reads
@@ -16,16 +20,19 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::sync::{Arc, Mutex};
 
 use crate::bus::Sender as BusSender;
 use crate::dbus::connection::Connection;
 use crate::dbus::wire::{MethodCall, Value};
+use crate::domain::Stream;
 use crate::state::Message;
 
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
 const PLAYER_PATH: &str = "/org/mpris/MediaPlayer2";
+const ROOT_IFACE: &str = "org.mpris.MediaPlayer2";
 const PLAYER_IFACE: &str = "org.mpris.MediaPlayer2.Player";
 const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
 const BUS_NAME: &str = "org.freedesktop.DBus";
@@ -64,7 +71,12 @@ impl PlayerInfo {
 /// sent it.
 struct CachedPlayer {
     owner: String,
-    pid: u32,
+    pid: Option<u32>,
+    /// The player's own account of what app it is. Identity is required by the
+    /// spec and holds a display name ("Helium"); DesktopEntry is optional and
+    /// holds a desktop file id. Either can name an app its bus name does not.
+    desktop_entry: Option<String>,
+    identity: Option<String>,
     info: PlayerInfo,
 }
 
@@ -121,7 +133,15 @@ impl PlayerCache {
     fn by_pid(&self, pid: u32) -> Option<&PlayerInfo> {
         self.players
             .iter()
-            .find(|(_, p)| p.pid == pid)
+            .find(|(_, p)| p.pid == Some(pid))
+            .map(|(_, p)| &p.info)
+    }
+
+    /// Metadata for the player whose declared identity matches the stream.
+    fn by_identity(&self, stream: &Stream) -> Option<&PlayerInfo> {
+        self.players
+            .iter()
+            .find(|(name, player)| player_matches_stream(name, player, stream))
             .map(|(_, p)| &p.info)
     }
 }
@@ -130,38 +150,53 @@ impl PlayerCache {
 /// the window's life and queries it with [`Mpris::resolve_title`].
 pub struct Mpris {
     cache: Arc<Mutex<PlayerCache>>,
-    /// What each audio PID last resolved to, and the cache generation it was
-    /// resolved against.
+    /// What each audio stream last resolved to, keyed by node id.
     ///
     /// Matching a stream to a player reads a /proc entry per ancestor, and the
     /// snapshot this feeds is rebuilt on every state change, which includes
-    /// every step of a slider drag. Answers only go stale when the players do,
-    /// so the generation is what decides.
-    resolved: RefCell<HashMap<u32, (u64, Option<String>)>>,
+    /// every step of a slider drag. An answer holds until either side of the
+    /// match moves, so each one carries what it was made against.
+    resolved: RefCell<HashMap<u32, Remembered>>,
 }
 
-/// Audio PIDs remembered at once. A session has a handful of streams; the cap
+/// A title resolved earlier, good while both the players and the stream's own
+/// identity stand still.
+#[derive(Clone)]
+struct Remembered {
+    generation: u64,
+    identity: u64,
+    title: Option<String>,
+}
+
+/// Audio streams remembered at once. A session has a handful of streams; the cap
 /// is what keeps a long run of short-lived ones from growing the map.
 const MAX_RESOLVED: usize = 64;
 
 impl Mpris {
-    /// Title for the player owning `audio_pid` or one of its /proc ancestors,
-    /// or None if none matches or it reports no title or artist.
-    pub fn resolve_title(&self, audio_pid: u32) -> Option<String> {
+    /// Title for the player matching the stream by process or application
+    /// identity, or None if none matches or it reports no title or artist.
+    pub fn resolve_title(&self, stream: &Stream) -> Option<String> {
         // A poisoned lock means the worker died mid-write. Enrichment is
         // optional, so miss rather than take the process down with it.
         let cache = self.cache.lock().ok()?;
         let generation = cache.generation;
+        let identity = identity_fingerprint(stream);
 
-        let remembered = self.resolved.borrow().get(&audio_pid).cloned();
-        if let Some((against, title)) = remembered
-            && against == generation
+        let remembered = self.resolved.borrow().get(&stream.id).cloned();
+        if let Some(remembered) = remembered
+            && remembered.generation == generation
+            && remembered.identity == identity
         {
-            return title;
+            return remembered.title;
         }
 
-        let title = ancestor_pids(audio_pid)
-            .find_map(|pid| cache.by_pid(pid))
+        let process_match = stream
+            .pid
+            .as_deref()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .and_then(|pid| ancestor_pids(pid).find_map(|pid| cache.by_pid(pid)));
+        let title = process_match
+            .or_else(|| cache.by_identity(stream))
             .and_then(PlayerInfo::display);
         drop(cache);
 
@@ -169,9 +204,29 @@ impl Mpris {
         if resolved.len() >= MAX_RESOLVED {
             resolved.clear();
         }
-        resolved.insert(audio_pid, (generation, title.clone()));
+        resolved.insert(
+            stream.id,
+            Remembered {
+                generation,
+                identity,
+                title: title.clone(),
+            },
+        );
         title
     }
+}
+
+/// Fold everything a match reads off the stream into one value, so a remembered
+/// answer is dropped once any of it changes. Props arrive in stages: a node
+/// binds with what it has, and the portal app id only ever rides the Client
+/// behind it, so a stream that missed on the way in has to be tried again.
+fn identity_fingerprint(stream: &Stream) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    stream.pid.hash(&mut hasher);
+    stream.app_id.hash(&mut hasher);
+    stream.binary.hash(&mut hasher);
+    stream.name.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Start tracking MPRIS players on a thread of its own, returning the handle
@@ -333,20 +388,29 @@ fn on_properties_changed(
     }
 }
 
-/// Bind one player: resolve its owner and PID, read its metadata, cache it.
+/// Bind one player: resolve its owner, read its identity and metadata, cache it.
 /// Best-effort, so any bus failure leaves the player out. True when the cache
 /// changed.
 fn attach(conn: &mut Connection, cache: &Arc<Mutex<PlayerCache>>, name: &str) -> bool {
     let Some(owner) = get_name_owner(conn, name) else {
         return false;
     };
-    let Some(pid) = get_connection_pid(conn, name) else {
-        return false;
-    };
+    let pid = get_connection_pid(conn, name);
+    let desktop_entry = fetch_string_property(conn, &owner, ROOT_IFACE, "DesktopEntry");
+    let identity = fetch_string_property(conn, &owner, ROOT_IFACE, "Identity");
     let info = fetch_metadata(conn, &owner);
 
     let inserted = match cache.lock() {
-        Ok(mut c) => c.insert(name.to_string(), CachedPlayer { owner, pid, info }),
+        Ok(mut c) => c.insert(
+            name.to_string(),
+            CachedPlayer {
+                owner,
+                pid,
+                desktop_entry,
+                identity,
+                info,
+            },
+        ),
         Err(_) => false,
     };
     if !inserted {
@@ -421,6 +485,29 @@ fn fetch_metadata(conn: &mut Connection, destination: &str) -> PlayerInfo {
         .unwrap_or_default()
 }
 
+fn fetch_string_property(
+    conn: &mut Connection,
+    destination: &str,
+    interface: &str,
+    property: &str,
+) -> Option<String> {
+    let reply = conn
+        .call(&MethodCall {
+            destination,
+            path: PLAYER_PATH,
+            interface: PROPS_IFACE,
+            member: "Get",
+            args: &[interface, property],
+        })
+        .ok()?;
+    reply
+        .body_values()?
+        .first()
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// Pull title and artist out of the a{sv} Metadata dict, ignoring every other
 /// key. Both are optional; a player with neither yields a default.
 fn parse_metadata(dict: &Value) -> PlayerInfo {
@@ -465,6 +552,50 @@ fn collect_strings(value: &Value) -> Vec<String> {
         .collect()
 }
 
+fn player_matches_stream(name: &str, player: &CachedPlayer, stream: &Stream) -> bool {
+    let bus_identity = name.strip_prefix(MPRIS_PREFIX).unwrap_or(name);
+    let identities = [
+        stream.app_id.as_deref(),
+        stream.binary.as_deref(),
+        Some(stream.name.as_str()),
+    ];
+
+    // A Chromium fork keeps the upstream bus name (Helium registers as
+    // org.mpris.MediaPlayer2.chromium.instanceN), so what the player calls
+    // itself is the only string tying it back to the app making the audio.
+    let declared = [player.desktop_entry.as_deref(), player.identity.as_deref()];
+
+    identities.into_iter().flatten().any(|identity| {
+        identity_matches(identity, bus_identity)
+            || declared
+                .into_iter()
+                .flatten()
+                .any(|declared| identity_matches(identity, declared))
+    })
+}
+
+fn identity_matches(stream_identity: &str, player_identity: &str) -> bool {
+    let stream_identity = normalized_identity(stream_identity);
+    let player_identity = normalized_identity(player_identity);
+    // An empty identity is a prefix of everything, so it is nothing to go on.
+    if stream_identity.is_empty() || player_identity.is_empty() {
+        return false;
+    }
+
+    stream_identity.eq_ignore_ascii_case(player_identity)
+        || (player_identity
+            .get(..stream_identity.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(stream_identity))
+            && player_identity
+                .get(stream_identity.len()..)
+                .is_some_and(|rest| rest.starts_with('.')))
+}
+
+fn normalized_identity(identity: &str) -> &str {
+    let identity = identity.rsplit('/').next().unwrap_or(identity);
+    identity.strip_suffix(".desktop").unwrap_or(identity)
+}
+
 /// The PIDs to try when matching an audio stream to a player: `audio_pid` then
 /// its /proc ancestors, up to [`MAX_ANCESTOR_DEPTH`], stopping before PID 1 so
 /// an unrelated higher-up player cannot match. The walk is needed because
@@ -499,11 +630,22 @@ mod tests {
     fn player(owner: &str, pid: u32, title: &str) -> CachedPlayer {
         CachedPlayer {
             owner: owner.to_string(),
-            pid,
+            pid: Some(pid),
+            desktop_entry: None,
+            identity: None,
             info: PlayerInfo {
                 title: Some(title.to_string()),
                 artist: None,
             },
+        }
+    }
+
+    fn stream(id: u32, pid: Option<u32>, app_id: Option<&str>) -> Stream {
+        Stream {
+            name: "player".to_string(),
+            app_id: app_id.map(str::to_string),
+            pid: pid.map(|pid| pid.to_string()),
+            ..crate::domain::sample_stream(id, crate::domain::StreamKind::Application)
         }
     }
 
@@ -588,6 +730,75 @@ mod tests {
         cache.insert("org.mpris.MediaPlayer2.vlc".into(), player(":1.7", 42, "T"));
         assert!(cache.by_owner_mut(":1.7").is_some());
         assert!(cache.by_owner_mut(":1.8").is_none());
+    }
+
+    #[test]
+    fn lookup_by_identity_works_without_process_visibility() {
+        let mut cached = player(":1.7", 42, "Track");
+        cached.pid = None;
+        cached.desktop_entry = Some("com.spotify.Client".into());
+
+        let mut cache = PlayerCache::default();
+        cache.insert("org.mpris.MediaPlayer2.spotify".into(), cached);
+
+        let audio = stream(7, None, Some("com.spotify.Client"));
+        assert_eq!(
+            cache
+                .by_identity(&audio)
+                .and_then(PlayerInfo::display)
+                .as_deref(),
+            Some("Track")
+        );
+    }
+
+    /// A Chromium fork registers under the upstream bus name, and a browser's
+    /// audio comes from a child process whose ancestry a sandbox cannot read.
+    /// What is left is the name the player gives for itself.
+    #[test]
+    fn lookup_by_identity_falls_back_to_the_players_declared_name() {
+        let mut audio = stream(7, None, None);
+        audio.binary = Some("helium".into());
+
+        let mut cached = player(":1.19", 1144, "Video");
+        cached.pid = None;
+
+        let mut cache = PlayerCache::default();
+        let bus_name = "org.mpris.MediaPlayer2.chromium.instance1144";
+        cache.insert(bus_name.into(), cached);
+        assert!(
+            cache.by_identity(&audio).is_none(),
+            "nothing ties helium to a bus name branded chromium",
+        );
+
+        if let Some(player) = cache.by_owner_mut(":1.19") {
+            player.identity = Some("Helium".into());
+        }
+        assert_eq!(
+            cache
+                .by_identity(&audio)
+                .and_then(PlayerInfo::display)
+                .as_deref(),
+            Some("Video")
+        );
+    }
+
+    #[test]
+    fn lookup_by_bus_identity_accepts_mpris_instance_suffixes() {
+        let mut audio = stream(7, None, None);
+        audio.binary = Some("firefox".into());
+
+        let mut cache = PlayerCache::default();
+        cache.insert(
+            "org.mpris.MediaPlayer2.firefox.instance42".into(),
+            player(":1.7", 42, "Video"),
+        );
+        assert_eq!(
+            cache
+                .by_identity(&audio)
+                .and_then(PlayerInfo::display)
+                .as_deref(),
+            Some("Video")
+        );
     }
 
     /// Encode an a{sv} metadata dict the way a Properties.Get reply carries it.
@@ -734,16 +945,17 @@ mod tests {
     fn a_resolved_title_is_remembered_until_the_players_change() {
         let mpris = inert_handle();
         let me = std::process::id();
+        let audio = stream(77, Some(me), None);
         let name = "org.mpris.MediaPlayer2.test";
 
         {
             let mut cache = mpris.cache.lock().expect("lock");
             cache.insert(name.into(), player(":1.1", me, "First"));
         }
-        assert_eq!(mpris.resolve_title(me).as_deref(), Some("First"));
+        assert_eq!(mpris.resolve_title(&audio).as_deref(), Some("First"));
         // Asked again with nothing changed, and answered from memory.
-        assert_eq!(mpris.resolve_title(me).as_deref(), Some("First"));
-        assert_eq!(mpris.resolved.borrow().len(), 1, "one PID remembered");
+        assert_eq!(mpris.resolve_title(&audio).as_deref(), Some("First"));
+        assert_eq!(mpris.resolved.borrow().len(), 1, "one stream remembered");
 
         // The player starts a new track, which moves the cache on.
         {
@@ -751,7 +963,7 @@ mod tests {
             cache.insert(name.into(), player(":1.1", me, "Second"));
         }
         assert_eq!(
-            mpris.resolve_title(me).as_deref(),
+            mpris.resolve_title(&audio).as_deref(),
             Some("Second"),
             "a changed player is resolved afresh rather than answered from memory",
         );
@@ -761,7 +973,28 @@ mod tests {
             let mut cache = mpris.cache.lock().expect("lock");
             assert!(cache.remove(name));
         }
-        assert_eq!(mpris.resolve_title(me), None);
+        assert_eq!(mpris.resolve_title(&audio), None);
+    }
+
+    /// A node binds with whatever props it has and the Client fills in the rest
+    /// behind it, with a snapshot built in between. The players have not moved,
+    /// so only the stream itself says the first answer is spent.
+    #[test]
+    fn a_stream_that_gains_an_app_id_is_resolved_afresh() {
+        let mpris = inert_handle();
+        let mut audio = stream(77, None, None);
+
+        {
+            let mut cache = mpris.cache.lock().expect("lock");
+            let mut cached = player(":1.1", 42, "Track");
+            cached.pid = None;
+            cached.desktop_entry = Some("com.spotify.Client".into());
+            cache.insert("org.mpris.MediaPlayer2.spotify".into(), cached);
+        }
+        assert_eq!(mpris.resolve_title(&audio), None, "nothing to match on yet");
+
+        audio.app_id = Some("com.spotify.Client".into());
+        assert_eq!(mpris.resolve_title(&audio).as_deref(), Some("Track"));
     }
 
     #[test]
@@ -774,6 +1007,7 @@ mod tests {
             resolved: RefCell::new(HashMap::new()),
         };
         drop(tx);
-        assert_eq!(mpris.resolve_title(std::process::id()), None);
+        let audio = stream(77, Some(std::process::id()), None);
+        assert_eq!(mpris.resolve_title(&audio), None);
     }
 }

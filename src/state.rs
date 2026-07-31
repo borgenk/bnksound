@@ -1251,21 +1251,8 @@ mod tests {
 
     fn app_stream(id: u32) -> AudioStream {
         AudioStream {
-            id,
-            kind: StreamKind::Application,
             name: format!("stream-{id}"),
-            app_id: None,
-            binary: None,
-            pid: None,
-            node_name: None,
-            media_name: None,
-            media_role: None,
-            channel_volumes: vec![0.5, 0.5],
-            muted: false,
-            xdg: None,
-            form: None,
-            is_default: false,
-            target_sink_name: None,
+            ..crate::domain::sample_stream(id, StreamKind::Application)
         }
     }
 

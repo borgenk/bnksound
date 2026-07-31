@@ -1,4 +1,4 @@
-use crate::xdg::XdgInfo;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
@@ -231,7 +231,9 @@ pub struct Stream {
     pub media_role: Option<String>,
     pub channel_volumes: Vec<f32>,
     pub muted: bool,
-    pub xdg: Option<XdgInfo>,
+    /// Resolved from the icon themes by name. `None` for device streams and
+    /// for apps whose name matches no installed icon.
+    pub icon_path: Option<PathBuf>,
     /// Resolved physical form, set for `Sink`/`Source` streams via
     /// [`DeviceForm`]. `None` until the Device info + Route params arrive
     /// (permanently `None` for software-only devices and app streams).
@@ -247,12 +249,10 @@ pub struct Stream {
 }
 
 impl Stream {
-    /// Best display name: the resolved XDG `Name=`, else the PipeWire props.
+    /// Best display name: what the app calls itself, minus a trailing generic
+    /// product word.
     pub fn display_name(&self) -> &str {
-        self.xdg
-            .as_ref()
-            .map(|x| x.name.as_str())
-            .unwrap_or(&self.name)
+        clean_name(&self.name)
     }
 
     /// Average linear gain across channels, clamped to [0.0, MAX_VOLUME].
@@ -275,7 +275,8 @@ impl Stream {
     /// Stable identity for "which app this stream belongs to", used to match
     /// across destroy/recreate and to key profile entries. `None` for sinks
     /// and for app streams missing every hint. The tag prefix (`app:` /
-    /// `bin:` / `xdg:`) keeps different sources from colliding.
+    /// `bin:`) keeps different sources from colliding. Deliberately not keyed
+    /// on the display name, which the Client props rewrite mid-life.
     pub fn app_identity(&self) -> Option<String> {
         if !matches!(self.kind, StreamKind::Application) {
             return None;
@@ -283,13 +284,56 @@ impl Stream {
         if let Some(a) = self.app_id.as_deref() {
             return Some(format!("app:{a}"));
         }
-        if let Some(b) = self.binary.as_deref() {
-            return Some(format!("bin:{b}"));
-        }
-        self.xdg
-            .as_ref()
-            .map(|x| format!("xdg:{}", x.desktop_path.display()))
+        self.binary.as_deref().map(|b| format!("bin:{b}"))
     }
+}
+
+/// Generic product words an app tacks onto its own name. Dropped for display
+/// when something is left in front, so "Helium Browser" reads as "Helium"
+/// while an app calling itself only "Browser" keeps the name. Longest first,
+/// so "Web Browser" goes before "Browser".
+const NAME_SUFFIXES: [&str; 6] = [
+    "web browser",
+    "media player",
+    "music player",
+    "browser",
+    "launcher",
+    "player",
+];
+
+/// Trim a trailing product word, bare ("Helium Browser") or parenthesised
+/// ("Spotify (Launcher)"). Returns a slice of the input, so no display path
+/// allocates for this.
+fn clean_name(name: &str) -> &str {
+    let trimmed = name.trim_end();
+    for suffix in NAME_SUFFIXES {
+        let stem = strip_ci(trimmed, suffix).or_else(|| {
+            trimmed
+                .strip_suffix(')')
+                .and_then(|inner| strip_ci(inner, suffix))
+                .and_then(|inner| inner.strip_suffix('('))
+        });
+        // Only a whole trailing word counts, so whitespace has to have been
+        // trimmed off the stem. Without that, "Webbrowser" would lose its tail.
+        if let Some(stem) = stem {
+            let kept = stem.trim_end();
+            if !kept.is_empty() && kept.len() < stem.len() {
+                return kept;
+            }
+        }
+    }
+    trimmed
+}
+
+/// `strip_suffix`, ignoring ASCII case.
+fn strip_ci<'a>(text: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = text.len().checked_sub(suffix.len())?;
+    if !text.is_char_boundary(cut) {
+        return None;
+    }
+    text[cut..]
+        .eq_ignore_ascii_case(suffix)
+        .then(|| &text[..cut])
 }
 
 /// Slider range: 0% to 150% on the perceptual (cubic) scale, matching
@@ -308,6 +352,36 @@ pub fn linear_to_cubic(linear: f32) -> f32 {
 pub fn cubic_to_linear(cubic: f32) -> f32 {
     let c = cubic.max(0.0);
     c * c * c
+}
+
+/// A [`Stream`] with every optional field unset, for tests to build on:
+///
+/// ```ignore
+/// Stream { name: "Speaker".into(), ..sample_stream(1, StreamKind::Sink) }
+/// ```
+///
+/// The struct has no `Default` because none of its fields have a meaningful
+/// zero outside a test, and spelling all of them out at each fixture turns
+/// every added field into a sweep across the crate.
+#[cfg(test)]
+pub(crate) fn sample_stream(id: u32, kind: StreamKind) -> Stream {
+    Stream {
+        id,
+        kind,
+        name: format!("Stream {id}"),
+        app_id: None,
+        binary: None,
+        pid: None,
+        node_name: None,
+        media_name: None,
+        media_role: None,
+        channel_volumes: vec![0.5, 0.5],
+        muted: false,
+        icon_path: None,
+        form: None,
+        is_default: false,
+        target_sink_name: None,
+    }
 }
 
 #[cfg(test)]
@@ -393,5 +467,49 @@ mod tests {
             DeviceForm::Input(SourceForm::LineIn).sort_key(),
             SourceForm::LineIn.sort_key()
         );
+    }
+
+    /// The names measured off real streams and desktop entries, plus the
+    /// shapes that must survive untouched.
+    #[test]
+    fn a_trailing_product_word_is_dropped_for_display() {
+        for (raw, shown) in [
+            ("Helium Browser", "Helium"),
+            ("Spotify (Launcher)", "Spotify"),
+            ("mpv Media Player", "mpv"),
+            ("Firefox Web Browser", "Firefox"),
+            ("Rhythmbox Music Player", "Rhythmbox"),
+            ("VLC media player", "VLC"),
+            ("Helium Browser   ", "Helium"),
+        ] {
+            let mut s = app_stream();
+            s.name = raw.to_string();
+            assert_eq!(s.display_name(), shown, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_only_the_product_word_keeps_it() {
+        for raw in ["Browser", "Launcher", "Player"] {
+            let mut s = app_stream();
+            s.name = raw.to_string();
+            assert_eq!(s.display_name(), raw, "nothing would be left");
+        }
+    }
+
+    #[test]
+    fn the_word_has_to_stand_alone() {
+        for raw in ["Webbrowser", "Multiplayer", "Relauncher", "Helium"] {
+            let mut s = app_stream();
+            s.name = raw.to_string();
+            assert_eq!(s.display_name(), raw, "not a trailing word");
+        }
+    }
+
+    fn app_stream() -> Stream {
+        Stream {
+            name: String::new(),
+            ..sample_stream(1, StreamKind::Application)
+        }
     }
 }

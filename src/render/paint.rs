@@ -1080,21 +1080,11 @@ mod tests {
 
     fn stream(id: u32, kind: StreamKind) -> Stream {
         Stream {
-            id,
-            kind,
             name: format!("Device {id}"),
-            app_id: None,
-            binary: None,
-            pid: None,
             node_name: Some(format!("node.{id}")),
-            media_name: None,
-            media_role: None,
-            channel_volumes: vec![0.5, 0.5],
-            muted: false,
-            xdg: None,
             form: Some(crate::domain::DeviceForm::Output(SinkForm::Speaker)),
             is_default: id == 1,
-            target_sink_name: None,
+            ..crate::domain::sample_stream(id, kind)
         }
     }
 

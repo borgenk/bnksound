@@ -4,7 +4,7 @@
 //! widgets, so both the GTK widget path and the native renderer build from the
 //! same numbers.
 
-use crate::xdg::XdgInfo;
+use std::path::Path;
 
 /// Aggregate state for a collapsed app row, materialised by
 /// [`crate::view::app_group::AppRowGroup::to_info`] so the row renderer never
@@ -14,7 +14,7 @@ pub struct AppRowInfo<'a> {
     pub key: &'a str,
     /// Owned because the label may be MPRIS-enriched (e.g. "Spotify · Track").
     pub display_name: String,
-    pub xdg: Option<&'a XdgInfo>,
+    pub icon_path: Option<&'a Path>,
     /// Cubic master volume (max of member cubics), drives slider + readout.
     pub master_cubic: f32,
     /// True iff every member is muted (or the group is empty).

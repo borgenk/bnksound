@@ -118,7 +118,10 @@ pub struct ViewSnapshot {
 
 /// Project state into a snapshot. `resolve_title` supplies MPRIS-enriched titles
 /// for single-stream app rows (a no-op closure disables enrichment).
-pub fn build_snapshot(state: &App, resolve_title: impl Fn(u32) -> Option<String>) -> ViewSnapshot {
+pub fn build_snapshot(
+    state: &App,
+    resolve_title: impl Fn(&AudioStream) -> Option<String>,
+) -> ViewSnapshot {
     let mut sinks: Vec<&AudioStream> = Vec::new();
     let mut sources: Vec<&AudioStream> = Vec::new();
     let mut app_streams: Vec<&AudioStream> = Vec::new();
@@ -231,7 +234,7 @@ fn app_row(
     row: &RenderedAppRow,
     state: &App,
     sink_by_name: &HashMap<&str, u32>,
-    resolve_title: &impl Fn(u32) -> Option<String>,
+    resolve_title: &impl Fn(&AudioStream) -> Option<String>,
 ) -> AppRowView {
     match row {
         RenderedAppRow::Group { group, expanded } => {
@@ -246,7 +249,7 @@ fn app_row(
                     .min_by_key(|s| s.id)
                     .map(|s| s.display_name().to_string())
                     .unwrap_or_default(),
-                icon_path: info.xdg.and_then(|x| x.icon_path.clone()),
+                icon_path: info.icon_path.map(std::path::Path::to_path_buf),
                 cubic: info.master_cubic,
                 muted: info.all_muted,
                 tombstoned: info.all_tombstoned,
@@ -268,7 +271,7 @@ fn app_row(
                 // Keyed on the app, not the stream: every member of a group
                 // wears the same icon, so they share one cache entry.
                 icon_key: stream.display_name().to_string(),
-                icon_path: stream.xdg.as_ref().and_then(|x| x.icon_path.clone()),
+                icon_path: stream.icon_path.clone(),
                 cubic,
                 muted: stream.muted,
                 tombstoned: state.tombstoned.contains(&stream.id),
@@ -385,27 +388,15 @@ mod tests {
     use crate::domain::{DeviceForm, MAX_VOLUME, SinkForm, StreamKind};
     use crate::state;
 
-    fn no_titles(_pid: u32) -> Option<String> {
+    fn no_titles(_stream: &AudioStream) -> Option<String> {
         None
     }
 
     fn stream(id: u32, kind: StreamKind) -> AudioStream {
         AudioStream {
-            id,
-            kind,
             name: format!("node-{id}"),
-            app_id: None,
-            binary: None,
-            pid: None,
             node_name: Some(format!("node.name.{id}")),
-            media_name: None,
-            media_role: None,
-            channel_volumes: vec![0.5, 0.5],
-            muted: false,
-            xdg: None,
-            form: None,
-            is_default: false,
-            target_sink_name: None,
+            ..crate::domain::sample_stream(id, kind)
         }
     }
 
@@ -470,11 +461,7 @@ mod tests {
             let mut s = stream(id, StreamKind::Application);
             s.app_id = Some("net.helium.Browser".into());
             s.media_name = media.map(str::to_string);
-            s.xdg = Some(crate::xdg::XdgInfo {
-                name: "Helium Browser".into(),
-                icon_path: None,
-                desktop_path: std::path::PathBuf::from("/dev/null"),
-            });
+            s.name = "Helium Browser".into();
             a.streams.insert(id, s);
         }
         let key = crate::state::app_row_key(&a.streams[&85]);
@@ -499,8 +486,8 @@ mod tests {
             .find(|r| !r.is_member)
             .expect("group row");
         assert_eq!(
-            group.label, "Helium Browser",
-            "the group keeps the app name"
+            group.label, "Helium",
+            "the group keeps the app name, minus the generic product word",
         );
     }
 

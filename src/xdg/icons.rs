@@ -29,7 +29,7 @@
 //! Minimal freedesktop icon lookup: app icons by name and size. Searches the
 //! configured theme, then whatever it inherits, then hicolor, taking an exact
 //! size match in each before the nearest. Falls back to
-//! `$base/<name>.{png,svg,xpm}` and `/usr/share/pixmaps/`.
+//! `$base/<name>.{png,svg,xpm}` and the `pixmaps` dir of each data root.
 //!
 //! Spec: https://specifications.freedesktop.org/icon-theme-spec/latest/
 
@@ -110,7 +110,9 @@ fn search(name: &str, size: u16, exts: &[&str]) -> Option<PathBuf> {
             return Some(p);
         }
     }
-    try_extensions(Path::new("/usr/share/pixmaps"), name, exts)
+    pixmap_paths()
+        .iter()
+        .find_map(|dir| try_extensions(dir, name, exts))
 }
 
 fn absolute_passthrough(name: &str) -> Option<PathBuf> {
@@ -259,24 +261,19 @@ fn icon_base_paths() -> Vec<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         push(PathBuf::from(&home).join(".icons"));
     }
-
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-    if let Some(p) = data_home {
-        push(p.join("icons"));
-    }
-
-    let dirs =
-        std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
-    for d in dirs.split(':') {
-        if d.is_empty() {
-            continue;
-        }
-        push(PathBuf::from(d).join("icons"));
+    for root in crate::xdg::dirs::data_roots() {
+        push(root.join("icons"));
     }
 
     out
+}
+
+/// The legacy flat dirs the spec keeps alongside the themes.
+fn pixmap_paths() -> Vec<PathBuf> {
+    crate::xdg::dirs::data_roots()
+        .into_iter()
+        .map(|root| root.join("pixmaps"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
