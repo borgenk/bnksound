@@ -76,7 +76,7 @@ jobs:
           fi
 
       - name: Hand the bundle to the publish job
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: flatpak-bundle
           path: bnksound-${{ github.ref_name }}-x86_64.flatpak
@@ -147,7 +147,7 @@ jobs:
 
       # Built in the job above, which needs a container the tarballs do not.
       - name: Collect the Flatpak bundle
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: flatpak-bundle
           path: dist
