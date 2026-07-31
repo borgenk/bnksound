@@ -120,12 +120,15 @@ install-assets:
 
 # Bump version, commit, and tag: make bump V=0.2.0
 # Pushing the tag triggers the release workflow, which rejects any tag whose
-# name does not match this version, so the two stay in lockstep.
+# name does not match this version, so the two stay in lockstep. The metainfo
+# gets an entry of the same version, dated today, because that list is what the
+# Flatpak reports as its release history.
 bump:
 	@test -n "$(V)" || (echo "Current: $(VERSION). Usage: make bump V=0.2.0" && exit 1)
 	sed -i '0,/^version = ".*"/{s//version = "$(V)"/}' Cargo.toml
+	sed -i 's|<releases>|<releases>\n    <release version="$(V)" date="'"$$(date -u +%F)"'"/>|' assets/$(APP_ID).metainfo.xml
 	cargo update --workspace
-	git add Cargo.toml Cargo.lock
+	git add Cargo.toml Cargo.lock assets/$(APP_ID).metainfo.xml
 	git commit -m "Bump version to $(V)"
 	git tag "v$(V)"
 	@echo "Bumped to v$(V). Push with: git push origin main --tags"
