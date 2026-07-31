@@ -160,7 +160,6 @@ jobs:
         with:
           manifest-path: io.github.borgenk.BnkSound.yml
           bundle: bnksound.flatpak
-          artifact-name: bnksound-flatpak-x86_64
           # The manifest copies the checkout in as a source and skips the two
           # names below, so the build cannot fold its own output back into the
           # app. The action's defaults (flatpak_app, repo) are not on that list.

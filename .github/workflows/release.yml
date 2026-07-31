@@ -53,7 +53,6 @@ jobs:
         with:
           manifest-path: io.github.borgenk.BnkSound.yml
           bundle: bnksound-${{ github.ref_name }}-x86_64.flatpak
-          artifact-name: bnksound-flatpak-x86_64
           # The manifest copies the checkout in as a source and skips the two
           # names below, so the build cannot fold its own output back into the
           # app. The action's defaults (flatpak_app, repo) are not on that list.
@@ -61,6 +60,10 @@ jobs:
           repo-dir: flatpak-repo
           # What ships is built from the checkout and nothing else.
           cache: false
+          # The action derives its artifact name from the bundle name. The
+          # bundle goes up below instead, under a name the publish job can ask
+          # for without knowing how the bundle is named.
+          upload-artifact: false
 
       # The tarballs get the same treatment further down, and for the same
       # reason: the binary is installed under the plain name, so its own
@@ -71,6 +74,13 @@ jobs:
             echo "::error::the Flatpak's bnksound does not link GTK"
             exit 1
           fi
+
+      - name: Hand the bundle to the publish job
+        uses: actions/upload-artifact@v5
+        with:
+          name: flatpak-bundle
+          path: bnksound-${{ github.ref_name }}-x86_64.flatpak
+          if-no-files-found: error
 
   release:
     name: Build and publish
@@ -139,7 +149,7 @@ jobs:
       - name: Collect the Flatpak bundle
         uses: actions/download-artifact@v5
         with:
-          name: bnksound-flatpak-x86_64
+          name: flatpak-bundle
           path: dist
 
       # make build-linux writes one of these per tarball; the bundle arrives
