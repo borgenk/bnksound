@@ -74,6 +74,8 @@ pub enum HitTarget {
     Backdrop,
     // Client-side decorations, present only when the shell draws its own chrome.
     TitlebarDrag,
+    /// Size the window to its columns, and back again to the size it had.
+    WindowFit,
     WindowMinimize,
     WindowMaximize,
     WindowClose,
@@ -199,8 +201,10 @@ pub struct ColumnGeom {
     /// The expand toggle, one slot above the topmost target pin. Empty unless
     /// the row is an app group with more than one member.
     pub expand: Rect,
-    /// The hairline rule closing the column on its right.
-    pub separator: Rect,
+    /// The hairline rule between this column and the next, absent on the last
+    /// one: a rule there would close the run against nothing, and it falls
+    /// outside the width the columns actually need.
+    pub separator: Option<Rect>,
     pub is_app: bool,
 }
 
@@ -272,6 +276,10 @@ pub struct Layout {
     /// The strip carrying the profile selector, absent when the window's own
     /// titlebar carries it instead.
     pub profile_strip: Option<Rect>,
+    /// The fit button, wherever the chrome could put one: in the window's own
+    /// titlebar, or failing that at the right of the profile strip. Absent
+    /// under a toolkit header, which is not this code's to add buttons to.
+    pub fit: Option<Rect>,
     /// The left action bar, absent when the user has hidden it.
     pub sidebar: Option<Rect>,
     /// The scrollable column area.
@@ -291,20 +299,41 @@ pub struct Layout {
 }
 
 // Projection metrics (logical pixels).
+/// Air before the run's first column.
 const STRIP_PAD: i32 = 10;
+/// Air after the run's last column.
+///
+/// A column leans left: its meter starts METER_INSET in and its button stack
+/// stops COLUMN_END_AIR short of the right edge. The run inherits that lean at
+/// its two ends, and the trailing pad carries the difference, so a window
+/// fitted to its columns shows the same air on both sides of them.
+const STRIP_PAD_RIGHT: i32 = STRIP_PAD + METER_INSET - COLUMN_END_AIR;
 /// The 1px rule between columns; the separator is drawn in it.
 const COL_GAP: i32 = 1;
-/// Inset from a column's left edge to its meter. The meter, fader, and button
-/// stack sit at fixed offsets rather than being centred, which is what keeps
-/// them lined up across columns of differing content.
+/// Inset from a column's left edge to its meter. The meter and the fader are
+/// placed as a pair on the column's middle, and the button stack hangs off the
+/// fader into the air left over on the right, so the bars keep the same place
+/// in every column whatever rides beside them.
 const METER_INSET: i32 = 24;
+/// Air between the meter and the fader.
+const SLIDER_METER_GAP: i32 = 12;
 /// Air between the fader and the button stack beside it.
 const FADER_BUTTON_GAP: i32 = 9;
+/// What a column holds between its button stack and its right edge.
+const COLUMN_END_AIR: i32 = metrics::COLUMN_WIDTH
+    - (METER_INSET
+        + METER_W
+        + SLIDER_METER_GAP
+        + metrics::SLIDER_WIDTH
+        + FADER_BUTTON_GAP
+        + metrics::PICK_SIZE);
+// The stack takes no width from the bars, so what is left of the column past
+// the fader has to hold it.
+const _: () = assert!(COLUMN_END_AIR >= 0);
 /// The strip's bottom padding, which is tighter than its top.
 const STRIP_PAD_BOTTOM: i32 = 2;
 const ICON_TOP: i32 = 8;
 const NAME_H: i32 = 16;
-const SLIDER_METER_GAP: i32 = 12;
 /// Inset from a column's top to its heading.
 const HEADER_TOP: i32 = 3;
 /// Air between the header block and the top of the meter and fader.
@@ -423,9 +452,7 @@ fn column(spec: ColumnSpec, rect: Rect, hits: &mut Vec<Hit>) -> ColumnGeom {
 
     // The button stack rides over the pair's right edge, bottom-aligned: mute
     // last, target pins above it.
-    let btn_x = (track.right() + FADER_BUTTON_GAP)
-        .min(rect.right() - PICK_SIZE)
-        .max(x);
+    let btn_x = track.right() + FADER_BUTTON_GAP;
     let mute = Rect::new(btn_x, body_bottom - PICK_SIZE, PICK_SIZE, PICK_SIZE);
 
     // The slider takes the whole trough; the knob's overhang is part of it.
@@ -494,7 +521,7 @@ fn column(spec: ColumnSpec, rect: Rect, hits: &mut Vec<Hit>) -> ColumnGeom {
         mute,
         targets,
         expand,
-        separator: Rect::new(rect.right(), rect.y, COL_GAP, rect.h),
+        separator: Some(Rect::new(rect.right(), rect.y, COL_GAP, rect.h)),
         is_app,
     }
 }
@@ -510,16 +537,15 @@ use crate::ui::meter::METER_WIDTH as METER_W;
 /// dropdown, then any overlay, and finally the resize edges, which stay grabbable
 /// no matter what is open.
 pub fn project(snapshot: &ViewSnapshot, ui: &UiState, window: Rect) -> Layout {
-    let scroll_x = ui.scroll_x;
     let mut hits: Vec<Hit> = Vec::new();
 
     // Client-drawn chrome takes the top strip; the mixer body gets the rest.
-    let (titlebar, content) = if ui.chrome == Chrome::Client {
-        let bar = titlebar(window, &mut hits);
+    let (titlebar, fit, content) = if ui.chrome == Chrome::Client {
+        let (bar, fit) = titlebar(window, &mut hits);
         let rest = Rect::new(window.x, bar.bar.bottom(), window.w, window.h - bar.bar.h);
-        (Some(bar), rest)
+        (Some(bar), Some(fit), rest)
     } else {
-        (None, window)
+        (None, None, window)
     };
 
     // The profile selector gets its own strip across the top, unless a drawn
@@ -550,6 +576,17 @@ pub fn project(snapshot: &ViewSnapshot, ui: &UiState, window: Rect) -> Layout {
         chip
     });
 
+    // A server-decorated window has no window buttons of its own, so the fit
+    // rides at the right end of the profile strip instead. The toolkit's header
+    // is GTK's, and nothing here can put a button in it.
+    let fit = fit.or_else(|| profile_strip.map(fit_button));
+    if let Some(rect) = fit {
+        hits.push(Hit {
+            rect,
+            target: HitTarget::WindowFit,
+        });
+    }
+
     // The action bar takes a fixed strip down the left; the columns take what
     // is left of the body.
     let cfg = &ui.settings;
@@ -567,7 +604,18 @@ pub fn project(snapshot: &ViewSnapshot, ui: &UiState, window: Rect) -> Layout {
     // its whole depth rather than sitting in a fixed-height block.
     let col_top = strip.y + STRIP_PAD;
     let col_h = (strip.h - STRIP_PAD - STRIP_PAD_BOTTOM).max(metrics::SLIDER_TRACK_HEIGHT);
-    let mut x = strip.x - scroll_x;
+    // The run starts at the padding whatever its length. Columns come and go
+    // with the streams, so a run placed against anything but the left edge
+    // would slide every column sideways each time one appears.
+    let run = run_width(column_count(snapshot));
+    // What the run needs beyond the strip, which is what there is to scroll.
+    let scroll_max_x = (STRIP_PAD + STRIP_PAD_RIGHT + run - strip.w).max(0);
+    // The offset outlives the run it was taken against: fitting the window, or
+    // a column going away, can leave it scrolled past an end that has moved.
+    // Honouring it then would hold the columns off the left edge and open the
+    // air on the right that the scroll was hiding.
+    let scroll_x = ui.scroll_x.clamp(0, scroll_max_x);
+    let mut x = strip.x + STRIP_PAD - scroll_x;
     let mut columns = Vec::new();
     let mut place = |spec: ColumnSpec, x: &mut i32, columns: &mut Vec<ColumnGeom>| {
         let rect = Rect::new(*x, col_top, metrics::COLUMN_WIDTH, col_h);
@@ -604,9 +652,13 @@ pub fn project(snapshot: &ViewSnapshot, ui: &UiState, window: Rect) -> Layout {
         }
     }
 
-    // Total content width to the right edge of the last column.
-    let used = x + scroll_x - strip.x;
-    let scroll_max_x = (used - strip.w + 2 * STRIP_PAD).max(0);
+    // The rule belongs between two columns, so the run's right edge does
+    // without. It would otherwise fall a pixel outside the width the columns
+    // need, which is the width the fit asks for.
+    if let Some(last) = columns.last_mut() {
+        last.separator = None;
+    }
+
     let strip_scrollbar =
         (scroll_max_x > 0).then(|| strip_scrollbar(strip, scroll_x, scroll_max_x, &mut hits));
 
@@ -634,6 +686,7 @@ pub fn project(snapshot: &ViewSnapshot, ui: &UiState, window: Rect) -> Layout {
         window,
         content,
         profile_strip,
+        fit,
         sidebar,
         strip,
         columns,
@@ -682,19 +735,65 @@ fn strip_scrollbar(
     ScrollbarGeom { track, slider }
 }
 
+/// How many columns a snapshot puts in the strip. Mirrors the runs [`project`]
+/// places, so the width the fit asks for is known without laying any of them
+/// out.
+pub fn column_count(snapshot: &ViewSnapshot) -> usize {
+    let sources = if snapshot.show_sources {
+        snapshot.sources.len()
+    } else {
+        0
+    };
+    let sinks = if snapshot.show_sinks {
+        snapshot.sinks.len()
+    } else {
+        0
+    };
+    let apps = if snapshot.show_apps {
+        snapshot.app_rows.len()
+    } else {
+        0
+    };
+    sources + sinks + apps
+}
+
+/// Width of `columns` columns side by side, with the rule between each pair.
+fn run_width(columns: usize) -> i32 {
+    match i32::try_from(columns).unwrap_or(i32::MAX) {
+        n if n <= 0 => 0,
+        n => n * metrics::COLUMN_WIDTH + (n - 1) * COL_GAP,
+    }
+}
+
+/// The window width that shows `columns` columns with no room left over: the
+/// action bar if it is shown, the strip's padding, and the run itself.
+///
+/// This is the size the fit action asks for, and the floor in [`minimum_size`]
+/// is the same number for a single column.
+pub fn natural_width(columns: usize, show_sidebar: bool) -> i32 {
+    let sidebar = if show_sidebar {
+        metrics::SIDEBAR_WIDTH
+    } else {
+        0
+    };
+    sidebar + STRIP_PAD + STRIP_PAD_RIGHT + run_width(columns)
+}
+
 /// The smallest window that still shows a whole column: the top strip, the
 /// padding around the columns, and a column's header, fader, and bottom margin.
 /// Both shells hand this to the window manager, so both stop at the same place.
 ///
+/// The action bar is part of the floor because it is not the columns' to take
+/// room from; a minimum that left it out would put the one column it promises
+/// half outside the strip.
+///
 /// The top strip is the same height whether the window's chrome carries the
 /// profile chip or a strip of its own does, so one number covers both.
-pub fn minimum_size() -> (i32, i32) {
-    use metrics::{
-        COLUMN_BOTTOM, COLUMN_HEADER_HEIGHT, COLUMN_WIDTH, MIN_FADER_HEIGHT, TITLEBAR_HEIGHT,
-    };
+pub fn minimum_size(show_sidebar: bool) -> (i32, i32) {
+    use metrics::{COLUMN_BOTTOM, COLUMN_HEADER_HEIGHT, MIN_FADER_HEIGHT, TITLEBAR_HEIGHT};
     let column = COLUMN_HEADER_HEIGHT + HEADER_GAP + MIN_FADER_HEIGHT + COLUMN_BOTTOM;
     (
-        COLUMN_WIDTH + 40,
+        natural_width(1, show_sidebar),
         TITLEBAR_HEIGHT + STRIP_PAD + column + STRIP_PAD_BOTTOM,
     )
 }
@@ -702,8 +801,8 @@ pub fn minimum_size() -> (i32, i32) {
 /// A window size grown to [`minimum_size`]. The minimum a toplevel declares is
 /// a hint a compositor may configure straight past, so every size handed to the
 /// window goes through here rather than being taken at its word.
-pub fn at_least_minimum(w: i32, h: i32) -> (i32, i32) {
-    let (min_w, min_h) = minimum_size();
+pub fn at_least_minimum(w: i32, h: i32, show_sidebar: bool) -> (i32, i32) {
+    let (min_w, min_h) = minimum_size(show_sidebar);
     (w.max(min_w), h.max(min_h))
 }
 
@@ -763,22 +862,23 @@ fn action_bar(bar: Rect, cfg: &crate::settings::Settings, hits: &mut Vec<Hit>) {
 
 /// Lay out the client-drawn titlebar: a drag strip with window buttons on the
 /// right, and the title filling what is left.
-fn titlebar(window: Rect, hits: &mut Vec<Hit>) -> TitlebarGeom {
+///
+/// The fit button is placed by the caller, since it is the one button a
+/// server-decorated window also gets, and its rectangle is returned here only
+/// so the title stops short of it.
+fn titlebar(window: Rect, hits: &mut Vec<Hit>) -> (TitlebarGeom, Rect) {
     use metrics::{TITLEBAR_HEIGHT, WINDOW_BTN};
     let bar = Rect::new(window.x, window.y, window.w, TITLEBAR_HEIGHT);
     let pad = (TITLEBAR_HEIGHT - WINDOW_BTN) / 2;
     let y = bar.y + pad;
 
-    // Right to left: close, maximize, minimize.
+    // Right to left: close, maximize, minimize, fit. Fit sits outside the three
+    // every window has, so the familiar trio keeps the corner it always had.
     let close = Rect::new(bar.right() - pad - WINDOW_BTN, y, WINDOW_BTN, WINDOW_BTN);
     let maximize = Rect::new(close.x - WINDOW_BTN, y, WINDOW_BTN, WINDOW_BTN);
     let minimize = Rect::new(maximize.x - WINDOW_BTN, y, WINDOW_BTN, WINDOW_BTN);
-    let title = Rect::new(
-        bar.x + STRIP_PAD,
-        bar.y,
-        minimize.x - bar.x - STRIP_PAD,
-        bar.h,
-    );
+    let fit = Rect::new(minimize.x - WINDOW_BTN, y, WINDOW_BTN, WINDOW_BTN);
+    let title = Rect::new(bar.x + STRIP_PAD, bar.y, fit.x - bar.x - STRIP_PAD, bar.h);
 
     // The drag strip goes down first so the buttons on top of it win.
     hits.push(Hit {
@@ -793,13 +893,29 @@ fn titlebar(window: Rect, hits: &mut Vec<Hit>) -> TitlebarGeom {
         hits.push(Hit { rect, target });
     }
 
-    TitlebarGeom {
-        bar,
-        title,
-        minimize,
-        maximize,
-        close,
-    }
+    (
+        TitlebarGeom {
+            bar,
+            title,
+            minimize,
+            maximize,
+            close,
+        },
+        fit,
+    )
+}
+
+/// Where the fit button goes in a strip the window paints but does not own the
+/// window buttons in: hard right, inside the same padding the chip sits behind.
+fn fit_button(strip: Rect) -> Rect {
+    use metrics::WINDOW_BTN;
+    let pad = ((strip.h - WINDOW_BTN) / 2).max(0);
+    Rect::new(
+        strip.right() - pad - WINDOW_BTN,
+        strip.y + pad,
+        WINDOW_BTN,
+        WINDOW_BTN,
+    )
 }
 
 /// Push the eight resize grabs around a window. Corners go down after edges so
@@ -1284,16 +1400,28 @@ mod tests {
     /// more columns than fit repaints only the ones on screen.
     #[test]
     fn meter_damage_drops_a_column_scrolled_out_of_the_strip() {
-        let snap = mixer_scene();
-        let mut ui = UiState::new();
-        let layout = project(&snap, &ui, Rect::new(0, 0, 560, 720));
-        let visible = layout.meter_damage().count();
-
-        ui.scroll_x = layout.strip.w + metrics::COLUMN_WIDTH;
-        let scrolled = project(&snap, &ui, Rect::new(0, 0, 560, 720));
+        let at_rest = narrow(8, 0);
+        let first = at_rest.columns.first().expect("a column").meter;
         assert!(
-            scrolled.meter_damage().count() < visible,
-            "scrolling the strip past its columns still damages {visible} of them",
+            at_rest
+                .meter_damage()
+                .any(|r| r == first.intersect(at_rest.strip)),
+            "the first column is on screen to begin with"
+        );
+
+        // Far enough that the first column has left the strip entirely.
+        let scrolled = narrow(8, metrics::COLUMN_WIDTH + COL_GAP + STRIP_PAD);
+        let gone = scrolled.columns.first().expect("a column").meter;
+        assert!(
+            gone.right() <= scrolled.strip.x,
+            "the first column {gone:?} has not actually left the strip {:?}",
+            scrolled.strip
+        );
+        assert!(
+            scrolled
+                .meter_damage()
+                .all(|r| r.x >= scrolled.strip.x && !r.is_empty()),
+            "a column off the left edge is still being repainted"
         );
     }
 
@@ -1324,6 +1452,34 @@ mod tests {
             s_short.h
         );
         assert!(m_tall.h == s_tall.h, "they stay the same length");
+    }
+
+    /// The meter and the fader hold the column's middle and the buttons ride in
+    /// the air beside them. A stack taking its own share of the width would
+    /// pull the two bars off centre.
+    #[test]
+    fn the_bars_take_the_column_centre_and_the_buttons_the_air_beside_them() {
+        let snap = mixer_scene();
+        let ui = UiState::new();
+        let layout = project(&snap, &ui, content());
+
+        for col in &layout.columns {
+            // The knob overhangs the trough, so the pair reads from the meter's
+            // left edge to the knob's right one.
+            let off = (col.meter.x + col.slider.thumb.right()) / 2 - (col.rect.x + col.rect.w / 2);
+            assert!(
+                off.abs() <= 4,
+                "the meter and fader sit on the column's centre, off by {off}"
+            );
+            assert!(
+                col.mute.x >= col.slider.track.right(),
+                "the buttons stay clear of the fader"
+            );
+            assert!(
+                col.mute.right() <= col.rect.right(),
+                "and inside the column"
+            );
+        }
     }
 
     /// A device has no default pin: its caps heading is the button, which is
@@ -1733,14 +1889,22 @@ mod tests {
     /// header, fader, and the mute button under it, all inside the strip.
     #[test]
     fn a_window_at_the_minimum_size_still_holds_a_whole_column() {
-        let (w, h) = minimum_size();
+        let ui = UiState::new();
+        let (w, h) = minimum_size(ui.settings.show_sidebar);
         let snap = columns_snapshot(1);
-        let layout = project(&snap, &UiState::new(), Rect::new(0, 0, w, h));
+        let layout = project(&snap, &ui, Rect::new(0, 0, w, h));
         let col = layout.columns.first().expect("a column");
 
         assert!(
             col.rect.bottom() <= layout.strip.bottom(),
             "column {:?} runs past the strip {:?}",
+            col.rect,
+            layout.strip
+        );
+        assert!(
+            col.rect.right() <= layout.strip.right(),
+            "column {:?} runs past the strip {:?}, so the action bar has taken \
+             room the minimum promised the column",
             col.rect,
             layout.strip
         );
@@ -1761,19 +1925,293 @@ mod tests {
     /// in, not the hint being honoured.
     #[test]
     fn a_size_under_the_minimum_is_grown_to_it() {
-        let (min_w, min_h) = minimum_size();
-        assert_eq!(at_least_minimum(1, 1), (min_w, min_h));
-        assert_eq!(at_least_minimum(2000, 40), (2000, min_h));
-        assert_eq!(at_least_minimum(40, 2000), (min_w, 2000));
+        let (min_w, min_h) = minimum_size(true);
+        assert_eq!(at_least_minimum(1, 1, true), (min_w, min_h));
+        assert_eq!(at_least_minimum(2000, 40, true), (2000, min_h));
+        assert_eq!(at_least_minimum(40, 2000, true), (min_w, 2000));
         // A window already big enough is handed back untouched.
-        assert_eq!(at_least_minimum(800, 600), (800, 600));
+        assert_eq!(at_least_minimum(800, 600, true), (800, 600));
+    }
+
+    /// The width the fit button asks for is only right if the columns then fill
+    /// it exactly: one pixel over is the gap the fit exists to remove, and one
+    /// under puts the last column half outside the strip.
+    #[test]
+    fn the_natural_width_leaves_no_room_over_and_none_short() {
+        for count in 1..8u32 {
+            let snap = columns_snapshot(count);
+            let ui = UiState::new();
+            let w = natural_width(count as usize, ui.settings.show_sidebar);
+            let layout = project(&snap, &ui, Rect::new(0, 0, w, 600));
+            let first = layout.columns.first().expect("a column");
+            let last = layout.columns.last().expect("a column");
+
+            assert_eq!(
+                first.rect.x,
+                layout.strip.x + STRIP_PAD,
+                "{count} columns start off the strip's padding"
+            );
+            assert_eq!(
+                last.rect.right(),
+                layout.strip.right() - STRIP_PAD_RIGHT,
+                "{count} columns end on the strip's padding"
+            );
+            // What the padding is for: the drawn edges, the first meter and the
+            // last button stack, stand the same distance from the strip's own.
+            assert_eq!(
+                first.meter.x - layout.strip.x,
+                layout.strip.right() - last.mute.right(),
+                "{count} columns sit off centre in the window fitted to them"
+            );
+            assert!(
+                layout.strip_scrollbar.is_none(),
+                "{count} columns fit their natural width, so nothing scrolls"
+            );
+        }
+    }
+
+    /// A column appearing must not move the ones already on screen. The streams
+    /// come and go on their own, and a fader that slides out from under the
+    /// pointer because something started playing is the cost of placing the run
+    /// anywhere but hard left.
+    #[test]
+    fn a_column_appearing_leaves_the_others_where_they_were() {
+        let ui = UiState::new();
+        let window = Rect::new(0, 0, 900, 600);
+        let before = project(&columns_snapshot(2), &ui, window);
+        let after = project(&columns_snapshot(5), &ui, window);
+
+        for (i, (was, now)) in before.columns.iter().zip(&after.columns).enumerate() {
+            assert_eq!(
+                was.rect, now.rect,
+                "column {i} moved when three more joined it"
+            );
+        }
+    }
+
+    /// Every chrome the window paints for itself gets the fit button somewhere,
+    /// because the compositor's titlebar is not ours to put one in and a
+    /// keyboard shortcut alone is a feature nobody finds.
+    #[test]
+    fn the_fit_button_finds_a_home_in_both_chromes_the_window_paints() {
+        let snap = columns_snapshot(3);
+        let window = Rect::new(0, 0, 900, 600);
+
+        let mut ui = UiState::new();
+        ui.chrome = Chrome::Client;
+        let client = project(&snap, &ui, window);
+        let fit = client.fit.expect("the titlebar carries it");
+        let bar = client.titlebar.as_ref().expect("a titlebar");
+        assert!(
+            fit.right() <= bar.minimize.x,
+            "the fit sits outside the three buttons every window has"
+        );
+        assert!(
+            bar.title.right() <= fit.x,
+            "the title stops short of it rather than running under it"
+        );
+
+        ui.chrome = Chrome::Server;
+        let server = project(&snap, &ui, window);
+        let strip = server.profile_strip.expect("a profile strip");
+        let fit = server.fit.expect("the profile strip carries it");
+        assert!(strip.contains(fit.x, fit.y) && fit.right() <= strip.right());
+        assert!(
+            fit.x > strip.x + metrics::PROFILE_CHIP_WIDTH,
+            "hard right, clear of the chip"
+        );
+
+        // GTK owns its header and there is nothing here to put a button in.
+        ui.chrome = Chrome::Toolkit;
+        assert_eq!(project(&snap, &ui, window).fit, None);
+    }
+
+    /// The button has to take the press wherever it landed, which for the
+    /// titlebar means winning against the drag strip underneath it.
+    #[test]
+    fn the_fit_button_takes_the_press_in_both_chromes() {
+        let snap = columns_snapshot(3);
+        let window = Rect::new(0, 0, 900, 600);
+        for chrome in [Chrome::Client, Chrome::Server] {
+            let mut ui = UiState::new();
+            ui.chrome = chrome;
+            let layout = project(&snap, &ui, window);
+            let fit = layout.fit.expect("a fit button");
+            assert_eq!(
+                layout.hit(fit.x + fit.w / 2, fit.y + fit.h / 2),
+                Some(&HitTarget::WindowFit),
+                "{chrome:?} does not route the press"
+            );
+        }
+    }
+
+    /// The rule belongs between two columns. On the last one it would close the
+    /// run against nothing and sit a pixel outside the width the fit asks for.
+    #[test]
+    fn only_the_columns_with_a_neighbour_carry_a_rule() {
+        let snap = columns_snapshot(4);
+        let layout = project(&snap, &UiState::new(), Rect::new(0, 0, 900, 600));
+        let (last, rest) = layout.columns.split_last().expect("columns");
+        assert_eq!(last.separator, None);
+        for col in rest {
+            let rule = col.separator.expect("a rule between neighbours");
+            assert_eq!(rule.x, col.rect.right());
+        }
+        // And nothing is drawn past where the columns end.
+        let end = layout.columns.last().expect("a column").rect.right();
+        assert_eq!(end, layout.strip.x + STRIP_PAD + run_width(4));
+    }
+
+    /// Scrolled to the end and then fitted: the run now fits, so the offset it
+    /// was scrolled to no longer exists. Honouring it would hold the columns off
+    /// the left edge and open the air on the right that the scroll was hiding,
+    /// which is the gap the fit was pressed to close.
+    #[test]
+    fn fitting_a_scrolled_strip_puts_the_columns_back_against_the_left() {
+        let snap = columns_snapshot(8);
+        let ui = UiState::new();
+
+        // Scrolled to the end of a window too narrow for the run.
+        let narrow = project(&snap, &ui, Rect::new(0, 0, 300, 400));
+        assert!(narrow.scroll_max_x > 0, "eight columns overrun 300px");
+        let mut scrolled = UiState::new();
+        scrolled.scroll_x = narrow.scroll_max_x;
+
+        // The fit widens the window to exactly what the run needs. The offset
+        // in hand is stale the moment it does.
+        let fitted = project(
+            &snap,
+            &scrolled,
+            Rect::new(0, 0, natural_width(8, true), 400),
+        );
+        let first = fitted.columns.first().expect("a column");
+        let last = fitted.columns.last().expect("a column");
+        assert_eq!(
+            first.rect.x,
+            fitted.strip.x + STRIP_PAD,
+            "the run is held off the left by an offset that no longer exists"
+        );
+        assert_eq!(
+            last.rect.right(),
+            fitted.strip.right() - STRIP_PAD_RIGHT,
+            "which leaves air on the right, the gap the fit was meant to close"
+        );
+        assert_eq!(fitted.scroll_max_x, 0);
+        assert!(fitted.strip_scrollbar.is_none());
+    }
+
+    /// The same staleness without a resize: a column going away shortens the
+    /// run under an offset taken against the longer one.
+    #[test]
+    fn a_column_leaving_pulls_a_scrolled_strip_back_with_it() {
+        // Wide enough for three columns, not for eight.
+        let window = Rect::new(0, 0, 500, 400);
+        let long = project(&columns_snapshot(8), &UiState::new(), window);
+        assert!(long.scroll_max_x > 0, "eight columns overrun 500px");
+
+        let mut ui = UiState::new();
+        ui.scroll_x = long.scroll_max_x;
+        let short = project(&columns_snapshot(3), &ui, window);
+
+        assert_eq!(
+            short.columns.first().expect("a column").rect.x,
+            short.strip.x + STRIP_PAD,
+            "three columns fit, so nothing is scrolled and nothing is held off"
+        );
+        assert_eq!(short.scroll_max_x, 0);
+    }
+
+    /// An offset is only ever clamped, never grown, so a strip that still
+    /// overruns keeps the place the user scrolled to.
+    #[test]
+    fn a_run_that_still_overruns_keeps_the_offset_it_was_given() {
+        let mut ui = UiState::new();
+        ui.scroll_x = 40;
+        let layout = project(&columns_snapshot(8), &ui, Rect::new(0, 0, 300, 400));
+        assert!(layout.scroll_max_x > 40, "40px is short of the end");
+        assert_eq!(
+            layout.columns.first().expect("a column").rect.x,
+            layout.strip.x + STRIP_PAD - 40
+        );
+    }
+
+    /// The run starts on the strip's padding whether it fills the window or
+    /// overruns it, so a window wider than its columns leaves the air on the
+    /// right rather than splitting it.
+    #[test]
+    fn a_short_run_starts_where_a_long_one_does() {
+        let ui = UiState::new();
+        let short = project(&columns_snapshot(2), &ui, Rect::new(0, 0, 900, 600));
+        let long = project(&columns_snapshot(12), &ui, Rect::new(0, 0, 900, 600));
+
+        for layout in [&short, &long] {
+            let first = layout.columns.first().expect("a column");
+            assert_eq!(first.rect.x, layout.strip.x + STRIP_PAD);
+        }
+    }
+
+    /// The scroll extent and the placement have to agree about the padding, or
+    /// scrolling to the end leaves the last column short of the edge.
+    #[test]
+    fn scrolling_to_the_end_lands_the_last_column_on_the_padding() {
+        let layout = narrow(8, 0);
+        let end = project(
+            &columns_snapshot(8),
+            &{
+                let mut ui = UiState::new();
+                ui.scroll_x = layout.scroll_max_x;
+                ui
+            },
+            Rect::new(0, 0, 300, 400),
+        );
+        let last = end.columns.last().expect("a column");
+        assert_eq!(last.rect.right(), end.strip.right() - STRIP_PAD_RIGHT);
+    }
+
+    /// The count the placement is centred by has to be the count the loop then
+    /// places, or every window wider than its columns is off by a column.
+    #[test]
+    fn the_counted_columns_are_the_placed_ones() {
+        let mut snap = columns_snapshot(3);
+        let ui = UiState::new();
+        for (sources, sinks, apps) in [
+            (true, true, true),
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            snap.show_sources = sources;
+            snap.show_sinks = sinks;
+            snap.show_apps = apps;
+            let layout = project(&snap, &ui, Rect::new(0, 0, 900, 600));
+            assert_eq!(
+                column_count(&snap),
+                layout.columns.len(),
+                "counted and placed disagree for {sources}/{sinks}/{apps}"
+            );
+        }
+    }
+
+    /// The action bar is not the columns' room to take, so the floor has to
+    /// carry it. Without that the one column the minimum promises is clipped.
+    #[test]
+    fn the_minimum_width_carries_the_action_bar_when_it_is_shown() {
+        let (with, _) = minimum_size(true);
+        let (without, _) = minimum_size(false);
+        assert_eq!(
+            with - without,
+            metrics::SIDEBAR_WIDTH,
+            "the bar's width is exactly what the floor gains"
+        );
+        assert_eq!(without, natural_width(1, false));
     }
 
     /// Both shells advertise the same minimum, and the fader is what sets it,
     /// so a change to one number moves the window's floor with it.
     #[test]
     fn the_minimum_height_is_the_chrome_plus_a_column() {
-        let (_, h) = minimum_size();
+        let (_, h) = minimum_size(true);
         let taller = metrics::MIN_FADER_HEIGHT + 10;
         let snap = columns_snapshot(1);
         let layout = project(&snap, &UiState::new(), Rect::new(0, 0, 300, h + 10));

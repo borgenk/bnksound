@@ -88,6 +88,52 @@ impl HaloState {
     }
 }
 
+/// How long a press mark takes to fade out. Short: it is an acknowledgement,
+/// not a state, and one that outstayed the press would read as one.
+const MARK: Duration = Duration::from_millis(180);
+
+/// A press acknowledgement: struck to full by the press, easing back to nothing
+/// on its own clock.
+///
+/// The fit button moves as the window it resizes grows, so a press can leave the
+/// pointer behind and take the hover with it. The mark says the press landed
+/// whatever the pointer does afterwards.
+#[derive(Default)]
+pub struct PressMark {
+    value: f32,
+    last: Option<Instant>,
+}
+
+impl PressMark {
+    /// Take the mark to full, where a press leaves it.
+    pub fn strike(&mut self) {
+        self.value = 1.0;
+    }
+
+    /// How strongly to draw it, eased so it leaves quickly and trails off.
+    pub fn strength(&self) -> f32 {
+        ease_out(self.value)
+    }
+
+    /// Ease toward nothing. Reports whether it moved, so a still window can
+    /// skip repainting.
+    pub fn advance(&mut self, now: Instant) -> bool {
+        let last = self.last.replace(now);
+        if self.value <= 0.0 {
+            return false;
+        }
+        // First run after a strike: nothing has had time to move yet.
+        let Some(last) = last else {
+            return false;
+        };
+        let step = now.saturating_duration_since(last).as_secs_f32() / MARK.as_secs_f32();
+        let next = (self.value - step).max(0.0);
+        let moved = next != self.value;
+        self.value = next;
+        moved
+    }
+}
+
 /// Cubic ease-out: fast at the start, slow at the finish.
 fn ease_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -197,6 +243,54 @@ mod tests {
             !tick(&mut state, None, start + FADE * 6),
             "nor is an empty state",
         );
+    }
+
+    #[test]
+    fn an_unstruck_mark_shows_nothing_and_asks_for_no_repaint() {
+        let mut mark = PressMark::default();
+        assert_eq!(mark.strength(), 0.0);
+        let start = Instant::now();
+        assert!(!mark.advance(start), "a still mark is not worth a frame");
+        assert!(!mark.advance(start + MARK));
+        assert_eq!(mark.strength(), 0.0);
+    }
+
+    #[test]
+    fn a_struck_mark_shows_at_once_and_is_gone_by_the_end_of_the_fade() {
+        let mut mark = PressMark::default();
+        let start = Instant::now();
+        // The clock starts running from the first advance after the strike, so
+        // the press is at full for the frame it lands on.
+        mark.advance(start);
+        mark.strike();
+        assert_eq!(
+            mark.strength(),
+            1.0,
+            "the press shows on the frame it lands"
+        );
+
+        assert!(mark.advance(start + MARK / 2), "still moving");
+        let mid = mark.strength();
+        assert!(mid > 0.0 && mid < 1.0, "partway out, got {mid}");
+
+        assert!(mark.advance(start + MARK));
+        assert_eq!(mark.strength(), 0.0, "gone by the end of the fade");
+        assert!(
+            !mark.advance(start + MARK * 2),
+            "and asks for nothing once it is gone",
+        );
+    }
+
+    #[test]
+    fn a_second_press_takes_the_mark_back_to_full() {
+        let mut mark = PressMark::default();
+        let start = Instant::now();
+        mark.advance(start);
+        mark.strike();
+        mark.advance(start + MARK / 2);
+        assert!(mark.strength() < 1.0);
+        mark.strike();
+        assert_eq!(mark.strength(), 1.0, "the second press reads as its own");
     }
 
     #[test]

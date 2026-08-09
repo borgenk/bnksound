@@ -51,6 +51,9 @@ const SEED: Geometry = Geometry {
     width: 560,
     height: 600,
     maximized: false,
+    // The seeded width is the point of these tests, so nothing here asks the
+    // window to work one out from streams a headless rig does not have.
+    fitted: false,
 };
 
 /// The headless output every rig creates. The wlroots pair have no say in this

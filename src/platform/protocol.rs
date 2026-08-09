@@ -75,6 +75,9 @@ pub mod evt {
     pub const XDG_SURFACE_CONFIGURE: u16 = 0;
     pub const XDG_TOPLEVEL_CONFIGURE: u16 = 0;
     pub const XDG_TOPLEVEL_CLOSE: u16 = 1;
+    /// The largest size the compositor says will fit its usable area, sent
+    /// before the first configure. xdg_wm_base 4 and up.
+    pub const XDG_TOPLEVEL_CONFIGURE_BOUNDS: u16 = 2;
     pub const DECORATION_CONFIGURE: u16 = 0;
     pub const SEAT_CAPABILITIES: u16 = 0;
     pub const DATA_DEVICE_SELECTION: u16 = 5;

@@ -28,7 +28,7 @@ use bnksound::render::text::Font;
 use bnksound::state;
 use bnksound::ui::layout;
 use bnksound::ui::theme::Palette;
-use bnksound::ui::{Focus, UiState};
+use bnksound::ui::{Chrome, Focus, UiState};
 use bnksound::view::snapshot::build_snapshot;
 
 /// Big enough for the chrome and three columns, small enough that the golden
@@ -46,7 +46,10 @@ const MAX_DIFFERING: f64 = 0.20;
 
 #[test]
 fn the_mixer_frame_matches_its_golden() {
-    check_golden("golden-frame.png", render(&mixer_scene(), Overlay::None));
+    check_golden(
+        "golden-frame.png",
+        render(&mixer_scene(), Overlay::None, Chrome::Server),
+    );
 }
 
 /// The overlays are laid out separately from the body, so they get their own
@@ -55,7 +58,7 @@ fn the_mixer_frame_matches_its_golden() {
 fn the_command_palette_frame_matches_its_golden() {
     check_golden(
         "golden-palette.png",
-        render(&palette_scene(), Overlay::Palette),
+        render(&palette_scene(), Overlay::Palette, Chrome::Server),
     );
 }
 
@@ -63,7 +66,17 @@ fn the_command_palette_frame_matches_its_golden() {
 fn the_profile_menu_frame_matches_its_golden() {
     check_golden(
         "golden-profile-menu.png",
-        render(&profile_scene(), Overlay::ProfileMenu),
+        render(&profile_scene(), Overlay::ProfileMenu, Chrome::Server),
+    );
+}
+
+/// The titlebar the window paints for itself, which is the only chrome that
+/// carries the window buttons and so the only one that shows the fit button.
+#[test]
+fn the_client_titlebar_frame_matches_its_golden() {
+    check_golden(
+        "golden-client-titlebar.png",
+        render(&mixer_scene(), Overlay::None, Chrome::Client),
     );
 }
 
@@ -154,10 +167,11 @@ enum Overlay {
 }
 
 /// Render a scene through the same path both shells use.
-fn render(app: &state::App, overlay: Overlay) -> PixelBuffer {
+fn render(app: &state::App, overlay: Overlay, chrome: Chrome) -> PixelBuffer {
     let font = Font::from_path_sealed(&fixture("test-font.ttf")).expect("fixture font");
     let snapshot = build_snapshot(app, |_| None);
     let mut ui = UiState::new();
+    ui.chrome = chrome;
     if overlay == Overlay::Palette {
         ui.focus = Focus::Palette;
         // Pinned so the caret is drawn every run, not on a blink phase.

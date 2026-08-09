@@ -102,12 +102,22 @@ impl Shell {
         moved
     }
 
-    /// Ease the knob rings toward wherever the pointer is. Driven by the clock
-    /// rather than a step per call, so it is safe on whatever turn the loop is
-    /// on. Reports whether anything is still moving.
-    pub fn tick_halo(&mut self, now: Instant) -> bool {
+    /// Ease what fades toward where it is going: the knob rings toward wherever
+    /// the pointer is, the fit button's press mark toward nothing. Driven by the
+    /// clock rather than a step per call, so it is safe on whatever turn the
+    /// loop is on. Reports whether anything is still moving.
+    pub fn tick_fades(&mut self, now: Instant) -> bool {
         let lit = self.ui.lit_knob();
-        self.ui.halo.advance(lit.as_ref(), now)
+        let halo = self.ui.halo.advance(lit.as_ref(), now);
+        let mark = self.ui.fit_mark.advance(now);
+        halo || mark
+    }
+
+    /// What a press on the fit button comes to, measured against the columns
+    /// the current snapshot puts in the strip.
+    pub fn fit_press(&mut self, width: i32) -> Option<crate::ui::FitStep> {
+        let columns = self.columns();
+        self.ui.fit_press(width, columns)
     }
 
     /// Flip the caret, while a field has focus. Reports whether it changed.
@@ -115,12 +125,27 @@ impl Shell {
         self.ui.blink_caret()
     }
 
+    /// How many columns the current snapshot puts in the strip, which is what
+    /// the fit is measured against.
+    pub fn columns(&self) -> usize {
+        crate::ui::layout::column_count(&self.snapshot)
+    }
+
+    /// Whether the window stands at the width its columns want. What a relaunch
+    /// reads to know it should work the width out again rather than restore the
+    /// one this session happened to end on.
+    pub fn is_fitted(&self, width: i32) -> bool {
+        self.ui.is_fitted(width, self.columns())
+    }
+
     /// Persist geometry and flush a final save on the way out.
     pub fn shutdown(&mut self, width: u32, height: u32, maximized: bool) {
+        let fitted = self.is_fitted(width as i32);
         let _ = self.runtime.dispatch(Message::GeometryChanged {
             width,
             height,
             maximized,
+            fitted,
         });
         self.runtime.shutdown();
     }

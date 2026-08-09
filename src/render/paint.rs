@@ -97,6 +97,10 @@ pub fn paint_frame(
         paint_titlebar(p, bar, ui, palette);
     }
     paint_chrome(p, snapshot, layout, ui, font, palette);
+    // After the chrome, since the strip it sits in is filled there.
+    if let Some(rect) = layout.fit {
+        paint_fit_button(p, rect, layout, ui, palette);
+    }
 
     // Columns are clipped to the strip so scrolled content does not spill into
     // the toolbar or past the edges.
@@ -180,6 +184,64 @@ pub fn paint_meters(
     }
 }
 
+/// Draw the fit button, wherever the chrome found room for it: the window's own
+/// titlebar, or the right end of the profile strip when the compositor draws the
+/// titlebar instead.
+///
+/// Two arrows, facing in to fit and out to give the width back. Solid rather
+/// than stroked: at ten pixels an outlined chevron pair is the close cross a few
+/// buttons along, and a pair of bare uprights is a pause button, which is not a
+/// thing to draw in a mixer.
+fn paint_fit_button(p: &mut Painter, rect: Rect, layout: &Layout, ui: &UiState, palette: &Palette) {
+    use crate::ui::layout::HitTarget;
+    if !p.intersects(rect) {
+        return;
+    }
+    let window_w = layout.window.w;
+    let columns = layout.columns.len();
+    // Drawn from the same answer the press acts on, so a button that looks
+    // pressable is one that does something. A compositor-sized window has no
+    // width to give, and one already fitted with nothing to go back to has
+    // nowhere to go.
+    let inert = ui.fit_step(window_w, columns).is_none();
+    if !inert && ui.hover.as_ref() == Some(&HitTarget::WindowFit) {
+        p.rounded_rect(rect, PICK_RADIUS, palette.wash_18);
+    }
+    // Over the hover, so a press reads brighter than resting on it. Fitting
+    // widens the window, which slides this button along with the edge it hangs
+    // from and can leave the pointer behind; the mark is what says the press
+    // landed, wherever the button ends up.
+    let mark = ui.fit_mark.strength();
+    if mark > 0.0 {
+        let ink = palette.wash_30.scale_alpha((mark * 255.0).round() as u8);
+        p.rounded_rect(rect, PICK_RADIUS, ink);
+    }
+    // Far enough down that the button reads as unavailable at a glance, without
+    // hiding it and moving the buttons beside it around.
+    let fg = if inert {
+        palette.text_idle
+    } else {
+        palette.text_subtle
+    };
+    let g = rect.inset((rect.w - 10) / 2);
+    let (mid, half) = (g.y + g.h / 2, 4);
+    let out = ui.is_fitted(window_w, columns);
+    let (l_tip, l_base) = if out { (g.x, g.x + 4) } else { (g.x + 4, g.x) };
+    let (r_tip, r_base) = if out {
+        (g.right(), g.right() - 4)
+    } else {
+        (g.right() - 4, g.right())
+    };
+    p.triangle(
+        [(l_tip, mid), (l_base, mid - half), (l_base, mid + half)],
+        fg,
+    );
+    p.triangle(
+        [(r_tip, mid), (r_base, mid - half), (r_base, mid + half)],
+        fg,
+    );
+}
+
 /// Draw the window's own titlebar: the app name and the three window buttons.
 fn paint_titlebar(
     p: &mut Painter,
@@ -192,7 +254,6 @@ fn paint_titlebar(
         return;
     }
     p.fill(bar.bar, palette.titlebar);
-    p.hline(bar.bar.x, bar.bar.bottom() - 1, bar.bar.w, palette.border);
     // The title's space belongs to the profile chip, which paint_chrome draws.
     // Two things in one strip would land on top of each other.
 
@@ -201,8 +262,8 @@ fn paint_titlebar(
     // typeset: the box-drawing characters they would need are missing from most
     // system fonts and come out as tofu.
     let buttons = [
-        (bar.minimize, HitTarget::WindowMinimize, palette.wash_10),
-        (bar.maximize, HitTarget::WindowMaximize, palette.wash_10),
+        (bar.minimize, HitTarget::WindowMinimize, palette.wash_18),
+        (bar.maximize, HitTarget::WindowMaximize, palette.wash_18),
         (bar.close, HitTarget::WindowClose, palette.danger_bg),
     ];
     for (rect, target, hover_bg) in buttons {
@@ -293,7 +354,6 @@ fn paint_chrome(
 ) {
     if let Some(bar) = layout.profile_strip {
         p.fill(bar, palette.titlebar);
-        p.hline(bar.x, bar.bottom() - 1, bar.w, palette.border);
     }
     // The action bar is a panel, not just a run of buttons: it carries the
     // surface colour so the filters read as chrome beside the mixer.
@@ -613,8 +673,10 @@ fn paint_column(p: &mut Painter, col: &ColumnGeom, row: &RowDraw, cx: &mut Colum
         );
     }
 
-    // The hairline closing the column on its right.
-    p.fill(col.separator, cx.palette.wash_6);
+    // The hairline between this column and the next.
+    if let Some(rule) = col.separator {
+        p.fill(rule, cx.palette.wash_6);
+    }
 }
 
 /// Draw the fader: a rounded trough, the fill from the bottom up to the value,
@@ -1533,6 +1595,291 @@ mod tests {
             "the menu hangs over no meter, so it covers nothing to get wrong",
         );
         assert_eq!(first_difference(&gated, &full), None);
+    }
+
+    /// The colours inside the fit button, for a window the compositor sizes and
+    /// for an ordinary one.
+    fn fit_glyph(snap: &ViewSnapshot, maximized: bool) -> Vec<u32> {
+        let (w, h) = (560, 720);
+        let mut ui = UiState::new();
+        ui.maximized = maximized;
+        let layout = crate::ui::layout::project(snap, &ui, Rect::new(0, 0, w, h));
+        let fit = layout.fit.expect("a fit button");
+        let mut buf = PixelBuffer::new(w as u32, h as u32);
+        {
+            let mut p = buf.painter();
+            paint_frame(
+                &mut p,
+                snap,
+                &ui,
+                &layout,
+                &font(),
+                &Palette::dark(),
+                &mut IconCache::new(),
+            );
+        }
+        (fit.y..fit.bottom())
+            .flat_map(|y| (fit.x..fit.right()).map(move |x| (y as usize * w as usize) + x as usize))
+            .map(|i| buf.pixels()[i])
+            .collect()
+    }
+
+    /// The smallest per-channel step between the resting button and the hovered
+    /// one that still reads as a highlight on a dark strip. A wash this far down
+    /// is technically a different colour and practically invisible, which is the
+    /// failure this pins: a live button the user cannot tell is live.
+    const HOVER_STEP: i32 = 30;
+
+    /// The press mark draws whether or not the pointer is still on the button,
+    /// and brighter than a hover, since a press outranks resting on something.
+    /// It is the whole point of the mark: fitting moves the button, so the press
+    /// cannot rely on the hover surviving it.
+    #[test]
+    fn a_pressed_fit_button_marks_itself_wherever_the_pointer_went() {
+        let (w, h) = (560, 720);
+        let snap = build_snapshot(&scene(), |_| None);
+        let corner = |ui: &UiState| {
+            let layout = crate::ui::layout::project(&snap, ui, Rect::new(0, 0, w, h));
+            let fit = layout.fit.expect("a fit button");
+            let mut buf = PixelBuffer::new(w as u32, h as u32);
+            {
+                let mut p = buf.painter();
+                paint_frame(
+                    &mut p,
+                    &snap,
+                    ui,
+                    &layout,
+                    &font(),
+                    &Palette::dark(),
+                    &mut IconCache::new(),
+                );
+            }
+            let at = (fit.y as usize + 3) * w as usize + fit.x as usize + 3;
+            ((buf.pixels()[at] >> 16) & 0xff) as i32
+        };
+
+        let resting = corner(&UiState::new());
+        let hovered = {
+            let mut ui = UiState::new();
+            ui.hover = Some(HitTarget::WindowFit);
+            corner(&ui)
+        };
+        // Struck, with the pointer nowhere near it: the press has just carried
+        // the button off to the right.
+        let pressed = {
+            let mut ui = UiState::new();
+            ui.fit_mark.strike();
+            corner(&ui)
+        };
+        assert!(
+            pressed - resting >= HOVER_STEP,
+            "an unhovered press leaves no mark: {pressed} against {resting}",
+        );
+        assert!(
+            pressed > hovered,
+            "a press has to outrank a hover: {pressed} against {hovered}",
+        );
+    }
+
+    /// A window standing at its fitted width, with a width to give back. The
+    /// button points out here, and a press takes the window back, so it has to
+    /// light like any other live button.
+    #[test]
+    fn a_fitted_window_lights_its_fit_button_too() {
+        use crate::ui::input::{self, PointerAction, PointerEvent};
+        let h = 720;
+        let snap = build_snapshot(&scene(), |_| None);
+        let cold = UiState::new();
+        let columns = crate::ui::layout::column_count(&snap);
+        let w = cold.fit_width(columns);
+        let fitted = |hover: bool| {
+            let mut ui = UiState::new();
+            // The width a press would go back to, which is what makes the press
+            // worth anything once the window is already fitted.
+            ui.fit_restore = Some(w + 200);
+            let layout = crate::ui::layout::project(&snap, &ui, Rect::new(0, 0, w, h));
+            let fit = layout.fit.expect("a fit button");
+            assert!(
+                ui.is_fitted(w, layout.columns.len()),
+                "the window stands at its fitted width",
+            );
+            if hover {
+                input::on_pointer(
+                    &mut ui,
+                    &layout,
+                    &snap,
+                    PointerEvent {
+                        x: (fit.x + fit.w / 2) as f64,
+                        y: (fit.y + fit.h / 2) as f64,
+                        action: PointerAction::Motion,
+                    },
+                    0,
+                    &font(),
+                );
+                assert_eq!(ui.hover, Some(HitTarget::WindowFit));
+            }
+            let mut buf = PixelBuffer::new(w as u32, h as u32);
+            {
+                let mut p = buf.painter();
+                paint_frame(
+                    &mut p,
+                    &snap,
+                    &ui,
+                    &layout,
+                    &font(),
+                    &Palette::dark(),
+                    &mut IconCache::new(),
+                );
+            }
+            let at = (fit.y as usize + 3) * w as usize + fit.x as usize + 3;
+            ((buf.pixels()[at] >> 16) & 0xff) as i32
+        };
+        assert!(
+            fitted(true) - fitted(false) >= HOVER_STEP,
+            "a fitted window's button does not light: {} against {}",
+            fitted(true),
+            fitted(false),
+        );
+    }
+
+    /// A pointer parked on the fit button lights it, visibly, and a press there
+    /// is a press on the fit and nothing else. The highlight is the only thing
+    /// telling the user the button is live, so it has to answer to the same
+    /// pointer the press does and it has to be worth looking at.
+    #[test]
+    fn the_pointer_on_the_fit_button_lights_it_and_presses_it() {
+        use crate::ui::input::{self, PointerAction, PointerEvent, WindowAction};
+        let snap = build_snapshot(&scene(), |_| None);
+        // Narrow through wide: the button rides the strip's right edge, so its
+        // neighbours change with the width.
+        for w in [380, 560, 900] {
+            let h = 720;
+            let mut ui = UiState::new();
+            let layout = crate::ui::layout::project(&snap, &ui, Rect::new(0, 0, w, h));
+            let fit = layout.fit.expect("a fit button");
+            // Every point of it, so no band of the button belongs to something
+            // else while the rest reads as the fit.
+            for y in fit.y..fit.bottom() {
+                for x in fit.x..fit.right() {
+                    assert_eq!(
+                        layout.hit(x, y),
+                        Some(&HitTarget::WindowFit),
+                        "at {w} wide, ({x},{y}) inside the button hits something else",
+                    );
+                }
+            }
+            let (cx, cy) = (fit.x + fit.w / 2, fit.y + fit.h / 2);
+            input::on_pointer(
+                &mut ui,
+                &layout,
+                &snap,
+                PointerEvent {
+                    x: cx as f64,
+                    y: cy as f64,
+                    action: PointerAction::Motion,
+                },
+                0,
+                &font(),
+            );
+            assert_eq!(
+                ui.hover,
+                Some(HitTarget::WindowFit),
+                "at {w} wide the pointer is on the button, so that is what is hovered",
+            );
+            assert_eq!(
+                layout.hit(cx, cy).and_then(input::window_action),
+                Some(WindowAction::ToggleFitWidth),
+                "at {w} wide a press there is the fit",
+            );
+
+            let frame = |ui: &UiState| {
+                let mut buf = PixelBuffer::new(w as u32, h as u32);
+                {
+                    let mut p = buf.painter();
+                    paint_frame(
+                        &mut p,
+                        &snap,
+                        ui,
+                        &layout,
+                        &font(),
+                        &Palette::dark(),
+                        &mut IconCache::new(),
+                    );
+                }
+                buf
+            };
+            let hot = frame(&ui);
+            let cold = frame(&UiState::new());
+            // Just inside the corner, clear of the glyph, so the highlight is
+            // the only thing that can have changed.
+            let at = (fit.y as usize + 3) * w as usize + fit.x as usize + 3;
+            let step = |px: u32| ((px >> 16) & 0xff) as i32;
+            assert!(
+                step(hot.pixels()[at]) - step(cold.pixels()[at]) >= HOVER_STEP,
+                "at {w} wide the highlight is too faint to see: {:#08x} against {:#08x}",
+                hot.pixels()[at],
+                cold.pixels()[at],
+            );
+        }
+    }
+
+    /// A button with nowhere to take the window is drawn in the idle colour, a
+    /// step down from the one a live button carries. Maximized is the plainest
+    /// way in: the size is the compositor's, so there is no width to give.
+    #[test]
+    fn a_fit_button_with_nowhere_to_go_draws_dimmer() {
+        let snap = build_snapshot(&scene(), |_| None);
+        let live = fit_glyph(&snap, false);
+        let inert = fit_glyph(&snap, true);
+        let subtle = Palette::dark().text_subtle.to_opaque_u32();
+        let idle = Palette::dark().text_idle.to_opaque_u32();
+        assert!(live.contains(&subtle), "a live button draws in subtle");
+        assert!(!live.contains(&idle), "and nowhere in idle");
+        assert!(inert.contains(&idle), "an inert one draws in idle");
+        assert!(!inert.contains(&subtle), "and nowhere in subtle");
+    }
+
+    /// The band across the top ends in its own colour, whichever chrome draws
+    /// it. Nothing rules it off from the mixer below.
+    #[test]
+    fn the_top_band_ends_without_a_rule() {
+        use crate::ui::Chrome;
+        let (w, h) = (560, 720);
+        let app = scene();
+        let snap = build_snapshot(&app, |_| None);
+        for chrome in [Chrome::Client, Chrome::Server] {
+            let mut ui = UiState::new();
+            ui.chrome = chrome;
+            let layout = crate::ui::layout::project(&snap, &ui, Rect::new(0, 0, w, h));
+            let band = layout
+                .titlebar
+                .as_ref()
+                .map(|bar| bar.bar)
+                .or(layout.profile_strip)
+                .expect("a band across the top");
+            let mut buf = PixelBuffer::new(w as u32, h as u32);
+            {
+                let mut p = buf.painter();
+                paint_frame(
+                    &mut p,
+                    &snap,
+                    &ui,
+                    &layout,
+                    &font(),
+                    &Palette::dark(),
+                    &mut IconCache::new(),
+                );
+            }
+            // The buttons and the chip are inset from the band, so its last row
+            // is clear of them and carries the fill alone.
+            let titlebar = Palette::dark().titlebar.to_opaque_u32();
+            let start = (band.bottom() - 1) as usize * w as usize;
+            let last = &buf.pixels()[start..start + w as usize];
+            assert!(
+                last.iter().all(|&px| px == titlebar),
+                "{chrome:?}: the band's last row carries something other than its own colour",
+            );
+        }
     }
 
     #[test]

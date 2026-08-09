@@ -6,11 +6,12 @@
 //! On-disk format (little-endian, no padding):
 //! ```text
 //!   magic            4 bytes "BNKZ"
-//!   version          u8 (currently 3)
+//!   version          u8 (currently 4)
 //!   --- header (general state) ---
 //!   window width     u32
 //!   window height    u32
 //!   window maximized u8
+//!   window fitted    u8 (absent in version 3)
 //!   active           u8 tag (0 = None, 1 = Some) + u16 len + utf-8
 //!   --- profile pages ---
 //!   profile count    u32
@@ -41,7 +42,11 @@ use crate::profile::{AppSettings, DeviceSettings, Profile, ProfileStore};
 
 const FILENAME: &str = "state.bin";
 const MAGIC: &[u8; 4] = b"BNKZ";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
+/// The one older format still read, so adding the fit byte does not take a
+/// user's profiles with it. Writes are always the current version, so a store
+/// upgrades itself on the first save.
+const PREV_VERSION: u8 = 3;
 
 /// Everything that persists across a restart: window geometry plus the
 /// profile store. The active-profile pointer lives in [`ProfileStore::active`].
@@ -206,6 +211,7 @@ fn encode(state: &State) -> Result<Vec<u8>> {
     out.extend_from_slice(&state.window.width.to_le_bytes());
     out.extend_from_slice(&state.window.height.to_le_bytes());
     out.push(u8::from(state.window.maximized));
+    out.push(u8::from(state.window.fitted));
     write_opt_string(&mut out, state.profiles.active.as_deref())?;
 
     let count = u32::try_from(state.profiles.profiles.len())
@@ -271,8 +277,10 @@ fn decode(data: &[u8]) -> Result<State> {
         ]));
     }
     let version = r.u8()?;
-    // No back-compat: only the current format is accepted.
-    if version != VERSION {
+    // The version before this one differs by a single header byte, so it is
+    // read rather than thrown away along with the profiles behind it. Anything
+    // older is refused.
+    if version != VERSION && version != PREV_VERSION {
         return Err(Error::UnsupportedVersion {
             got: version,
             want: VERSION,
@@ -282,7 +290,9 @@ fn decode(data: &[u8]) -> Result<State> {
     let width = r.u32()?;
     let height = r.u32()?;
     let maximized = r.u8()? != 0;
-    let window = Geometry::clamped(width, height, maximized);
+    // A store written before the fit existed was never fitted.
+    let fitted = version == VERSION && r.u8()? != 0;
+    let window = Geometry::clamped(width, height, maximized, fitted);
 
     let active = r.opt_string()?;
     let profile_count = r.u32()? as usize;
@@ -486,6 +496,7 @@ mod tests {
                 width: 1024,
                 height: 768,
                 maximized: true,
+                fitted: true,
             },
             profiles: ProfileStore {
                 profiles: vec![p],
@@ -520,14 +531,6 @@ mod tests {
     }
 
     #[test]
-    fn window_geometry_survives_round_trip() {
-        let loaded = decode(&encode(&sample_state()).expect("encode")).expect("decode");
-        assert_eq!(loaded.window.width, 1024);
-        assert_eq!(loaded.window.height, 768);
-        assert!(loaded.window.maximized);
-    }
-
-    #[test]
     fn encode_starts_with_magic_and_version() {
         let bytes = encode(&State::default()).expect("encode");
         assert_eq!(&bytes[0..4], MAGIC);
@@ -548,6 +551,47 @@ mod tests {
         bytes[4] = 99;
         let err = decode(&bytes).unwrap_err();
         assert!(format!("{err}").contains("unsupported state version"));
+    }
+
+    /// The version before this one differs by the fit byte alone. Reading it is
+    /// what keeps a user's profiles through the upgrade, and the fit reads as
+    /// off because a store written then had no fit to record.
+    #[test]
+    fn a_store_from_the_previous_version_still_reads() {
+        let state = sample_state();
+        let current = encode(&state).expect("encode");
+
+        // The same bytes as the previous version wrote them: version 3, and the
+        // header one byte shorter for want of the fit.
+        let fit_at = 4 + 1 + 4 + 4 + 1;
+        let mut prev = current.clone();
+        prev[4] = PREV_VERSION;
+        prev.remove(fit_at);
+
+        let loaded = decode(&prev).expect("a version 3 store still decodes");
+        assert!(
+            !loaded.window.fitted,
+            "a store from before the fit has none"
+        );
+        assert_eq!(
+            loaded.profiles, state.profiles,
+            "the profiles behind the header survive the upgrade"
+        );
+        assert_eq!(loaded.window.width, state.window.width);
+        assert_eq!(loaded.window.maximized, state.window.maximized);
+    }
+
+    /// Reading the old format does not mean writing it. The first save moves
+    /// the store forward, so the compatibility is one-way and temporary.
+    #[test]
+    fn a_store_read_from_the_previous_version_is_written_back_as_this_one() {
+        let mut bytes = encode(&sample_state()).expect("encode");
+        let fit_at = 4 + 1 + 4 + 4 + 1;
+        bytes[4] = PREV_VERSION;
+        bytes.remove(fit_at);
+
+        let loaded = decode(&bytes).expect("decode");
+        assert_eq!(encode(&loaded).expect("re-encode")[4], VERSION);
     }
 
     #[test]
@@ -572,6 +616,7 @@ mod tests {
                 width: 5,
                 height: 999_999,
                 maximized: false,
+                fitted: false,
             },
             ..State::default()
         };

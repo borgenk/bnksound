@@ -161,6 +161,9 @@ pub enum WindowAction {
     Resize(ResizeEdge),
     Minimize,
     ToggleMaximize,
+    /// Size the window to the width its columns need, or back to the size it
+    /// had before the last fit.
+    ToggleFitWidth,
     Close,
 }
 
@@ -170,6 +173,7 @@ pub fn window_action(target: &HitTarget) -> Option<WindowAction> {
     Some(match target {
         HitTarget::TitlebarDrag => WindowAction::Move,
         HitTarget::ResizeEdge(edge) => WindowAction::Resize(*edge),
+        HitTarget::WindowFit => WindowAction::ToggleFitWidth,
         HitTarget::WindowMinimize => WindowAction::Minimize,
         HitTarget::WindowMaximize => WindowAction::ToggleMaximize,
         HitTarget::WindowClose => WindowAction::Close,
@@ -183,6 +187,19 @@ pub fn is_screenshot_key(event: KeyEvent) -> bool {
         && event.mods.shift
         && !event.mods.alt
         && matches!(event.key, Key::Char('s') | Key::Char('S'))
+}
+
+/// Whether a key press asks the window to fit its columns (Ctrl+Shift+F).
+///
+/// The button for this is in the titlebar the window paints for itself, which
+/// two of the three chrome modes do not have. The shortcut is what reaches the
+/// action in the other two.
+pub fn is_fit_key(ui: &UiState, event: KeyEvent) -> bool {
+    !ui.overlay_focused()
+        && event.mods.ctrl
+        && event.mods.shift
+        && !event.mods.alt
+        && matches!(event.key, Key::Char('f') | Key::Char('F'))
 }
 
 /// The clipboard action a key press means, or None. Only an overlay editor
@@ -297,6 +314,36 @@ fn profile_drop(layout: &Layout, name: &str, x: i32, y: i32) -> Option<Message> 
     })
 }
 
+/// Point the hover at whatever the pointer is over now.
+///
+/// The ring belongs to the knob alone, while the click belongs to the whole
+/// track, so the two are hit-tested separately. Going through `hover` first
+/// keeps a knob under an overlay unlit.
+///
+/// Usually a motion event prompts this, but a window that resizes itself moves
+/// the chrome out from under a pointer that never moved, and no event follows
+/// to say so. The shell calls this directly on those.
+pub fn rehover(ui: &mut UiState, layout: &Layout, x: i32, y: i32) {
+    let hover = layout.hit(x, y).cloned();
+    let knob_hover = match &hover {
+        Some(HitTarget::RowSlider(row)) => layout
+            .columns
+            .iter()
+            .find(|c| &c.id == row)
+            .filter(|c| c.slider.thumb.contains(x, y))
+            .map(|c| c.id.clone()),
+        _ => None,
+    };
+    if hover != ui.hover {
+        ui.hover = hover;
+        ui.dirty.mark_full();
+    }
+    if knob_hover != ui.knob_hover {
+        ui.knob_hover = knob_hover;
+        ui.dirty.mark_full();
+    }
+}
+
 /// Handle a pointer event: update transient state and emit any messages.
 /// `now_ms` stamps clicks for multi-click detection; `font` measures text so a
 /// click in a field lands on the character under it.
@@ -314,27 +361,7 @@ pub fn on_pointer(
 
     match event.action {
         PointerAction::Motion => {
-            let hover = layout.hit(xi, yi).cloned();
-            // The ring belongs to the knob alone, while the click belongs to
-            // the whole track, so the two are hit-tested separately. Going
-            // through `hover` first keeps a knob under an overlay unlit.
-            let knob_hover = match &hover {
-                Some(HitTarget::RowSlider(row)) => layout
-                    .columns
-                    .iter()
-                    .find(|c| &c.id == row)
-                    .filter(|c| c.slider.thumb.contains(xi, yi))
-                    .map(|c| c.id.clone()),
-                _ => None,
-            };
-            if hover != ui.hover {
-                ui.hover = hover;
-                ui.dirty.mark_full();
-            }
-            if knob_hover != ui.knob_hover {
-                ui.knob_hover = knob_hover;
-                ui.dirty.mark_full();
-            }
+            rehover(ui, layout, xi, yi);
             match ui.drag.clone() {
                 Some(Drag::Slider(id)) => {
                     if let Some(track) = slider_track(layout, &id) {
@@ -1016,6 +1043,44 @@ mod tests {
         assert_eq!(ui.lit_knob(), None, "but the ring stays dark");
     }
 
+    /// Fitting widens the window, and the fit button hangs off the edge that
+    /// moves, so the button slides out from under a pointer that never moved.
+    /// Nothing arrives to say so, which is why the shell asks. Without the ask
+    /// the button keeps a highlight the pointer is no longer on.
+    #[test]
+    fn a_window_growing_under_the_pointer_hands_the_hover_on() {
+        let mut app = state::empty();
+        app.streams.insert(
+            1,
+            Stream {
+                name: "Speaker".into(),
+                node_name: Some("node.1".into()),
+                ..crate::domain::sample_stream(1, StreamKind::Sink)
+            },
+        );
+        let snap = build_snapshot(&app, |_| None);
+        let mut ui = UiState::new();
+        let narrow = crate::ui::layout::project(&snap, &ui, Rect::new(0, 0, 400, 720));
+        let fit = narrow.fit.expect("a fit button");
+        let (x, y) = (fit.x + fit.w / 2, fit.y + fit.h / 2);
+
+        pointer_at(&mut ui, &narrow, &snap, PointerAction::Motion, x, y, 0);
+        assert_eq!(ui.hover, Some(HitTarget::WindowFit), "the pointer is on it");
+
+        // The press widens the window. The pointer stays exactly where it was.
+        let wide = crate::ui::layout::project(&snap, &ui, Rect::new(0, 0, 700, 720));
+        assert!(
+            wide.fit.expect("a fit button").x > fit.x,
+            "the button rides the right edge, so a wider window moves it",
+        );
+        rehover(&mut ui, &wide, x, y);
+        assert_ne!(
+            ui.hover,
+            Some(HitTarget::WindowFit),
+            "the button moved out from under the pointer, so it is not hovered",
+        );
+    }
+
     /// Both shells report the pointer leaving the window as a motion to a point
     /// outside it, so that one move has to put every hover-driven thing back to
     /// rest. Without it the last thing hovered keeps its highlight and its ring
@@ -1261,12 +1326,73 @@ mod tests {
             Some(WindowAction::Minimize)
         );
         assert_eq!(
+            window_action(&HitTarget::WindowFit),
+            Some(WindowAction::ToggleFitWidth)
+        );
+        assert_eq!(
             window_action(&HitTarget::ResizeEdge(ResizeEdge::BottomRight)),
             Some(WindowAction::Resize(ResizeEdge::BottomRight))
         );
         // Mixer targets are not the window's business.
         assert_eq!(window_action(&HitTarget::MuteAll), None);
         assert_eq!(window_action(&HitTarget::RowMute(RowId::Sink(1))), None);
+    }
+
+    /// The shortcut is what reaches the fit in the two chrome modes with no
+    /// titlebar of the window's own, so it has to be live in the mixer body and
+    /// dead anywhere a field is taking the letters.
+    #[test]
+    fn the_fit_shortcut_is_ctrl_shift_f_and_only_outside_a_field() {
+        let mut ui = UiState::new();
+        let ctrl_shift = Modifiers {
+            ctrl: true,
+            shift: true,
+            alt: false,
+        };
+        let fit = KeyEvent {
+            key: Key::Char('f'),
+            mods: ctrl_shift,
+        };
+        assert!(is_fit_key(&ui, fit));
+        assert!(is_fit_key(
+            &ui,
+            KeyEvent {
+                key: Key::Char('F'),
+                ..fit
+            }
+        ));
+
+        // An open editor is typing, not driving the window.
+        ui.focus = Focus::Palette;
+        assert!(!is_fit_key(&ui, fit));
+        ui.focus = Focus::Body;
+
+        for mods in [
+            Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+            },
+            Modifiers {
+                ctrl: false,
+                shift: true,
+                alt: false,
+            },
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: true,
+            },
+        ] {
+            assert!(!is_fit_key(&ui, KeyEvent { mods, ..fit }), "{mods:?}");
+        }
+        assert!(!is_fit_key(
+            &ui,
+            KeyEvent {
+                key: Key::Char('g'),
+                ..fit
+            }
+        ));
     }
 
     /// A scene with the profile dropdown open over two profiles.

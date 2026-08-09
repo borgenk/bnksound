@@ -39,7 +39,7 @@ use crate::ui::input::{
 use crate::ui::layout::{self, ResizeEdge};
 use crate::ui::meter::PEAK_DECAY_INTERVAL;
 use crate::ui::theme::Palette;
-use crate::ui::{CARET_BLINK, Chrome, Drag};
+use crate::ui::{CARET_BLINK, Chrome, Drag, FitStep};
 
 /// One wl_shm buffer and whether the compositor still holds it.
 #[derive(Clone, Copy, Default)]
@@ -99,7 +99,27 @@ const AUTOSAVE_INTERVAL: Duration = Duration::from_millis(500);
 /// Globals we bind, with the versions we speak.
 const COMPOSITOR_VERSION: u32 = 4;
 const SHM_VERSION: u32 = 1;
-const WM_BASE_VERSION: u32 = 2;
+/// 4 is where xdg_toplevel.configure_bounds arrives, which is the only honest
+/// source for how wide the window may ask to be.
+const WM_BASE_VERSION: u32 = 4;
+
+/// How long a launch keeps re-fitting to the stream list.
+///
+/// The columns are whatever PipeWire has told us about so far, and it tells us
+/// over the first moments of a session rather than all at once. A fit taken on
+/// the first stream to arrive would be a fit to one column, so the window keeps
+/// following the list until it has settled and then leaves the width alone.
+const REFIT_SETTLE: Duration = Duration::from_millis(1500);
+
+/// A fit this launch owes its columns, because the last session ended at a
+/// fitted width and the streams that decided that width are not this session's.
+#[derive(Clone, Copy)]
+struct Refit {
+    /// Width the window opened at, which is what the fit's restore goes back to.
+    opened_at: i32,
+    /// When to stop following the stream list.
+    until: Instant,
+}
 const SEAT_VERSION: u32 = 5;
 const ACTIVATION_VERSION: u32 = 1;
 
@@ -187,6 +207,9 @@ pub struct App {
     normal_size: (i32, i32),
     /// The states the latest configure carried.
     states: ToplevelStates,
+    /// The fit this launch still owes its columns, set when the last session
+    /// ended fitted. None once it has been paid or given up on.
+    refit: Option<Refit>,
     configured: bool,
     pub closed: bool,
     counts: Counts,
@@ -240,6 +263,7 @@ impl App {
         let startup_size = layout::at_least_minimum(
             i32::try_from(geometry.width).unwrap_or(560),
             i32::try_from(geometry.height).unwrap_or(720),
+            shell.ui.settings.show_sidebar,
         );
 
         let mut app = App {
@@ -288,6 +312,10 @@ impl App {
             height: startup_size.1,
             normal_size: startup_size,
             states: ToplevelStates::default(),
+            refit: geometry.fitted.then(|| Refit {
+                opened_at: startup_size.0,
+                until: Instant::now() + REFIT_SETTLE,
+            }),
             configured: false,
             closed: false,
             counts: Counts::default(),
@@ -340,7 +368,7 @@ impl App {
         );
         self.roundtrip()?;
 
-        if std::env::var_os("BNKSOUND_DEBUG").is_some() {
+        if debug_enabled() {
             eprintln!(
                 "bound: compositor={} shm={} wm_base={} seat={} decoration_mgr={} activation={}",
                 self.compositor,
@@ -418,7 +446,7 @@ impl App {
         );
         self.send(toplevel, req::XDG_TOPLEVEL_SET_APP_ID, &[Arg::Str(APP_ID)]);
         // Never shrink below one full column, which would cut the sliders off.
-        let (min_w, min_h) = layout::minimum_size();
+        let (min_w, min_h) = layout::minimum_size(self.shell.ui.settings.show_sidebar);
         self.send(
             toplevel,
             req::XDG_TOPLEVEL_SET_MIN_SIZE,
@@ -567,7 +595,7 @@ impl App {
                 // minimum back: the window keeps its own floor rather than
                 // handing the user a column cut off at the knees.
                 let (w, h) = if w > 0 && h > 0 {
-                    layout::at_least_minimum(w, h)
+                    layout::at_least_minimum(w, h, self.shell.ui.settings.show_sidebar)
                 } else {
                     (w, h)
                 };
@@ -576,8 +604,11 @@ impl App {
                     self.height = h;
                     self.shell.ui.dirty.mark_full();
                 }
-                if states.maximized != self.shell.ui.maximized {
+                if states.maximized != self.shell.ui.maximized
+                    || states.tiled != self.shell.ui.tiled
+                {
                     self.shell.ui.maximized = states.maximized;
+                    self.shell.ui.tiled = states.tiled;
                     self.shell.ui.dirty.mark_full();
                 }
                 // Only an ordinary window's size is worth keeping. Maximized,
@@ -614,6 +645,19 @@ impl App {
                     // The buffers hold device pixels, so ensure_buffers will see
                     // a new size and rebuild them.
                     self.shell.ui.dirty.mark_full();
+                }
+            }
+            (_, evt::XDG_TOPLEVEL_CONFIGURE_BOUNDS) if msg.object == self.xdg_toplevel => {
+                // Zero for either axis means the compositor has no bound to
+                // give, which leaves the fit unclamped rather than pinned to 0.
+                let w = r.i32().unwrap_or(0);
+                let _h = r.i32().unwrap_or(0);
+                self.shell.ui.max_width = if w > 0 { w } else { i32::MAX };
+                if debug_enabled() {
+                    eprintln!(
+                        "{:>6}ms configure bounds: width {w}",
+                        self.started.elapsed().as_millis(),
+                    );
                 }
             }
             (_, evt::XDG_TOPLEVEL_CLOSE) if msg.object == self.xdg_toplevel => {
@@ -680,7 +724,7 @@ impl App {
                 if let Some(fd) = self.conn.take_fd() {
                     match Keyboard::from_keymap_fd(fd, size) {
                         Ok(kb) => {
-                            if std::env::var_os("BNKSOUND_DEBUG").is_some() {
+                            if debug_enabled() {
                                 eprintln!("keymap loaded ({size} bytes)");
                             }
                             self.xkb = Some(kb);
@@ -743,7 +787,7 @@ impl App {
                 let _time = r.u32();
                 let code = r.u32().unwrap_or(0);
                 let state = r.u32().unwrap_or(0);
-                if std::env::var_os("BNKSOUND_DEBUG").is_some() {
+                if debug_enabled() {
                     eprintln!("key: code={code} state={state} xkb={}", self.xkb.is_some());
                 }
                 if state == 1 {
@@ -917,7 +961,7 @@ impl App {
     }
 
     fn bind_seat(&mut self, caps: u32) {
-        if std::env::var_os("BNKSOUND_DEBUG").is_some() {
+        if debug_enabled() {
             eprintln!("seat capabilities: {caps:#x} (1=pointer, 2=keyboard)");
         }
         if caps & SEAT_CAP_POINTER != 0 && self.pointer == 0 {
@@ -991,7 +1035,40 @@ impl App {
             &self.font,
         );
         self.apply_cursor();
+        self.dispatch(msgs);
+    }
+
+    /// Reduce messages, and let a fitted window follow the columns when the
+    /// user has just asked for a different set of them.
+    ///
+    /// Whether the window was fitted is read before the messages land, because
+    /// afterwards the count has moved and every fitted window would read as
+    /// un-fitted. A window the user sized is theirs: the new columns scroll into
+    /// the strip and the width stays put.
+    fn dispatch(&mut self, msgs: Vec<AppMessage>) {
+        let follows =
+            msgs.iter().any(AppMessage::changes_columns) && self.shell.is_fitted(self.width);
         self.shell.dispatch(msgs);
+        if follows {
+            self.refit_to_columns();
+        }
+    }
+
+    /// Take a fitted window to the width its columns now want, keeping the
+    /// width it would go back to. The toggle moved the columns, not the user's
+    /// own idea of how wide the window should be.
+    fn refit_to_columns(&mut self) {
+        let columns = layout::column_count(&self.shell.snapshot);
+        if self.shell.ui.is_fitted(self.width, columns) {
+            return;
+        }
+        let restore = self.shell.ui.fit_restore;
+        let step = self
+            .shell
+            .ui
+            .fit_step(self.width, columns)
+            .map(|step| FitStep { restore, ..step });
+        self.apply_fit(step);
     }
 
     /// Hand a window-management request to the compositor.
@@ -1021,9 +1098,76 @@ impl App {
                 };
                 self.send(toplevel, op, &[]);
             }
+            WindowAction::ToggleFitWidth => self.toggle_fit_width(),
             WindowAction::Close => self.closed = true,
         }
         let _ = self.flush();
+    }
+
+    /// Size the window to the width its columns need, or put back the width it
+    /// had before the last fit.
+    ///
+    /// Only an ordinary window has a width to give. Maximized, fullscreen, or
+    /// tiled, the size is the compositor's arrangement, and a window that
+    /// committed its own would be told so.
+    fn toggle_fit_width(&mut self) {
+        let step = self.shell.fit_press(self.width);
+        self.apply_fit(step);
+    }
+
+    /// Pay the fit this launch owes its columns, while the stream list is still
+    /// settling.
+    ///
+    /// Fitting once on the first stream to arrive would fit to one column, so
+    /// this follows the list for as long as [`REFIT_SETTLE`] and then stops. A
+    /// window already standing where its columns want it is left alone, which
+    /// is what keeps a settled fit from bouncing back on the next turn.
+    fn tick_refit(&mut self) {
+        let Some(refit) = self.refit else {
+            return;
+        };
+        if Instant::now() >= refit.until {
+            self.refit = None;
+            return;
+        }
+        let columns = layout::column_count(&self.shell.snapshot);
+        if columns == 0 || self.shell.ui.is_fitted(self.width, columns) {
+            return;
+        }
+        // The width to go back to is the one the window opened at, not whatever
+        // an earlier turn of this same settling left behind.
+        let step = self
+            .shell
+            .ui
+            .fit_step(self.width, columns)
+            .map(|step| FitStep {
+                restore: Some(refit.opened_at),
+                ..step
+            });
+        self.apply_fit(step);
+    }
+
+    /// Take a width the fit asked for and make it the window's.
+    fn apply_fit(&mut self, step: Option<FitStep>) {
+        let Some(step) = step else {
+            return;
+        };
+        self.shell.ui.fit_restore = step.restore;
+        self.width = step.width;
+        self.normal_size = (self.width, self.height);
+        self.set_window_geometry();
+        self.shell.ui.dirty.mark_full();
+        // The chrome just moved under a pointer that did not, and no event is
+        // coming to say so. Without this the hover keeps pointing at whatever
+        // was under the pointer before the width changed.
+        if self.pointer_inside {
+            let layout = self.layout();
+            let (x, y) = (self.ptr_x as i32, self.ptr_y as i32);
+            input::rehover(&mut self.shell.ui, &layout, x, y);
+        }
+        // The save tick carries the fitted width from here, so a relaunch comes
+        // back at the size the press asked for.
+        self.push_geometry();
     }
 
     /// The next launch waiting on the lock socket, and the activation token it
@@ -1126,15 +1270,20 @@ impl App {
             self.screenshot();
             return;
         }
+        if input::is_fit_key(&self.shell.ui, event) {
+            self.toggle_fit_width();
+            let _ = self.flush();
+            return;
+        }
         if let Some(action) = input::clipboard_action(&self.shell.ui, event) {
             self.clipboard(action);
             return;
         }
-        if std::env::var_os("BNKSOUND_DEBUG").is_some() {
+        if debug_enabled() {
             eprintln!("  -> key={key:?} mods={mods:?}");
         }
         let msgs = input::on_key(&mut self.shell.ui, &self.shell.snapshot, event);
-        self.shell.dispatch(msgs);
+        self.dispatch(msgs);
     }
 
     /// Copy, cut, or paste for the focused editor.
@@ -1493,11 +1642,15 @@ impl App {
         // UI and worker messages.
         let mut batch = Vec::new();
         self.msg_rx.drain(|m| batch.push(m));
-        self.shell.dispatch(batch);
+        self.dispatch(batch);
 
         let mut worker = Vec::new();
         self.evt_rx.drain(|e| worker.push(e));
         self.shell.dispatch_worker(worker);
+
+        // After the worker events, since those are what bring the columns the
+        // fit is owed to.
+        self.tick_refit();
 
         // Meter animation: decay, then fold in the newest peaks. An idle window
         // whose bars are all at rest changes nothing and skips its repaint.
@@ -1512,9 +1665,9 @@ impl App {
             }
         }
 
-        // The knob's ring eases in and out, so it keeps painting for as long as
-        // it is still moving.
-        if self.shell.tick_halo(Instant::now()) {
+        // The knob's ring eases in and out, and the fit button's press mark
+        // eases away, so both keep painting for as long as they are moving.
+        if self.shell.tick_fades(Instant::now()) {
             self.shell.ui.dirty.mark_full();
         }
 
@@ -1549,6 +1702,7 @@ impl App {
             width: w.max(0) as u32,
             height: h.max(0) as u32,
             maximized: self.shell.ui.maximized,
+            fitted: self.shell.is_fitted(w),
         });
     }
 
@@ -1691,9 +1845,9 @@ fn toplevel_states(bytes: &[u8]) -> ToplevelStates {
     out
 }
 
-/// Whether to narrate window sizing to stderr. Sizing is negotiated with the
-/// compositor, so when a window comes up wrong the exchange is the only place
-/// the reason shows.
+/// Whether to narrate the compositor exchange to stderr. The globals, the
+/// window's size, and every key arrive over that exchange, so when the window
+/// comes up wrong it is the only place the reason shows.
 fn debug_enabled() -> bool {
     std::env::var_os("BNKSOUND_DEBUG").is_some()
 }

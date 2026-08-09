@@ -28,7 +28,7 @@ use crate::shell::Shell;
 use crate::state::Message;
 use crate::ui::input::{self, ClipboardAction, PointerAction};
 use crate::ui::meter::PEAK_DECAY_INTERVAL;
-use crate::ui::{CARET_BLINK, Chrome};
+use crate::ui::{CARET_BLINK, Chrome, FitStep};
 
 pub fn activate(app: &gtk::Application) {
     if let Some(window) = app.active_window() {
@@ -82,7 +82,7 @@ pub fn activate(app: &gtk::Application) {
 
     // The drawing area asks for nothing, so without this the window would
     // shrink past the point where a column still fits.
-    let (min_w, min_h) = crate::ui::layout::minimum_size();
+    let (min_w, min_h) = crate::ui::layout::minimum_size(shell.borrow().ui.settings.show_sidebar);
     surface.borrow().widget.set_size_request(min_w, min_h);
 
     window.set_child(Some(&surface.borrow().widget));
@@ -110,9 +110,12 @@ pub fn activate(app: &gtk::Application) {
     };
 
     wire_input(&surface, &window, &shell, &msg_tx, &redraw);
-    wire_buses(&shell, &redraw, msg_rx, evt_rx);
+    wire_buses(&window, &shell, &redraw, msg_rx, evt_rx);
     wire_ticks(&shell, &redraw);
     wire_geometry(&window, &shell);
+    if geometry.fitted {
+        wire_refit(&window, &shell, geometry.width as i32);
+    }
 
     window.present();
     redraw();
@@ -173,6 +176,14 @@ fn wire_input(
                             screenshot::capture(pixels, w, h);
                             return;
                         }
+                        if input::is_fit_key(&shell.ui, key) {
+                            drop(surface);
+                            // Resizing settles through the frame clock, which
+                            // borrows the shell again on its way back.
+                            drop(shell);
+                            toggle_fit_width(&window, &shell_rc);
+                            return;
+                        }
                         if let Some(action) = input::clipboard_action(&shell.ui, key) {
                             drop(surface);
                             // Paste borrows the shell again when GDK answers,
@@ -187,12 +198,48 @@ fn wire_input(
                     }
                 }
             };
-            shell_rc.borrow_mut().dispatch(msgs);
+            dispatch(&window, &shell_rc, msgs);
             redraw();
         })
     };
 
     surface::attach_controllers(&surface.borrow().widget, window, handler);
+}
+
+/// Reduce messages, and let a fitted window follow the columns when the user
+/// has just asked for a different set of them.
+///
+/// Whether the window was fitted is read before the messages land, because
+/// afterwards the count has moved and every fitted window would read as
+/// un-fitted. A window the user sized is theirs: the new columns scroll into the
+/// strip and the width stays put.
+fn dispatch(window: &gtk::ApplicationWindow, shell: &Rc<RefCell<Shell>>, msgs: Vec<Message>) {
+    let follows = msgs.iter().any(Message::changes_columns);
+    let width = window.default_width();
+    let follows = {
+        let mut shell = shell.borrow_mut();
+        let was_fitted = follows && shell.is_fitted(width);
+        shell.dispatch(msgs);
+        was_fitted
+    };
+    if !follows {
+        return;
+    }
+    // The width to come back to is still the user's own, not the fitted width
+    // the toggle just moved off.
+    let step = {
+        let shell = shell.borrow();
+        let columns = shell.columns();
+        if shell.ui.is_fitted(width, columns) {
+            return;
+        }
+        let restore = shell.ui.fit_restore;
+        shell
+            .ui
+            .fit_step(width, columns)
+            .map(|step| FitStep { restore, ..step })
+    };
+    apply_fit(window, shell, step);
 }
 
 /// Copy, cut, or paste for the focused editor, through GDK's clipboard.
@@ -249,6 +296,7 @@ fn clipboard(
 
 /// Drain both buses whenever a producer wakes their fd.
 fn wire_buses(
+    window: &gtk::ApplicationWindow,
     shell: &Rc<RefCell<Shell>>,
     redraw: &Rc<dyn Fn()>,
     msg_rx: crate::bus::Receiver<Message>,
@@ -257,11 +305,12 @@ fn wire_buses(
     {
         let shell = Rc::clone(shell);
         let redraw = Rc::clone(redraw);
+        let window = window.clone();
         let fd = msg_rx.wake_fd();
         glib_fd::watch_readable(fd, move || {
             let mut batch = Vec::new();
             msg_rx.drain(|m| batch.push(m));
-            shell.borrow_mut().dispatch(batch);
+            dispatch(&window, &shell, batch);
             redraw();
         });
     }
@@ -301,8 +350,9 @@ fn wire_ticks(shell: &Rc<RefCell<Shell>>, redraw: &Rc<dyn Fn()>) {
             {
                 let mut shell = shell.borrow_mut();
                 let mut moved = shell.tick_meters();
-                // The knob's ring eases in and out on the same tick.
-                moved |= shell.tick_halo(std::time::Instant::now());
+                // The knob's ring and the fit button's press mark ease on the
+                // same tick.
+                moved |= shell.tick_fades(std::time::Instant::now());
                 if moved {
                     shell.ui.dirty.mark_full();
                 }
@@ -325,6 +375,82 @@ fn wire_ticks(shell: &Rc<RefCell<Shell>>, redraw: &Rc<dyn Fn()>) {
             glib::ControlFlow::Continue
         });
     }
+}
+
+/// Size the window to the width its columns need, or put back the width it had
+/// before the last fit.
+///
+/// GTK4 has no resize call. Setting the default size again is what moves a
+/// window that is already on screen, and it is also the property that tracks
+/// the normal-state width while the window is maximized, so it is both the
+/// width to read and the one to write.
+///
+/// A maximized or fullscreen window has no width to give. Tiled, GTK offers no
+/// way to ask, and the request goes out to be ignored.
+fn toggle_fit_width(window: &gtk::ApplicationWindow, shell: &Rc<RefCell<Shell>>) {
+    let current = window.default_width();
+    // GTK offers nothing like configure_bounds, so the ceiling is the window
+    // manager's to apply rather than ours to guess at.
+    let step = shell.borrow_mut().fit_press(current);
+    apply_fit(window, shell, step);
+}
+
+/// Follow the stream list for the first moments of a session, so a window that
+/// closed at a fitted width opens at the width this session's columns need.
+///
+/// PipeWire reports its streams over those first moments rather than all at
+/// once, so a single fit would land on however many had arrived by then. The
+/// tick stops itself once the list has settled and leaves the width alone after
+/// that; nothing here resizes a window on a stream that turns up later.
+fn wire_refit(window: &gtk::ApplicationWindow, shell: &Rc<RefCell<Shell>>, opened_at: i32) {
+    const STEP: Duration = Duration::from_millis(100);
+    const SETTLE: Duration = Duration::from_millis(1500);
+
+    let (window, shell) = (window.clone(), Rc::clone(shell));
+    let mut left = SETTLE.as_millis() / STEP.as_millis();
+    glib::timeout_add_local(STEP, move || {
+        tick_refit(&window, &shell, opened_at);
+        left -= 1;
+        if left == 0 {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
+
+/// One turn of the settling above: fit to whatever columns exist right now. A
+/// window already standing where its columns want it is left alone, which keeps
+/// a settled fit from bouncing back on the next tick.
+fn tick_refit(window: &gtk::ApplicationWindow, shell: &Rc<RefCell<Shell>>, opened_at: i32) {
+    let current = window.default_width();
+    let step = {
+        let shell = shell.borrow();
+        let columns = shell.columns();
+        if columns == 0 || shell.ui.is_fitted(current, columns) {
+            return;
+        }
+        shell.ui.fit_step(current, columns)
+    };
+    // The width to go back to is the one the window opened at, not whatever an
+    // earlier turn of this same settling left behind.
+    let step = step.map(|step| FitStep {
+        restore: Some(opened_at),
+        ..step
+    });
+    apply_fit(window, shell, step);
+}
+
+/// Take a width the fit asked for and make it the window's.
+fn apply_fit(window: &gtk::ApplicationWindow, shell: &Rc<RefCell<Shell>>, step: Option<FitStep>) {
+    if window.is_maximized() || window.is_fullscreen() {
+        return;
+    }
+    let Some(step) = step else {
+        return;
+    };
+    shell.borrow_mut().ui.fit_restore = step.restore;
+    window.set_default_size(step.width, window.default_height());
 }
 
 /// Persist the window's normal-state size and its maximized flag, once, on

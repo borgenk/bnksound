@@ -16,6 +16,11 @@ pub struct Geometry {
     pub width: u32,
     pub height: u32,
     pub maximized: bool,
+    /// Whether the width was the one the fit gave it. The streams that decide
+    /// how many columns there are differ from session to session, so the saved
+    /// width is the wrong one to come back to; this says to work the width out
+    /// again from the columns that turn up.
+    pub fitted: bool,
 }
 
 impl Default for Geometry {
@@ -24,17 +29,19 @@ impl Default for Geometry {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             maximized: false,
+            fitted: false,
         }
     }
 }
 
 impl Geometry {
     /// Build from raw decoded values, clamping dimensions into a sane range.
-    pub fn clamped(width: u32, height: u32, maximized: bool) -> Self {
+    pub fn clamped(width: u32, height: u32, maximized: bool, fitted: bool) -> Self {
         Self {
             width: width.clamp(MIN_DIM, MAX_DIM),
             height: height.clamp(MIN_DIM, MAX_DIM),
             maximized,
+            fitted,
         }
     }
 }
@@ -45,7 +52,7 @@ mod tests {
 
     #[test]
     fn clamped_pins_undersized_dims_to_min() {
-        let g = Geometry::clamped(10, 5, false);
+        let g = Geometry::clamped(10, 5, false, false);
         assert_eq!(g.width, MIN_DIM);
         assert_eq!(g.height, MIN_DIM);
         assert!(!g.maximized);
@@ -53,7 +60,7 @@ mod tests {
 
     #[test]
     fn clamped_pins_oversized_dims_to_max() {
-        let g = Geometry::clamped(999_999, 999_999, true);
+        let g = Geometry::clamped(999_999, 999_999, true, false);
         assert_eq!(g.width, MAX_DIM);
         assert_eq!(g.height, MAX_DIM);
         assert!(g.maximized);
@@ -61,7 +68,7 @@ mod tests {
 
     #[test]
     fn clamped_leaves_in_range_dims_untouched() {
-        let g = Geometry::clamped(1024, 768, false);
+        let g = Geometry::clamped(1024, 768, false, false);
         assert_eq!(g.width, 1024);
         assert_eq!(g.height, 768);
     }

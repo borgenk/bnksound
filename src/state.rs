@@ -178,6 +178,8 @@ pub enum Message {
     /// Toggle an app row between collapsed aggregate and per-member
     /// sub-columns. No-op for single-member groups.
     GroupToggleExpanded(String),
+    // Note: [`Message::changes_columns`] names the variants that alter how many
+    // columns the strip holds. A new one belongs in that list.
     /// The MPRIS player cache changed; the UI re-reads it on the next
     /// refresh. Carries no data (the cache lives in the UI's Mpris handle).
     MprisChanged,
@@ -232,11 +234,13 @@ pub enum Message {
     AutoSaveTick,
     /// Window resize / maximize notification. width/height carry the last
     /// normal-state size (not the maximized or tiled size), so this is the size
-    /// to restore next launch.
+    /// to restore next launch. `fitted` says that width came from the fit, in
+    /// which case the next launch works it out again rather than restoring it.
     GeometryChanged {
         width: u32,
         height: u32,
         maximized: bool,
+        fitted: bool,
     },
     /// Toggle the Ctrl+K command palette, clearing query and selection.
     TogglePalette,
@@ -250,6 +254,22 @@ pub enum Message {
     /// selection without changing which row is selected; the sender clamps it
     /// to the list, since only the projection knows how many rows fit.
     PaletteScrollTo(usize),
+}
+
+impl Message {
+    /// Whether this is the user asking for a different set of columns, as
+    /// opposed to the stream list changing under them.
+    ///
+    /// A window standing at its columns' width follows these, the way a window
+    /// grows when a disclosure is twisted open: the user asked for the content,
+    /// so the window making room for it is the consequence of their own press.
+    /// A stream starting on its own gets no such licence.
+    pub fn changes_columns(&self) -> bool {
+        matches!(
+            self,
+            Message::GroupToggleExpanded(_) | Message::ToggleSection(_)
+        )
+    }
 }
 
 pub fn boot() -> App {
@@ -659,11 +679,13 @@ pub fn update(state: &mut App, message: Message, out: &mut Vec<Command>) {
             width,
             height,
             maximized,
+            fitted,
         } => {
             let next = Geometry {
                 width,
                 height,
                 maximized,
+                fitted,
             };
             if state.geometry != next {
                 state.geometry = next;
@@ -1247,6 +1269,31 @@ mod tests {
         let mut out = Vec::new();
         super::update(state, message, &mut out);
         out
+    }
+
+    /// A fitted window resizes itself on exactly the messages this names, so
+    /// the list is the difference between the window following the user and
+    /// the window moving on its own.
+    #[test]
+    fn only_the_users_own_changes_to_the_column_set_move_the_window() {
+        assert!(Message::GroupToggleExpanded("app:x".into()).changes_columns());
+        assert!(Message::ToggleSection(Section::Apps).changes_columns());
+
+        // A stream starting or stopping is the world moving, not the user.
+        assert!(!Message::Worker(Box::new(WorkerEvent::StreamRemoved(1))).changes_columns());
+        assert!(!Message::MprisChanged.changes_columns());
+        // Nor is anything that leaves the column set alone.
+        for m in [
+            Message::MuteToggled(1),
+            Message::VolumeChanged(1, 0.5),
+            Message::MuteAllToggled,
+            Message::MakeDefault(1),
+            Message::ResetAllStreamTargets,
+            Message::AutoSaveTick,
+            Message::TogglePalette,
+        ] {
+            assert!(!m.changes_columns(), "{m:?} should not move the window");
+        }
     }
 
     fn app_stream(id: u32) -> AudioStream {
@@ -2182,6 +2229,7 @@ mod tests {
                 width: 900,
                 height: 800,
                 maximized: false,
+                fitted: false,
             },
         );
 
@@ -2202,6 +2250,7 @@ mod tests {
                 width: original.width,
                 height: original.height,
                 maximized: original.maximized,
+                fitted: original.fitted,
             },
         );
 
@@ -2219,6 +2268,7 @@ mod tests {
                 width: 900,
                 height: 800,
                 maximized: true,
+                fitted: false,
             },
         );
         assert!(state.geometry_dirty);
@@ -2245,6 +2295,7 @@ mod tests {
                 width: 1024,
                 height: 768,
                 maximized: true,
+                fitted: true,
             },
         );
         update(&mut state, Message::AutoSaveTick);
