@@ -747,21 +747,16 @@ fn paint_meter(p: &mut Painter, area: Rect, id: &RowId, ui: &UiState, palette: &
     let gap = 1;
     let bar_w = ((area.w - (n - 1) * gap) / n).max(1);
     let segs = meter::segments_for(area.h);
-    let cell_h = (meter::CELL_PITCH - meter::CELL_GAP).max(1);
 
     for bar in 0..n {
         let bx = area.x + bar * (bar_w + gap);
         let peak = channels.get(bar as usize).copied().unwrap_or(0.0);
         let lit = meter::lit_fraction(peak);
         for i in 0..segs {
-            // Whole rows throughout: the pitch divides the strip evenly, so
-            // every cell is the same height and lands on a pixel boundary.
-            let cell = Rect::new(
-                bx,
-                area.bottom() - i * meter::CELL_PITCH - cell_h,
-                bar_w,
-                cell_h,
-            );
+            // Whole rows throughout: the cells stack on the whole pitch, so
+            // every edge lands on a pixel boundary.
+            let (top, cell_h) = meter::cell_span(area.h, i);
+            let cell = Rect::new(bx, area.y + top, bar_w, cell_h);
             p.fill(cell, palette.dim_grid);
             let cov = meter::segment_coverage(lit, segs, i);
             if cov > 0.0 {
@@ -1173,6 +1168,16 @@ mod tests {
     }
 
     fn render(app: &state::App, w: u32, h: u32) -> PixelBuffer {
+        render_with_layout(app, w, h).0
+    }
+
+    /// A rendered frame beside the layout it was painted from, for tests that
+    /// sample pixels at an element's own rectangle.
+    fn render_with_layout(
+        app: &state::App,
+        w: u32,
+        h: u32,
+    ) -> (PixelBuffer, crate::ui::layout::Layout) {
         let f = font();
         let snap = build_snapshot(app, |_| None);
         let content = Rect::new(0, 0, w as i32, h as i32);
@@ -1191,7 +1196,7 @@ mod tests {
                 &mut IconCache::new(),
             );
         }
-        buf
+        (buf, layout)
     }
 
     /// The app column of a rendered scene, with its layout.
@@ -1370,6 +1375,31 @@ mod tests {
             namespace < action,
             "namespace ink {namespace} should be dimmer than action ink {action}"
         );
+    }
+
+    /// The first row of `rect` carrying anything but `bg`.
+    fn first_ink_row(buf: &PixelBuffer, rect: Rect, bg: u32) -> Option<i32> {
+        (rect.y..rect.bottom()).find(|&y| (rect.x..rect.right()).any(|x| pixel_at(buf, x, y) != bg))
+    }
+
+    #[test]
+    fn the_meter_and_the_fader_start_on_the_same_row_at_any_height() {
+        // The meter's cells stack on a whole pitch and the trough beside it
+        // does not, so the two only line up while the top cell takes up
+        // whatever the pitch leaves. The heights here cover every remainder.
+        let app = scene();
+        for h in 250..262 {
+            let (buf, layout) = render_with_layout(&app, 380, h);
+            let col = layout.columns.first().expect("a column");
+            // The strip behind the column, sampled left of the meter where the
+            // body draws nothing.
+            let bg = pixel_at(&buf, col.meter.x - 3, col.meter.y);
+            let meter = first_ink_row(&buf, col.meter, bg).expect("the meter draws nothing");
+            let trough =
+                first_ink_row(&buf, col.slider.track, bg).expect("the trough draws nothing");
+            assert_eq!(meter, col.meter.y, "the ladder fills its strip at {h}");
+            assert_eq!(meter, trough, "meter and fader tops disagree at {h}");
+        }
     }
 
     #[test]

@@ -15,10 +15,10 @@ use crate::ui::layout::RowId;
 pub const METER_WIDTH: i32 = 18;
 /// Whole pixels from one cell to the next, its gap included.
 ///
-/// The pitch is kept whole so every rung is the same size with sharp edges. A
-/// meter's height varies with the window, so a fixed number of cells would put
-/// them on a fractional pitch, which can only be drawn by spreading the edges
-/// over partial rows; at this size that reads as blur.
+/// The pitch is kept whole so the rungs have sharp edges. A meter's height
+/// varies with the window, so a fixed number of cells would put them on a
+/// fractional pitch, which can only be drawn by spreading the edges over
+/// partial rows; at this size that reads as blur.
 ///
 /// Whole pixels leave a choice between few thick rungs and many thin ones, and
 /// the rungs are what the meter is read by, so they get the rows: three of cell
@@ -27,12 +27,40 @@ pub const METER_WIDTH: i32 = 18;
 pub const CELL_PITCH: i32 = 4;
 /// Rows of background between one cell and the next.
 pub const CELL_GAP: i32 = 1;
+/// Rows of ink in one cell.
+pub const CELL_HEIGHT: i32 = CELL_PITCH - CELL_GAP;
 // A gap as wide as the pitch would leave no cell to draw.
 const _: () = assert!(CELL_GAP < CELL_PITCH);
 
-/// How many cells fit a meter `height` rows tall.
+/// How many cells a meter `height` rows tall shows, counting the top one the
+/// strip cuts short.
 pub fn segments_for(height: i32) -> i32 {
-    (height / CELL_PITCH).max(1)
+    let height = height.max(1);
+    let whole = height / CELL_PITCH;
+    if height % CELL_PITCH == 0 {
+        whole
+    } else {
+        whole + 1
+    }
+}
+
+/// The rows cell `from_bottom` covers in a strip `height` tall, as an offset
+/// from the strip's top and a row count.
+///
+/// Cells stack from the bottom on the whole pitch, so cell 0 ends on the
+/// strip's last row and every rung below the top one is [`CELL_HEIGHT`] tall.
+/// The top cell runs to the strip's first row and takes whatever the pitch
+/// leaves it, one to `CELL_PITCH` rows. That holds the ladder's top edge level
+/// with the fader beside it at any window height, and grows it a row at a time
+/// as the window grows.
+pub fn cell_span(height: i32, from_bottom: i32) -> (i32, i32) {
+    let bottom = height - from_bottom * CELL_PITCH;
+    let top = if from_bottom >= segments_for(height) - 1 {
+        0
+    } else {
+        bottom - CELL_HEIGHT
+    };
+    (top, (bottom - top).max(0))
 }
 /// Bars drawn before a stream has reported how many channels it carries.
 /// Nearly everything is stereo, and a second bar appearing beside the first
@@ -179,16 +207,48 @@ mod tests {
     #[test]
     fn cells_tile_a_meter_without_a_fractional_pitch() {
         // Whatever height a window gives the strip, the cells divide it in
-        // whole pixels, which is what keeps every rung the same and sharp.
-        for height in [40, 80, 140, 141, 300, 721] {
+        // whole pixels, which is what keeps the rungs sharp.
+        for height in 1..800 {
             let n = segments_for(height);
             assert!(n >= 1, "a meter always has at least one cell");
-            assert!(
-                n * CELL_PITCH <= height,
-                "{n} cells of {CELL_PITCH} must fit within {height}",
+
+            let (bottom_top, bottom_h) = cell_span(height, 0);
+            assert_eq!(
+                bottom_top + bottom_h,
+                height,
+                "the first cell ends on the strip's last row",
             );
-            // The leftover is smaller than a cell, so nothing visible is lost.
-            assert!(height - n * CELL_PITCH < CELL_PITCH);
+            let (top_top, top_h) = cell_span(height, n - 1);
+            assert_eq!(top_top, 0, "the last cell starts on the strip's first row");
+            assert!(
+                (1..=CELL_PITCH).contains(&top_h),
+                "the top cell takes the leftover, got {top_h} at {height}",
+            );
+
+            // Everything under the top rung is one cell tall, on the pitch,
+            // with the gap between one cell and the next.
+            for i in 0..n - 1 {
+                let (top, h) = cell_span(height, i);
+                assert_eq!(h, CELL_HEIGHT, "cell {i} of {n} at height {height}");
+                let (above_top, above_h) = cell_span(height, i + 1);
+                assert_eq!(top - (above_top + above_h), CELL_GAP);
+            }
+        }
+    }
+
+    #[test]
+    fn the_top_cell_grows_a_row_at_a_time_with_the_strip() {
+        // A window resize moves the strip's top edge past the grid one row at a
+        // time. The ladder follows it row by row rather than a cell at a time,
+        // which is what keeps the meter from stepping while the window drags.
+        for height in 1..800 {
+            let short = cell_span(height, segments_for(height) - 1).1;
+            let tall = cell_span(height + 1, segments_for(height + 1) - 1).1;
+            let grew = tall == short + 1;
+            // A cell that has taken the whole pitch splits, and the new rung
+            // starts over at a single row.
+            let split = short == CELL_PITCH && tall == 1;
+            assert!(grew || split, "{height}: {short} -> {tall}");
         }
     }
 
