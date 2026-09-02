@@ -31,9 +31,11 @@ use bnksound::ui::theme::Palette;
 use bnksound::ui::{Chrome, Focus, UiState};
 use bnksound::view::snapshot::build_snapshot;
 
-/// Big enough for the chrome and three columns, small enough that the golden
-/// stays a reasonable thing to keep in the repository.
-const WIDTH: u32 = 380;
+/// Big enough for the chrome and the scene's four columns, small enough that
+/// the golden stays a reasonable thing to keep in the repository. The width is
+/// what [`layout::natural_width`] asks for at four columns, so the run sits in
+/// the frame with no scrollbar and even air at both ends.
+const WIDTH: u32 = 514;
 const HEIGHT: u32 = 300;
 
 /// Per-channel difference at which two pixels count as disagreeing.
@@ -218,6 +220,15 @@ fn mixer_scene() -> state::App {
             0.70,
             false,
         ),
+        // The second output is what gives the app column its target pins.
+        (
+            3,
+            StreamKind::Sink,
+            "Schiit Modi+ Analog",
+            Some(DeviceForm::Output(SinkForm::Speaker)),
+            0.26,
+            false,
+        ),
     ] {
         app.streams.insert(
             id,
@@ -257,7 +268,9 @@ fn mixer_scene() -> state::App {
             icon_path: None,
             form: None,
             is_default: false,
-            target_sink_name: None,
+            // Pinned to the speakers, so the frame carries a target pin in
+            // both of its states.
+            target_sink_name: Some("node.3".to_string()),
         },
     );
     app

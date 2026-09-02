@@ -13,7 +13,7 @@ use crate::render::buffer::Color;
 use crate::render::image::{IconCache, draw_icon};
 use crate::render::primitives::{Painter, Rect};
 use crate::render::text::{Font, TextStyle};
-use crate::ui::layout::{ColumnGeom, HitTarget, Layout, RowId, SliderGeom};
+use crate::ui::layout::{ColumnGeom, HitTarget, Layout, RowId, SliderGeom, pin_press};
 use crate::ui::meter::{self, Tier};
 use crate::ui::theme::Palette;
 use crate::ui::{Focus, UiState};
@@ -32,6 +32,14 @@ const MAX_NAME_CHARS: usize = 14;
 type NameText = ArrayString<{ MAX_NAME_CHARS * 4 }>;
 /// Small pick-button label.
 const PICK_SIZE_PT: f32 = 12.0;
+/// Label on a lamp button, a step down from a plain pick: the lamp is what the
+/// eye goes to, and the letter only says which sink the pin is for.
+const LAMP_PICK_SIZE_PT: f32 = 10.0;
+/// Diameter of the lamp and its inset from the button's top right corner. The
+/// inset holds it off both edges while leaving the label on the middle of the
+/// button; what keeps the two apart is the corner, not the label giving way.
+const LAMP_SIZE: i32 = 4;
+const LAMP_INSET: i32 = 3;
 /// The profile chip's label, a step up from a pick button.
 const PROFILE_SIZE: f32 = 13.0;
 /// Inset from the chip's edge to its label.
@@ -378,7 +386,7 @@ fn paint_chrome(
                     font,
                     palette,
                     PickState {
-                        lit,
+                        fill: lit.then_some(palette.filter),
                         hovered,
                         accent: false,
                     },
@@ -391,7 +399,7 @@ fn paint_chrome(
                 font,
                 palette,
                 PickState {
-                    lit: false,
+                    fill: None,
                     hovered,
                     accent: false,
                 },
@@ -403,7 +411,7 @@ fn paint_chrome(
                 font,
                 palette,
                 PickState {
-                    lit: false,
+                    fill: None,
                     hovered,
                     accent: false,
                 },
@@ -447,10 +455,12 @@ fn paint_chrome(
     }
 }
 
-/// How a pick button reads: filled when lit, outlined in the accent when it is
-/// the active choice, plain otherwise.
+/// How a pick button reads: filled when it is on, outlined in the accent when
+/// it is the active choice, plain otherwise.
 struct PickState {
-    lit: bool,
+    /// What the button fills with while it is on, None while it is off. The
+    /// colour says which kind of on it is: a shown section, a muted row.
+    fill: Option<Color>,
     hovered: bool,
     accent: bool,
 }
@@ -459,9 +469,9 @@ struct PickState {
 /// A pick button's background and border, returning the colour its content
 /// draws in. Split out so a button can hold drawn ink instead of a glyph.
 fn pick_chrome(p: &mut Painter, rect: Rect, palette: &Palette, state: PickState) -> Color {
-    let (border, fg) = if state.lit {
-        p.rounded_rect(rect, PICK_RADIUS, palette.filter);
-        (palette.filter, palette.on_filled)
+    let (border, fg) = if let Some(fill) = state.fill {
+        p.rounded_rect(rect, PICK_RADIUS, fill);
+        (fill, palette.on_filled)
     } else {
         if state.hovered {
             p.rounded_rect(rect, PICK_RADIUS, palette.wash_5);
@@ -486,6 +496,36 @@ fn pick(
 ) {
     let fg = pick_chrome(p, rect, palette, state);
     centered_text(p, rect, label, font, TextStyle::new(PICK_SIZE_PT, fg));
+}
+
+/// A pick button carrying a lamp in its top right corner, lit in `lamp` when
+/// the switch is on and a dark lens when it is off.
+///
+/// Drawing the lamp in both states is what says the button switches rather than
+/// fires: a press on one already on is the way back. The lit colour comes from
+/// the caller because a lamp has to carry over its own button, and the mute's
+/// button is orange while it is on.
+///
+/// The label stays on the middle of the button. The lamp keeps clear of it by
+/// sitting in the corner rather than by pushing it aside.
+fn pick_lamp(
+    p: &mut Painter,
+    rect: Rect,
+    label: &str,
+    font: &Font,
+    palette: &Palette,
+    state: PickState,
+    lamp: Option<Color>,
+) {
+    let fg = pick_chrome(p, rect, palette, state);
+    centered_text(p, rect, label, font, TextStyle::new(LAMP_PICK_SIZE_PT, fg));
+    let dot = Rect::new(
+        rect.right() - LAMP_INSET - LAMP_SIZE,
+        rect.y + LAMP_INSET,
+        LAMP_SIZE,
+        LAMP_SIZE,
+    );
+    p.rounded_rect(dot, LAMP_SIZE / 2, lamp.unwrap_or(palette.lamp_dim));
 }
 
 fn paint_column(p: &mut Painter, col: &ColumnGeom, row: &RowDraw, cx: &mut ColumnCtx) {
@@ -601,7 +641,7 @@ fn paint_column(p: &mut Painter, col: &ColumnGeom, row: &RowDraw, cx: &mut Colum
                 col.expand,
                 cx.palette,
                 PickState {
-                    lit: row.is_expanded,
+                    fill: row.is_expanded.then_some(cx.palette.filter),
                     hovered: matches!(hover, Some(HitTarget::AppExpand(r)) if *r == col.id),
                     accent: false,
                 },
@@ -618,60 +658,50 @@ fn paint_column(p: &mut Painter, col: &ColumnGeom, row: &RowDraw, cx: &mut Colum
             p.triangle(points, fg);
         }
         for (rect, sink) in &col.targets {
-            // Every case is one character: automatic, the sink's initial, or a
-            // sink that is no longer there.
-            let initial = match sink {
-                None => 'A',
-                Some(id) => cx
-                    .sinks
-                    .iter()
-                    .find(|s| s.id == *id)
-                    .map_or('?', |s| s.short),
-            };
+            // The sink's initial, or a mark for a sink that is no longer there.
+            let initial = cx
+                .sinks
+                .iter()
+                .find(|s| s.id == *sink)
+                .map_or('?', |s| s.short);
             let mut buf = [0u8; 4];
             let label = initial.encode_utf8(&mut buf);
-            pick(
+            let on = row.target_sink == Some(*sink);
+            pick_lamp(
                 p,
                 *rect,
                 label,
                 cx.font,
                 cx.palette,
                 PickState {
-                    lit: false,
+                    fill: None,
                     hovered: matches!(
                         hover,
                         Some(HitTarget::AppTarget { row: r, sink: s })
-                            if *r == col.id && *s == *sink
+                            if *r == col.id && *s == pin_press(*sink, on)
                     ),
-                    accent: *sink == row.target_sink,
+                    accent: on,
                 },
+                on.then_some(cx.palette.lamp_pin),
             );
         }
     }
-    if row.muted {
-        p.rounded_rect(col.mute, PICK_RADIUS, cx.palette.warning);
-        p.rounded_stroke(col.mute, PICK_RADIUS, 1.0, cx.palette.warning);
-        centered_text(
-            p,
-            col.mute,
-            "M",
-            cx.font,
-            TextStyle::new(PICK_SIZE_PT, cx.palette.on_filled),
-        );
-    } else {
-        pick(
-            p,
-            col.mute,
-            "M",
-            cx.font,
-            cx.palette,
-            PickState {
-                lit: false,
-                hovered: matches!(hover, Some(HitTarget::RowMute(r)) if *r == col.id),
-                accent: false,
-            },
-        );
-    }
+    // Mute is a switch like the pins beside it, so it wears the same lamp. The
+    // fill is what carries at a glance across a wall of columns; the lamp is
+    // what says a second press undoes it.
+    pick_lamp(
+        p,
+        col.mute,
+        "M",
+        cx.font,
+        cx.palette,
+        PickState {
+            fill: row.muted.then_some(cx.palette.warning),
+            hovered: matches!(hover, Some(HitTarget::RowMute(r)) if *r == col.id),
+            accent: false,
+        },
+        row.muted.then_some(cx.palette.lamp_mute),
+    );
 
     // The hairline between this column and the next.
     if let Some(rule) = col.separator {
@@ -1148,6 +1178,10 @@ mod tests {
     fn scene() -> state::App {
         let mut a = state::empty();
         a.streams.insert(1, stream(1, StreamKind::Sink));
+        // A second output, which is what gives an app column its target pins.
+        let mut headset = stream(5, StreamKind::Sink);
+        headset.form = Some(crate::domain::DeviceForm::Output(SinkForm::Headset));
+        a.streams.insert(5, headset);
         a.streams.insert(2, stream(2, StreamKind::Source));
         let mut app = stream(3, StreamKind::Application);
         app.app_id = Some("com.example.Player".into());
@@ -1220,7 +1254,7 @@ mod tests {
         let app = expandable_scene();
         let (layout, at) = app_column(&app);
         let col = &layout.columns[at];
-        let top_pin = col.targets.first().expect("an autoroute pin").0;
+        let top_pin = col.targets.first().expect("a target pin").0;
 
         assert_eq!(col.expand.x, top_pin.x, "same button column as the pins");
         assert!(
@@ -1246,7 +1280,7 @@ mod tests {
         let col = &layout.columns[at];
         assert!(col.expand.is_empty(), "got {:?}", col.expand);
 
-        let top_pin = col.targets.first().expect("an autoroute pin").0;
+        let top_pin = col.targets.first().expect("a target pin").0;
         let above = top_pin.y - crate::ui::layout::metrics::PICK_STACK_GAP - 1;
         assert!(
             !matches!(
@@ -1400,6 +1434,61 @@ mod tests {
             assert_eq!(meter, col.meter.y, "the ladder fills its strip at {h}");
             assert_eq!(meter, trough, "meter and fader tops disagree at {h}");
         }
+    }
+
+    /// The pixel at the middle of a button's lamp.
+    fn lamp_pixel(buf: &PixelBuffer, button: Rect) -> u32 {
+        pixel_at(
+            buf,
+            button.right() - LAMP_INSET - LAMP_SIZE / 2,
+            button.y + LAMP_INSET + LAMP_SIZE / 2,
+        )
+    }
+
+    /// A lamp is a handful of pixels, few enough for the golden frame to stay
+    /// inside its tolerance with every one of them out, so the two states are
+    /// checked here instead.
+    #[test]
+    fn a_lamp_lights_for_the_switch_that_is_on_and_no_other() {
+        let mut app = scene();
+        let pinned_to = 5;
+        let muted = app.streams.get_mut(&3).expect("the app stream");
+        muted.target_sink_name = Some(format!("node.{pinned_to}"));
+        muted.muted = true;
+
+        let (buf, layout) = render_with_layout(&app, 560, 720);
+        let palette = Palette::dark();
+        let (lit, dark) = (
+            palette.lamp_pin.to_opaque_u32(),
+            palette.lamp_dim.to_opaque_u32(),
+        );
+
+        let col = layout
+            .columns
+            .iter()
+            .find(|c| !c.targets.is_empty())
+            .expect("an app column with pins");
+        for (rect, sink) in &col.targets {
+            let want = if *sink == pinned_to { lit } else { dark };
+            assert_eq!(lamp_pixel(&buf, *rect), want, "pin for sink {sink}");
+        }
+        assert!(
+            col.targets.iter().any(|(_, s)| *s == pinned_to),
+            "the scene never offered the sink the row was pinned to",
+        );
+        assert_eq!(
+            lamp_pixel(&buf, col.mute),
+            palette.lamp_mute.to_opaque_u32(),
+            "a muted row lights its mute lamp, in its own colour",
+        );
+
+        // A row that is neither muted nor pinned carries only dark lamps.
+        let quiet = layout
+            .columns
+            .iter()
+            .find(|c| matches!(c.id, RowId::Sink(_)))
+            .expect("a device column");
+        assert_eq!(lamp_pixel(&buf, quiet.mute), dark);
     }
 
     #[test]

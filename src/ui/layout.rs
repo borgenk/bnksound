@@ -196,8 +196,9 @@ pub struct ColumnGeom {
     pub meter: Rect,
     pub mute: Rect,
     /// Target buttons as (rect, sink id), stacked bottom-up above the mute
-    /// button; None is the autoroute button. Empty for device rows.
-    pub targets: Vec<(Rect, Option<u32>)>,
+    /// button. Empty for device rows and for a lone sink, which is nothing to
+    /// route between.
+    pub targets: Vec<(Rect, u32)>,
     /// The expand toggle, one slot above the topmost target pin. Empty unless
     /// the row is an app group with more than one member.
     pub expand: Rect,
@@ -398,6 +399,16 @@ pub struct ColumnSpec<'a> {
     pub can_expand: bool,
     /// Sinks the app target picker offers; empty for device rows.
     pub sinks: &'a [SinkOption],
+    /// The sink this row is pinned to, which is the pin a press clears rather
+    /// than sets. None follows the default sink.
+    pub target: Option<u32>,
+}
+
+/// What a press on a target pin asks for: the sink to pin to, or None to clear
+/// the pin when the row already sits on it. Drawing resolves the same answer to
+/// tell which pin the pointer is over, so the rule lives here alone.
+pub fn pin_press(sink: u32, on: bool) -> Option<u32> {
+    (!on).then_some(sink)
 }
 
 /// Lay out one column into `rect`, which spans the full height of the strip.
@@ -409,6 +420,7 @@ fn column(spec: ColumnSpec, rect: Rect, hits: &mut Vec<Hit>) -> ColumnGeom {
         is_app,
         can_expand,
         sinks,
+        target,
     } = spec;
     let x = rect.x;
 
@@ -464,29 +476,26 @@ fn column(spec: ColumnSpec, rect: Rect, hits: &mut Vec<Hit>) -> ColumnGeom {
     let mut targets = Vec::new();
     let mut expand = Rect::new(x, rect.y, 0, 0);
     if is_app {
-        // Autoroute first, then one pin per sink, stacked upward from the mute
-        // button so the cluster reads bottom-up in the same order every time.
-        let count = sinks.len() as i32 + 1;
+        // One pin per sink, stacked upward from the mute button so the cluster
+        // reads bottom-up in the same order every time. A single sink is
+        // nothing to route between, so it gets no pins at all.
         let mut by = mute.y - PICKER_MUTE_GAP - PICK_SIZE;
-        for i in (0..count).rev() {
-            let sink = if i == 0 {
-                None
-            } else {
-                sinks.get((i - 1) as usize).map(|s| s.id)
-            };
-            let r = Rect::new(btn_x, by, PICK_SIZE, PICK_SIZE);
-            targets.push((r, sink));
-            hits.push(Hit {
-                rect: r,
-                target: HitTarget::AppTarget {
-                    row: id.clone(),
-                    sink,
-                },
-            });
-            by -= PICK_SIZE + PICK_STACK_GAP;
+        if sinks.len() > 1 {
+            for sink in sinks.iter().rev() {
+                let r = Rect::new(btn_x, by, PICK_SIZE, PICK_SIZE);
+                targets.push((r, sink.id));
+                hits.push(Hit {
+                    rect: r,
+                    target: HitTarget::AppTarget {
+                        row: id.clone(),
+                        sink: pin_press(sink.id, target == Some(sink.id)),
+                    },
+                });
+                by -= PICK_SIZE + PICK_STACK_GAP;
+            }
+            targets.reverse();
         }
-        targets.reverse();
-        // The loop leaves `by` one slot above the topmost pin, which is where
+        // The stack leaves `by` at the next free slot above it, which is where
         // the expand toggle goes so the cluster keeps reading bottom-up.
         if can_expand {
             expand = Rect::new(btn_x, by, PICK_SIZE, PICK_SIZE);
@@ -628,6 +637,7 @@ pub fn project(snapshot: &ViewSnapshot, ui: &UiState, window: Rect) -> Layout {
         is_app: false,
         can_expand: false,
         sinks: &[],
+        target: None,
     };
     if snapshot.show_sources {
         for row in &snapshot.sources {
@@ -647,6 +657,7 @@ pub fn project(snapshot: &ViewSnapshot, ui: &UiState, window: Rect) -> Layout {
                 is_app: true,
                 can_expand: row.can_expand,
                 sinks: &snapshot.sink_options,
+                target: row.target_sink,
             };
             place(spec, &mut x, &mut columns);
         }
@@ -1301,12 +1312,13 @@ mod tests {
         build_snapshot(&app, |_| None)
     }
 
-    /// A sink and an app stream, so an app column carries a pin per sink plus
-    /// the autoroute pin.
-    fn sink_and_app_scene() -> ViewSnapshot {
+    /// Two sinks and an app, which is the smallest scene an app column shows
+    /// target pins in: with one sink there is nothing to route between.
+    fn sinks_and_app_scene() -> ViewSnapshot {
         let mut app = state::empty();
         for (id, kind, name) in [
             (1, crate::domain::StreamKind::Sink, "Speaker"),
+            (2, crate::domain::StreamKind::Sink, "Headset"),
             (7, crate::domain::StreamKind::Application, "Player"),
         ] {
             app.streams.insert(
@@ -1314,7 +1326,7 @@ mod tests {
                 crate::domain::Stream {
                     name: name.into(),
                     node_name: Some(format!("node.{id}")),
-                    is_default: kind == crate::domain::StreamKind::Sink,
+                    is_default: id == 1,
                     ..crate::domain::sample_stream(id, kind)
                 },
             );
@@ -1506,20 +1518,14 @@ mod tests {
     /// the stack is never stolen by the pin above it.
     #[test]
     fn the_mute_button_wins_over_the_pin_stack() {
-        let mut app = state::empty();
-        app.streams.insert(
-            7,
-            crate::domain::Stream {
-                name: "Player".into(),
-                app_id: Some("com.example.Player".into()),
-                node_name: Some("node.7".into()),
-                ..crate::domain::sample_stream(7, crate::domain::StreamKind::Application)
-            },
-        );
-        let snap = build_snapshot(&app, |_| None);
+        let snap = sinks_and_app_scene();
         let ui = UiState::new();
         let layout = project(&snap, &ui, content());
-        let col = &layout.columns[0];
+        let col = layout
+            .columns
+            .iter()
+            .find(|c| !c.targets.is_empty())
+            .expect("an app column with pins");
 
         let (x, y) = (col.mute.x + col.mute.w / 2, col.mute.y + col.mute.h / 2);
         assert!(matches!(layout.hit(x, y), Some(HitTarget::RowMute(_))));
@@ -1534,7 +1540,7 @@ mod tests {
     fn the_pins_sit_tighter_to_each_other_than_to_the_mute_button() {
         // The spacing is what says the pins are one set of linked choices and
         // the mute is not part of it, so the two gaps must stay distinct.
-        let snap = sink_and_app_scene();
+        let snap = sinks_and_app_scene();
         let ui = UiState::new();
         let layout = project(&snap, &ui, content());
         let col = layout
@@ -1559,6 +1565,83 @@ mod tests {
             metrics::PICKER_MUTE_GAP,
             "the mute button sits a wider gap below the stack",
         );
+    }
+
+    /// A press on the pin a row already sits on asks to clear it, which is the
+    /// only way back to following the default sink.
+    #[test]
+    fn pressing_the_pin_a_row_is_on_clears_it() {
+        let snap = sinks_and_app_scene();
+        let ui = UiState::new();
+        let app = snap.app_rows.first().expect("an app row");
+        let sink = snap.sink_options.first().expect("a sink").id;
+
+        // Nothing pinned: every pin sets its own sink.
+        let layout = project(&snap, &ui, content());
+        let col = layout
+            .columns
+            .iter()
+            .find(|c| !c.targets.is_empty())
+            .expect("an app column with pins");
+        let pin = col
+            .targets
+            .iter()
+            .find(|(_, s)| *s == sink)
+            .expect("a pin for the sink")
+            .0;
+        let press = |layout: &Layout, rect: Rect| {
+            layout
+                .hit(rect.x + rect.w / 2, rect.y + rect.h / 2)
+                .cloned()
+                .expect("the pin takes a press")
+        };
+        assert_eq!(
+            press(&layout, pin),
+            HitTarget::AppTarget {
+                row: app.id.clone(),
+                sink: Some(sink),
+            },
+        );
+
+        // Pinned there: the same button hands the row back to the default.
+        let mut snap = sinks_and_app_scene();
+        snap.app_rows[0].target_sink = Some(sink);
+        let layout = project(&snap, &ui, content());
+        assert_eq!(
+            press(&layout, pin),
+            HitTarget::AppTarget {
+                row: app.id.clone(),
+                sink: None,
+            },
+        );
+    }
+
+    /// One output is nothing to route between, so the pins are left out and the
+    /// column keeps only its mute.
+    #[test]
+    fn a_lone_sink_gets_no_target_pins() {
+        let mut app = state::empty();
+        for (id, kind) in [
+            (1, crate::domain::StreamKind::Sink),
+            (7, crate::domain::StreamKind::Application),
+        ] {
+            app.streams.insert(
+                id,
+                crate::domain::Stream {
+                    name: format!("Row {id}"),
+                    node_name: Some(format!("node.{id}")),
+                    is_default: id == 1,
+                    ..crate::domain::sample_stream(id, kind)
+                },
+            );
+        }
+        let snap = build_snapshot(&app, |_| None);
+        let ui = UiState::new();
+        let layout = project(&snap, &ui, content());
+        assert_eq!(snap.sink_options.len(), 1, "the scene offers one sink");
+        for col in &layout.columns {
+            assert!(col.targets.is_empty(), "{:?} carries pins", col.id);
+        }
     }
 
     #[test]

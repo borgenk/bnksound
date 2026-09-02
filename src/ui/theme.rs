@@ -52,6 +52,17 @@ pub struct Palette {
     pub volume_ok: Color,
     pub filter: Color,
     pub filter_hover: Color,
+    // The lamp on a toggle button, a dark lens when off and lit in the colour
+    // of what it switches: routing for a target pin, muted for a mute. The
+    // mute's lamp burns over its own orange fill, so it is the warning colour
+    // lifted rather than the colour itself.
+    //
+    // The dark lens sits under the button's own border, which is what keeps an
+    // unlit lamp behind the frame around it. Above the border it reads as the
+    // loudest thing on a button that is doing nothing.
+    pub lamp_pin: Color,
+    pub lamp_mute: Color,
+    pub lamp_dim: Color,
     // Borders.
     pub border: Color,
     // Modal action buttons.
@@ -108,6 +119,9 @@ impl Palette {
             volume_ok: rgb(0x66, 0xbb, 0x6a),
             filter: rgb(0xe5, 0xa9, 0x21),
             filter_hover: rgb(0xd6, 0x9e, 0x2e),
+            lamp_pin: rgb(0x42, 0xa5, 0xf5),
+            lamp_mute: rgb(0xff, 0xcc, 0xbc),
+            lamp_dim: rgb(0x38, 0x3c, 0x42),
             border: rgb(0x33, 0x33, 0x33),
             cta_bg: rgb(0x31, 0x38, 0x44),
             cta_bg_hover: rgb(0x3d, 0x44, 0x50),

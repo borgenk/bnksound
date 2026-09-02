@@ -71,17 +71,26 @@ fn stream(
 }
 
 /// The mixer as it looks in a screenshot: real device names and two
-/// applications playing something.
+/// applications playing something. One of them is pinned to the speakers, so
+/// the frame carries a target pin in each of its two states.
 pub fn showcase() -> state::App {
     let mut app = devices();
-    for (id, app_id, name, volume, muted) in [
-        (10, "com.spotify.Client", "Kingdom Hearts", 0.84_f32, false),
-        (11, "org.mozilla.firefox", "Firefox", 0.55, true),
+    for (id, app_id, name, volume, muted, target) in [
+        (
+            10,
+            "com.spotify.Client",
+            "Kingdom Hearts",
+            0.84_f32,
+            false,
+            Some("node.2"),
+        ),
+        (11, "org.mozilla.firefox", "Firefox", 0.55, true, None),
     ] {
         let mut s = stream(id, StreamKind::Application, name, None, volume, false);
         s.app_id = Some(app_id.to_string());
         s.media_name = Some(name.to_string());
         s.muted = muted;
+        s.target_sink_name = target.map(str::to_string);
         app.streams.insert(id, s);
     }
     app
