@@ -2,6 +2,7 @@
 	install-assets run test check bump \
 	build-native build-native-release run-native \
 	build-gtk build-gtk-release run-gtk test-matrix tables perf perf-save frame \
+	screenshot \
 	test-compositor
 
 # The toolchain is nightly (rust-toolchain.toml) and .cargo/config.toml builds
@@ -85,6 +86,9 @@ perf-save:
 # Pass a path, width, and height: make frame ARGS="out.png 800 900"
 frame:
 	cargo run --features dev -- --render-frame $(ARGS)
+
+screenshot:
+	cargo run --features dev -- --render-frame assets/screenshot.png 518 292
 
 # The Wayland protocol code against real compositors: headless weston, labwc
 # and cage, each running the shipped window through --probe. Ignored by default

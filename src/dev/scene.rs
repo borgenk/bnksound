@@ -75,26 +75,53 @@ fn stream(
 /// the frame carries a target pin in each of its two states.
 pub fn showcase() -> state::App {
     let mut app = devices();
-    for (id, app_id, name, volume, muted, target) in [
+    for (id, app_id, binary, name, volume, muted, target) in [
         (
             10,
             "com.spotify.Client",
+            "spotify",
             "Kingdom Hearts",
             0.84_f32,
             false,
             Some("node.2"),
         ),
-        (11, "org.mozilla.firefox", "Firefox", 0.55, true, None),
+        (
+            11,
+            "com.google.Chrome",
+            "google-chrome",
+            "Google Chrome",
+            0.55,
+            true,
+            None,
+        ),
     ] {
         let mut s = stream(id, StreamKind::Application, name, None, volume, false);
         s.app_id = Some(app_id.to_string());
+        s.binary = Some(binary.to_string());
         s.media_name = Some(name.to_string());
         s.muted = muted;
         s.target_sink_name = target.map(str::to_string);
+        // The same lookup a live stream takes, so a machine without the app
+        // installed draws the fallback initial.
+        s.icon_path = crate::xdg::icon_for(&crate::xdg::Hints {
+            app_id: s.app_id.as_deref(),
+            binary: s.binary.as_deref(),
+            ..Default::default()
+        });
         app.streams.insert(id, s);
     }
+    // Outputs and applications, the sections a mixer screenshot is about.
+    app.section_filter.inputs = false;
     app
 }
+
+/// Peaks for [`showcase`], per node id, on the linear scale the peak stream
+/// reports. Only the microphone and the playing song carry one.
+pub const SHOWCASE_PEAKS: [(u32, [f32; 2]); 3] = [
+    (2, [0.089, 0.072]),
+    (3, [0.022, 0.018]),
+    (10, [0.126, 0.089]),
+];
 
 /// The devices plus `apps` application streams, each its own application, so the
 /// row count is exactly what was asked for.

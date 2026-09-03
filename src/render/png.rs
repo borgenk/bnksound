@@ -1,6 +1,7 @@
 //! PNG encoding for screenshots.
 //!
-//! Frames are ARGB8888 words with an opaque alpha, so they go out as 8-bit RGB.
+//! Frames are ARGB8888 words, encoded as 8-bit RGB or, where the alpha carries
+//! something, as 8-bit RGBA.
 //! The zlib stream uses deflate's fixed Huffman codes over an LZ77 pass, which
 //! is a large win on a flat UI (long runs of one colour) for a small amount of
 //! code, and needs no code-length table in the output.
@@ -9,15 +10,24 @@ const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
 /// Encode `pixels` (row-major, `width` words per row) as an 8-bit RGB PNG.
 pub fn encode_rgb(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
-    let raw = scanlines(pixels, width, height);
+    encode(pixels, width, height, false)
+}
+
+/// Encode `pixels` as an 8-bit RGBA PNG, keeping each word's alpha.
+pub fn encode_rgba(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
+    encode(pixels, width, height, true)
+}
+
+fn encode(pixels: &[u32], width: u32, height: u32, alpha: bool) -> Vec<u8> {
+    let raw = scanlines(pixels, width, height, alpha);
     let mut out = Vec::from(SIGNATURE);
 
     let mut ihdr = Vec::with_capacity(13);
     ihdr.extend_from_slice(&width.to_be_bytes());
     ihdr.extend_from_slice(&height.to_be_bytes());
-    // 8 bits per sample, color type 2 (truecolor), no compression/filter/
-    // interlace variation beyond the one PNG defines.
-    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    // 8 bits per sample, color type 2 (truecolor) or 6 (with alpha), no
+    // compression/filter/interlace variation beyond the one PNG defines.
+    ihdr.extend_from_slice(&[8, if alpha { 6 } else { 2 }, 0, 0, 0]);
     chunk(&mut out, b"IHDR", &ihdr);
     chunk(&mut out, b"IDAT", &zlib(&raw));
     chunk(&mut out, b"IEND", &[]);
@@ -25,9 +35,10 @@ pub fn encode_rgb(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
 }
 
 /// The raw PNG image data: every row prefixed with filter type 0 (none).
-fn scanlines(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
+fn scanlines(pixels: &[u32], width: u32, height: u32, alpha: bool) -> Vec<u8> {
     let (w, h) = (width as usize, height as usize);
-    let mut raw = Vec::with_capacity(h * (1 + w * 3));
+    let samples = if alpha { 4 } else { 3 };
+    let mut raw = Vec::with_capacity(h * (1 + w * samples));
     for y in 0..h {
         raw.push(0);
         for x in 0..w {
@@ -35,6 +46,9 @@ fn scanlines(pixels: &[u32], width: u32, height: u32) -> Vec<u8> {
             raw.push((px >> 16) as u8);
             raw.push((px >> 8) as u8);
             raw.push(px as u8);
+            if alpha {
+                raw.push((px >> 24) as u8);
+            }
         }
     }
     raw
@@ -334,12 +348,16 @@ mod tests {
         assert_eq!(back.pixels, pixels, "every pixel round-trips");
     }
 
-    /// The reference screenshot is a real deflate-compressed PNG with dynamic
-    /// Huffman blocks and per-row filters, which is what exercises inflate.
+    /// A PNG another encoder wrote: dynamic Huffman blocks and per-row filters,
+    /// neither of which this module emits, so it is what exercises inflate and
+    /// the unfilter step.
     #[test]
-    fn the_reference_screenshot_decodes() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/screenshot.png");
-        let bytes = std::fs::read(path).expect("reference screenshot");
+    fn a_foreign_png_decodes() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/dynamic-huffman.png"
+        );
+        let bytes = std::fs::read(path).expect("decoder fixture");
         let img = decode(&bytes).expect("decode reference");
         assert_eq!(img.pixels.len(), (img.width * img.height) as usize);
         assert!(img.width > 100 && img.height > 100, "a real image");

@@ -24,6 +24,38 @@ use crate::ui::layout;
 use crate::ui::theme::Palette;
 use crate::view::snapshot::build_snapshot;
 
+const CORNER_RADIUS: f32 = 4.0;
+
+/// Fade the alpha outside the rounded rectangle. Coverage comes from the
+/// distance to the corner's circle, which keeps the curve smooth.
+fn round_corners(pixels: &mut [u32], width: u32, height: u32, radius: f32) {
+    if radius < 1.0 {
+        return;
+    }
+    let (w, h) = (width as f32, height as f32);
+    let span = radius.ceil() as u32;
+    for y in 0..height {
+        if y >= span && y < height - span {
+            continue;
+        }
+        for x in 0..width {
+            if x >= span && x < width - span {
+                continue;
+            }
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            // How far past the corner circle the pixel sits.
+            let dx = (radius - px).max(px - (w - radius)).max(0.0);
+            let dy = (radius - py).max(py - (h - radius)).max(0.0);
+            let cover = (0.5 - (dx.hypot(dy) - radius)).clamp(0.0, 1.0);
+            let Some(slot) = pixels.get_mut((y * width + x) as usize) else {
+                continue;
+            };
+            let alpha = ((*slot >> 24) as f32 * cover).round() as u32;
+            *slot = (alpha << 24) | (*slot & 0x00ff_ffff);
+        }
+    }
+}
+
 /// Paint one frame of the showcase mixer and write it out as a PNG.
 pub fn run(args: &[String]) -> Result<()> {
     let mut rest = args.iter().skip_while(|a| *a != "--render-frame").skip(1);
@@ -38,7 +70,14 @@ pub fn run(args: &[String]) -> Result<()> {
     let font = Font::load()?;
     let app = scene::showcase();
     let snapshot = build_snapshot(&app, |_| None);
-    let ui = UiState::new();
+    // Meter levels are session state, not stream state, so the fixture's peaks
+    // are folded in here.
+    let mut ui = UiState::new();
+    for (node, peaks) in scene::SHOWCASE_PEAKS {
+        for row in snapshot.meter_routes.get(&node).into_iter().flatten() {
+            ui.meters.apply(row, &peaks);
+        }
+    }
     let layout = layout::project(&snapshot, &ui, Rect::new(0, 0, width, height));
 
     // The window is measured in logical pixels and the buffer in device ones,
@@ -62,7 +101,11 @@ pub fn run(args: &[String]) -> Result<()> {
         );
     }
 
-    std::fs::write(&path, png::encode_rgb(buffer.pixels(), dev_w, dev_h))?;
+    {
+        let (pixels, w, h) = buffer.parts();
+        round_corners(pixels, w, h, CORNER_RADIUS * scale);
+    }
+    std::fs::write(&path, png::encode_rgba(buffer.pixels(), dev_w, dev_h))?;
     println!("wrote {path} ({dev_w}x{dev_h} at scale {scale})");
     Ok(())
 }
