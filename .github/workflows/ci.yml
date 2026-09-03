@@ -5,9 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # The toolchain is nightly and floats, so a lint that did not exist yesterday
-  # can fail a build nobody touched. Monday morning is a better time to find
-  # that than the moment a tag goes out.
+  # Weekly, to catch drift in the Flatpak runtime and the installed packages.
   schedule:
     - cron: "0 6 * * 1"
 
@@ -47,10 +45,9 @@ jobs:
             clang \
             libclang-dev
 
+      # rust-toolchain.toml pins the nightly and the components it needs.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt, clippy, rust-src
+        run: rustup toolchain install
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -115,10 +112,9 @@ jobs:
             clang \
             libclang-dev
 
+      # rust-toolchain.toml pins the nightly and the components it needs.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: clippy, rust-src
+        run: rustup toolchain install
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

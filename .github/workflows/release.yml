@@ -109,12 +109,9 @@ jobs:
             clang \
             libclang-dev
 
-      # Nightly, with the standard library source: rust-toolchain.toml pins the
-      # channel and .cargo/config.toml builds std from source with the app.
+      # rust-toolchain.toml pins the nightly and the components it needs.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
+        run: rustup toolchain install
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
