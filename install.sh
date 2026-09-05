@@ -16,37 +16,101 @@ set -eu
 REPO="borgenk/bnksound"
 APP_ID="io.github.borgenk.BnkSound"
 
-# Check a download against the sha256 published beside it. A mismatch stops the
-# install; anything else that goes wrong only warns, since a release from before
-# checksums existed, or a machine with no digest tool, should still install.
+# A path as an Exec field. Percent is the field-code escape, so it doubles, and
+# a path holding anything the spec reserves has to be quoted.
+desktop_exec() {
+    path="$(printf '%s' "$1" | sed 's/%/%%/g')"
+    case "$path" in
+        *[!A-Za-z0-9/._+-]*)
+            printf '"%s"' "$(printf '%s' "$path" | sed 's/[\\"`$]/\\&/g')"
+            ;;
+        *)
+            printf '%s' "$path"
+            ;;
+    esac
+}
+
+# Copy the desktop entry with Exec naming the binary by absolute path. A
+# launcher resolves a bare name against the session's PATH, which need not
+# carry ~/.local/bin.
+write_desktop_entry() {
+    src="$1"
+    dest="$2"
+    field="$(desktop_exec "$3")"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            Exec=*) printf '%s\n' "Exec=$field" ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done < "$src" > "$dest"
+}
+
+# Pick the downloader. Both handle file:// URLs, which is what lets the
+# installer test drive this path with no network.
+select_fetch() {
+    if command -v curl > /dev/null 2>&1; then
+        fetch() { curl -fsSL "$1" -o "$2"; }
+        fetch_stdout() { curl -fsSL "$1"; }
+    elif command -v wget > /dev/null 2>&1; then
+        fetch() { wget -q "$1" -O "$2"; }
+        fetch_stdout() { wget -q "$1" -O -; }
+    else
+        echo "Error: curl or wget is required"
+        return 1
+    fi
+}
+
+# The download's sha256, or non-zero when the machine has nothing to compute it
+# with.
+sha256_of() {
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum > /dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    elif command -v openssl > /dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
+# Check a download against the sha256 published beside it, and refuse when that
+# cannot be done: a checksum that will not download and a machine with no digest
+# tool look the same as a tampered release.
 verify_checksum() {
     file="$1"
     sums_url="$2"
 
+    if [ "${BNKSOUND_SKIP_CHECKSUM:-}" = "1" ]; then
+        echo "Warning: BNKSOUND_SKIP_CHECKSUM=1, installing a download nothing has checked"
+        return 0
+    fi
+
+    if ! actual="$(sha256_of "$file")"; then
+        echo "Error: verifying the download needs sha256sum, shasum or openssl"
+        echo "  install one, or set BNKSOUND_SKIP_CHECKSUM=1 to install unverified"
+        return 1
+    fi
+
     if ! fetch "$sums_url" "$file.sha256" 2> /dev/null; then
-        echo "Note: this release publishes no checksum, skipping verification"
-        return 0
+        echo "Error: cannot download the checksum for this release"
+        echo "  $sums_url"
+        echo "  set BNKSOUND_SKIP_CHECKSUM=1 to install unverified"
+        return 1
     fi
 
-    if command -v sha256sum > /dev/null 2>&1; then
-        actual="$(sha256sum "$file" | cut -d' ' -f1)"
-    elif command -v shasum > /dev/null 2>&1; then
-        actual="$(shasum -a 256 "$file" | cut -d' ' -f1)"
-    elif command -v openssl > /dev/null 2>&1; then
-        actual="$(openssl dgst -sha256 "$file" | awk '{print $NF}')"
-    else
-        echo "Note: no sha256 tool found, skipping verification"
-        return 0
-    fi
-
-    # The published file is `sha256sum` output, so the digest is its first field.
+    # The published file is sha256sum output, so the digest is its first field.
     expected="$(cut -d' ' -f1 < "$file.sha256")"
+    if [ "${#expected}" -ne 64 ] || [ -n "$(printf '%s' "$expected" | tr -d '0-9a-fA-F')" ]; then
+        echo "Error: the published checksum is not a sha256 digest, refusing to install"
+        return 1
+    fi
 
     if [ "$expected" != "$actual" ]; then
         echo "Error: checksum mismatch, refusing to install"
         echo "  expected: $expected"
         echo "  actual:   $actual"
-        exit 1
+        return 1
     fi
 
     echo "Checksum verified"
@@ -96,16 +160,7 @@ main() {
             ;;
     esac
 
-    if command -v curl > /dev/null 2>&1; then
-        fetch() { curl -fsSL "$1" -o "$2"; }
-        fetch_stdout() { curl -fsSL "$1"; }
-    elif command -v wget > /dev/null 2>&1; then
-        fetch() { wget -q "$1" -O "$2"; }
-        fetch_stdout() { wget -q "$1" -O -; }
-    else
-        echo "Error: curl or wget is required"
-        exit 1
-    fi
+    select_fetch || exit 1
 
     if [ -n "${BNKSOUND_VERSION:-}" ]; then
         VERSION="$BNKSOUND_VERSION"
@@ -141,7 +196,7 @@ main() {
         exit 1
     fi
 
-    verify_checksum "$TMP_DIR/$FILENAME" "${URL}.sha256"
+    verify_checksum "$TMP_DIR/$FILENAME" "${URL}.sha256" || exit 1
 
     echo "Extracting..."
     tar -xzf "$TMP_DIR/$FILENAME" -C "$TMP_DIR"
@@ -181,7 +236,8 @@ main() {
     ICONS_DIR="$DATA_HOME/icons/hicolor"
     if [ -f "$TMP_DIR/${APP_ID}.desktop" ]; then
         mkdir -p "$APPS_DIR"
-        cp "$TMP_DIR/${APP_ID}.desktop" "$APPS_DIR/${APP_ID}.desktop"
+        write_desktop_entry "$TMP_DIR/${APP_ID}.desktop" \
+            "$APPS_DIR/${APP_ID}.desktop" "$INSTALL_DIR/bnksound"
         update-desktop-database "$APPS_DIR" > /dev/null 2>&1 || true
     fi
     if [ -d "$TMP_DIR/icons/hicolor" ]; then
@@ -212,4 +268,7 @@ main() {
     fi
 }
 
-main "$@"
+# Sourced as a library by the Makefile and the installer test, run otherwise.
+if [ "${BNKSOUND_INSTALL_LIB:-}" != "1" ]; then
+    main "$@"
+fi

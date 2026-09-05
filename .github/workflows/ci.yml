@@ -13,23 +13,20 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
 
+# Actions are pinned to a commit, with the version beside it.
 jobs:
-  # The shipping binary. GTK is deliberately not installed here: if anything in
-  # the shared code starts reaching for the GTK stack, this job stops building,
-  # which is the whole point of keeping the default feature set empty.
+  # GTK is deliberately not installed here: if the shared code starts reaching
+  # for the GTK stack, this job stops building.
   native:
     name: Native (no GTK)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # pipewire and libspa link against the PipeWire dev packages; libspa-sys
-      # runs bindgen at build time, which needs libclang. Text and keyboard
-      # handling link freetype, fontconfig, harfbuzz, and xkbcommon directly.
-      # The emoji tests skip themselves when no colour emoji font is installed,
-      # so fonts-noto-color-emoji is what makes them actually run here.
+      # libspa-sys runs bindgen, which needs libclang. The emoji tests skip
+      # themselves unless a colour emoji font is installed.
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -45,15 +42,17 @@ jobs:
             clang \
             libclang-dev
 
-      # rust-toolchain.toml pins the nightly and the components it needs.
       - name: Install Rust toolchain
         run: rustup toolchain install
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: make fmt-check
+
+      - name: Test the installer and the ABI floor
+        run: make test-install test-abi
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -64,17 +63,10 @@ jobs:
       - name: Test
         run: cargo test
 
-      # A GTK-free binary should link no GTK, GDK, GLib, or Pango of its own, so
-      # check the artifact rather than trusting the feature flags. The test is
-      # the binary's own DT_NEEDED list: those are the libraries bnksound asks
-      # for. What those libraries then pull in is theirs to choose, and one of
-      # them does pull GLib: HarfBuzz is built with GLib support on the usual
-      # distributions, so libglib loads behind it whatever we ask for. Hence the
-      # whole ldd closure is printed for the record but not gated on.
-      # .cargo/config.toml names a target, so artifacts live under the triple
-      # rather than straight in target/. Missing the binary is its own error:
-      # readelf on a path that does not exist reads as a linkage failure
-      # otherwise.
+      # The check is the binary's own DT_NEEDED list, not the ldd closure:
+      # HarfBuzz is built with GLib support on the usual distributions, so
+      # libglib loads behind it whatever bnksound asks for. The closure is
+      # printed for the record.
       - name: Assert the binary links no GTK stack
         run: |
           bin=target/x86_64-unknown-linux-gnu/debug/bnksound
@@ -96,7 +88,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install system dependencies
         run: |
@@ -112,12 +104,11 @@ jobs:
             clang \
             libclang-dev
 
-      # rust-toolchain.toml pins the nightly and the components it needs.
       - name: Install Rust toolchain
         run: rustup toolchain install
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -128,47 +119,37 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
-  # The Flatpak, built from the manifest that ships. Nothing else exercises
-  # cargo-sources.json, so a dependency added without regenerating it surfaces
-  # here and only here: the manifest builds with `cargo --offline --locked`,
-  # which fails on a crate the vendored sources do not carry. Regenerate with
-  # flatpak-cargo-generator.py against Cargo.lock when that happens.
-  #
-  # The image carries the tooling and the GNOME 50 runtime the manifest builds
-  # against, so flatpak-builder only fetches the two SDK extensions from
-  # Flathub. The container is privileged because bwrap needs user namespaces
-  # the runner does not otherwise hand out.
+  # Nothing else exercises cargo-sources.json: the manifest builds offline and
+  # locked, so a dependency added without regenerating it fails here and only
+  # here. Regenerate with flatpak-cargo-generator.py against Cargo.lock.
+  # Privileged because bwrap needs user namespaces the runner does not grant.
   flatpak:
     name: Flatpak
     runs-on: ubuntu-latest
-    # Longer than the cargo jobs: the SDK extensions download before any code
-    # compiles, and the release profile links with LTO afterwards.
+    # Longer than the cargo jobs: SDK extensions download, then an LTO build.
     timeout-minutes: 45
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:1fb2df10a57276f90806e1f35454048e30bf1855b7b4ff4808c9ee55887bd852 # gnome-50
       options: --privileged
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build
-        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
         with:
           manifest-path: io.github.borgenk.BnkSound.yml
           bundle: bnksound.flatpak
-          # The manifest copies the checkout in as a source and skips the two
-          # names below, so the build cannot fold its own output back into the
-          # app. The action's defaults (flatpak_app, repo) are not on that list.
+          # The manifest skips these two names, so the build cannot fold its
+          # own output back into the app. The action's defaults are not.
           build-dir: build-dir
           repo-dir: flatpak-repo
-          # The action's only restore-key is the literal prefix
-          # "flatpak-builder-<arch>", so a key without it never falls back to
-          # the previous run and every build re-downloads all of crates.io.
+          # The action's only restore-key is the prefix flatpak-builder-<arch>,
+          # so a key without it re-downloads all of crates.io every build.
           cache-key: flatpak-builder-${{ github.sha }}
 
-      # The manifest builds bnksound-gtk and installs it under the plain name,
-      # so what the app holds is only visible in the binary's own linkage. The
-      # undecorated build links no part of the GTK stack.
+      # The manifest installs bnksound-gtk under the plain name, so only the
+      # linkage says which build is inside.
       - name: Verify the app holds the GTK build
         run: |
           if ! grep -aq 'libgtk-4\.so' build-dir/files/bin/bnksound; then
@@ -176,15 +157,9 @@ jobs:
             exit 1
           fi
 
-      # Flathub's linter, which the image already carries. Its rules are
-      # Flathub's submission policy rather than a claim about whether the app
-      # works, and a few of them land on choices made deliberately: the host
-      # read access the row labels need, and being Wayland-only. Those are in
-      # flatpak-lint-allowed.json with their reasons. Every other error fails,
-      # and so does an accepted one that stopped being reported.
-      #
-      # The linter exits non-zero whenever it reports anything, so its own
-      # status says only that the file has content.
+      # The accepted errors and their reasons are in flatpak-lint-allowed.json.
+      # Every other error fails, and so does an accepted one that stopped being
+      # reported. The linter exits non-zero whenever it reports anything.
       - name: Lint against Flathub's rules
         run: |
           out="${RUNNER_TEMP:-/tmp}"

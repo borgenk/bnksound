@@ -11,18 +11,15 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Actions are pinned to a commit, with the version beside it.
 jobs:
-  # The release tarballs are named from the Cargo.toml version, and install.sh
-  # fetches them by the release tag. A mismatch would publish assets the
-  # installer cannot find, so both build jobs wait on this one rather than
-  # finding out after a Flatpak build.
   version:
     name: Verify tag matches Cargo.toml version
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Compare tag against Cargo.toml
         run: |
@@ -32,67 +29,16 @@ jobs:
             exit 1
           fi
 
-  # The Flatpak bundle, from the manifest CI builds on every push. A job of its
-  # own for the flatpak tooling and the GNOME runtime the image carries. The
-  # container is privileged because bwrap needs user namespaces the runner does
-  # not otherwise hand out.
-  flatpak:
-    name: Flatpak bundle
+  # CI does not run on tags, so the gate runs here before anything is built.
+  gate:
+    name: Gate
     needs: version
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
-      options: --privileged
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Build
-        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
-        with:
-          manifest-path: io.github.borgenk.BnkSound.yml
-          bundle: bnksound-${{ github.ref_name }}-x86_64.flatpak
-          # The manifest copies the checkout in as a source and skips the two
-          # names below, so the build cannot fold its own output back into the
-          # app. The action's defaults (flatpak_app, repo) are not on that list.
-          build-dir: build-dir
-          repo-dir: flatpak-repo
-          # What ships is built from the checkout and nothing else.
-          cache: false
-          # The action derives its artifact name from the bundle name. The
-          # bundle goes up below instead, under a name the publish job can ask
-          # for without knowing how the bundle is named.
-          upload-artifact: false
-
-      # The tarballs get the same treatment further down, and for the same
-      # reason: the binary is installed under the plain name, so its own
-      # linkage is what says which of the two builds is inside.
-      - name: Verify the bundle holds the GTK build
-        run: |
-          if ! grep -aq 'libgtk-4\.so' build-dir/files/bin/bnksound; then
-            echo "::error::the Flatpak's bnksound does not link GTK"
-            exit 1
-          fi
-
-      - name: Hand the bundle to the publish job
-        uses: actions/upload-artifact@v7
-        with:
-          name: flatpak-bundle
-          path: bnksound-${{ github.ref_name }}-x86_64.flatpak
-          if-no-files-found: error
-
-  release:
-    name: Build and publish
-    needs: [version, flatpak]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Both variants are built here, so this is the union of what each needs:
-      # the GTK packages for the binary that ships, the rest for both.
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -106,23 +52,115 @@ jobs:
             libfontconfig1-dev \
             libharfbuzz-dev \
             libxkbcommon-dev \
+            fonts-noto-color-emoji \
             clang \
             libclang-dev
 
-      # rust-toolchain.toml pins the nightly and the components it needs.
       - name: Install Rust toolchain
         run: rustup toolchain install
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      # One archive per variant, each holding its binary as bnksound.
+      - name: Check
+        run: make check
+
+  # Privileged because bwrap needs user namespaces the runner does not grant.
+  flatpak:
+    name: Flatpak bundle
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:1fb2df10a57276f90806e1f35454048e30bf1855b7b4ff4808c9ee55887bd852 # gnome-50
+      options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build
+        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
+        with:
+          manifest-path: io.github.borgenk.BnkSound.yml
+          bundle: bnksound-${{ github.ref_name }}-x86_64.flatpak
+          # The manifest skips these two names, so the build cannot fold its
+          # own output back into the app. The action's defaults are not.
+          build-dir: build-dir
+          repo-dir: flatpak-repo
+          # What ships is built from the checkout and nothing else.
+          cache: false
+          # The action names its artifact from the bundle. The bundle goes up
+          # below, under a name the publish job can ask for.
+          upload-artifact: false
+
+      # The binary is installed under the plain name, so only the linkage says
+      # which build is inside.
+      - name: Verify the bundle holds the GTK build
+        run: |
+          if ! grep -aq 'libgtk-4\.so' build-dir/files/bin/bnksound; then
+            echo "::error::the Flatpak's bnksound does not link GTK"
+            exit 1
+          fi
+
+      - name: Hand the bundle to the publish job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flatpak-bundle
+          path: bnksound-${{ github.ref_name }}-x86_64.flatpak
+          if-no-files-found: error
+
+  release:
+    name: Build and publish
+    needs: [gate, flatpak]
+    runs-on: ubuntu-latest
+    # The tarballs take their glibc and system libraries from whatever builds
+    # them, so they are built in the oldest distribution they run on.
+    container: debian:12
+    timeout-minutes: 30
+    steps:
+      # Ahead of the checkout, so the action has git to clone with. The list is
+      # the union of what both variants need and what the image lacks.
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            make \
+            pkg-config \
+            libgtk-4-dev \
+            libwayland-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libharfbuzz-dev \
+            libxkbcommon-dev \
+            clang \
+            libclang-dev
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" toolchain install
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
       - name: Build release tarballs
         run: make build-linux
 
-      # install.sh picks an archive by name and trusts the binary inside it, so
-      # check that each archive holds the build its name claims. The GTK one
-      # must link GTK, the undecorated one must link no part of that stack.
+      # install.sh picks an archive by name and trusts the binary inside, so
+      # check that each archive holds the build its name claims.
       - name: Verify each archive holds the build it claims
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
@@ -142,15 +180,13 @@ jobs:
             exit 1
           fi
 
-      # Built in the job above, which needs a container the tarballs do not.
       - name: Collect the Flatpak bundle
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: flatpak-bundle
           path: dist
 
-      # make build-linux writes one of these per tarball; the bundle arrives
-      # without one.
+      # make build-linux writes one per tarball; the bundle arrives without one.
       - name: Checksum the Flatpak bundle
         run: |
           cd dist
@@ -159,7 +195,7 @@ jobs:
           done
 
       - name: Publish to GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             dist/*.tar.gz

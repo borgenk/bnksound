@@ -1,29 +1,26 @@
-.PHONY: fmt clippy build build-release build-linux install install-gtk \
+.PHONY: fmt fmt-check clippy build build-release build-linux install install-gtk \
 	install-assets run test check bump \
 	build-native build-native-release run-native \
 	build-gtk build-gtk-release run-gtk test-matrix tables perf perf-save frame \
-	screenshot \
+	screenshot test-install test-abi \
 	test-compositor
 
-# The toolchain is nightly (rust-toolchain.toml) and .cargo/config.toml builds
-# the standard library from source alongside the app. Release binaries come out
-# around a third smaller than a stable build and paint a few percent faster,
-# because LTO reaches std and release panics abort where they happen instead of
-# unwinding through a formatter. The cost is that a release panic prints
-# nothing at all. Debug builds and the test harness are untouched: the panic
-# strategy is set on the release profile only.
 APP_NAME := bnksound
 APP_ID := io.github.borgenk.BnkSound
 VERSION := $(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 LINUX_TARGET := x86_64-unknown-linux-gnu
-# Everything lands under the target triple, since .cargo/config.toml names one.
+GLIBC_FLOOR := 2.34
 BUILD_PATH := target/$(LINUX_TARGET)/release
-BIN_DIR := ~/.local/bin
-APPS_DIR := ~/.local/share/applications
-ICON_DIR := ~/.local/share/icons/hicolor
+# Absolute, since the installed desktop entry names the binary by full path.
+BIN_DIR := $(HOME)/.local/bin
+APPS_DIR := $(HOME)/.local/share/applications
+ICON_DIR := $(HOME)/.local/share/icons/hicolor
 
 fmt:
 	cargo fmt --all
+
+fmt-check:
+	cargo fmt --all -- --check
 
 clippy:
 	cargo clippy --all --benches --tests --examples --all-features -- -D warnings
@@ -35,10 +32,8 @@ build-release:
 	cargo build --release
 
 # --- Native / GTK build matrix ----------------------------------------------
-# Two binaries, both painting through the same software renderer:
 #   bnksound      the default, GTK-free Wayland app
-#   bnksound-gtk  opt-in, GTK owns the window (built with --features gtk)
-# The plain build/test/run targets above are the native one.
+#   bnksound-gtk  opt-in, GTK owns the window
 build-native:
 	cargo build --bin bnksound
 build-native-release:
@@ -46,7 +41,6 @@ build-native-release:
 run-native:
 	cargo run --bin bnksound
 
-# The GTK variant. Its binary is bnksound-gtk, gated behind the gtk feature.
 build-gtk:
 	cargo build --features gtk --bin bnksound-gtk
 build-gtk-release:
@@ -54,31 +48,27 @@ build-gtk-release:
 run-gtk:
 	cargo run --features gtk --bin bnksound-gtk
 
-# Both feature sets, which is what CI gates on: the native build must stay
-# GTK-free and the GTK build must keep working.
+# Both feature sets, which is what CI gates on.
 test-matrix:
 	cargo test
 	cargo test --features gtk
 
 # --- Development tooling (src/dev/) ------------------------------------------
-# All of it hangs off flags on the native binary, behind the `dev` feature, so
+# All of it hangs off flags on the native binary, behind the dev feature, so
 # the shipping build carries none of it.
 
-# Regenerate the Unicode grapheme tables from the data vendored in ucd/. Pure,
-# offline, and deterministic: on an unchanged ucd/ this rewrites the committed
-# file with identical bytes.
+# Regenerate the Unicode grapheme tables from the data vendored in ucd/.
+# Deterministic: an unchanged ucd/ rewrites the committed file byte for byte.
 tables:
 	cargo run --features dev -- --gen-tables
 
-# Time the hot paths and compare against perf/baseline.txt, failing on a
-# regression. Release only: a debug build measures the wrong program. The
-# allocator that counts allocations comes in with perf-alloc. Not run in CI,
-# where a shared runner's timings say more about the runner than the code.
+# Time the hot paths against perf/baseline.txt, failing on a regression.
+# Release only: a debug build measures the wrong program. Not run in CI, where a
+# shared runner's timings say more about the runner than the code.
 perf:
 	cargo run --release --features perf-alloc -- --perf
 
-# Accept the current numbers as the new baseline, to be committed with whatever
-# change moved them.
+# Accept the current numbers as the new baseline.
 perf-save:
 	cargo run --release --features perf-alloc -- --perf --save
 
@@ -90,19 +80,21 @@ frame:
 screenshot:
 	cargo run --features dev -- --render-frame assets/screenshot.png 518 292
 
-# The Wayland protocol code against real compositors: headless weston, labwc
-# and cage, each running the shipped window through --probe. Ignored by default
-# so a machine without those three still passes cargo test, and serial because
-# every test boots a compositor. Not run in CI, which has no compositor at all.
+# The installer's desktop entry and checksums, with no network.
+test-install:
+	sh .github/scripts/test-install.sh
+
+# The ABI floor check, against binaries this machine already has.
+test-abi:
+	sh .github/scripts/test-abi.sh
+
+# The Wayland protocol code against real compositors: headless weston, labwc and
+# cage. Ignored by default, and serial, since every test boots a compositor.
 test-compositor:
 	cargo test --features dev --test compositor -- --ignored --test-threads=1
 
 # Install the release binary, desktop entry, and icons under ~/.local, the same
-# per-user location install.sh uses.
-#
-# Either variant installs as bnksound and the two overwrite each other, so the
-# desktop entry and the command are the same whichever you picked. The -gtk
-# suffix exists only in target/, where cargo needs two names.
+# per-user location install.sh uses. Either variant installs as bnksound.
 install: build-release install-assets
 	install -Dm755 $(BUILD_PATH)/$(APP_NAME) $(BIN_DIR)/$(APP_NAME)
 	@echo "Installed the native $(APP_NAME) to ~/.local/bin/"
@@ -111,11 +103,12 @@ install-gtk: build-gtk-release install-assets
 	install -Dm755 $(BUILD_PATH)/$(APP_NAME)-gtk $(BIN_DIR)/$(APP_NAME)
 	@echo "Installed the GTK $(APP_NAME) to ~/.local/bin/"
 
-# Desktop entry and icon theme, the same for both variants since the entry runs
-# bnksound either way.
-# The icon cache / desktop database refreshes are best-effort (ignored if the tools are absent).
+# Desktop entry and icon theme, the same for both variants since both install as
+# bnksound. install.sh writes the entry, so its Exec rule lives in one place.
 install-assets:
-	install -Dm644 assets/$(APP_ID).desktop $(APPS_DIR)/$(APP_ID).desktop
+	@mkdir -p $(APPS_DIR)
+	BNKSOUND_INSTALL_LIB=1 sh -c '. ./install.sh; write_desktop_entry "$$1" "$$2" "$$3"' \
+		sh assets/$(APP_ID).desktop $(APPS_DIR)/$(APP_ID).desktop $(BIN_DIR)/$(APP_NAME)
 	mkdir -p $(ICON_DIR)
 	cp -r assets/icons/hicolor/. $(ICON_DIR)/
 	-gtk-update-icon-cache -f -t $(ICON_DIR)
@@ -123,10 +116,8 @@ install-assets:
 	@echo "Installed desktop file + icons to ~/.local/share/"
 
 # Bump version, commit, and tag: make bump V=0.2.0
-# Pushing the tag triggers the release workflow, which rejects any tag whose
-# name does not match this version, so the two stay in lockstep. The metainfo
-# gets an entry of the same version, dated today, because that list is what the
-# Flatpak reports as its release history.
+# The release workflow rejects a tag that does not match this version. The
+# metainfo entry is what the Flatpak reports as its release history.
 bump:
 	@test -n "$(V)" || (echo "Current: $(VERSION). Usage: make bump V=0.2.0" && exit 1)
 	sed -i '0,/^version = ".*"/{s//version = "$(V)"/}' Cargo.toml
@@ -137,17 +128,10 @@ bump:
 	git tag "v$(V)"
 	@echo "Bumped to v$(V). Push with: git push origin main --tags"
 
-# Build the release tarballs into dist/ for upload to a GitHub Release.
-#
-# One archive per variant, so a download carries the build it is for and not
-# both. Each holds its binary under the plain name bnksound, alongside the same
-# desktop entry and icon tree, which is why the staging tree is built once and
-# only the binary swapped. The GTK archive keeps the unsuffixed name it has
-# always had, so an installer from before the split still resolves it.
-#
-# Each archive ships with a sha256 beside it, which install.sh checks before it
-# unpacks anything. The digest names the bare file, so `sha256sum -c` works by
-# hand in dist/ too.
+# Build the release tarballs into dist/ for upload to a GitHub Release. One
+# archive per variant, each holding its binary under the plain name bnksound, so
+# the staging tree is built once and only the binary swapped. The GTK archive
+# keeps the unsuffixed name, which older installers resolve.
 TARBALL_GTK := $(APP_NAME)-v$(VERSION)-$(LINUX_TARGET).tar.gz
 TARBALL_UND := $(APP_NAME)-undecorated-v$(VERSION)-$(LINUX_TARGET).tar.gz
 
@@ -156,6 +140,8 @@ build-linux:
 		cargo build --release --features gtk --bin $(APP_NAME)-gtk
 	RUSTFLAGS="--remap-path-prefix=$(HOME)=[home]" \
 		cargo build --release --bin $(APP_NAME)
+	sh .github/scripts/check-abi.sh $(GLIBC_FLOOR) \
+		$(BUILD_PATH)/$(APP_NAME) $(BUILD_PATH)/$(APP_NAME)-gtk
 	rm -rf dist/stage
 	mkdir -p dist/stage/icons
 	cp assets/$(APP_ID).desktop dist/stage/$(APP_ID).desktop
@@ -176,4 +162,5 @@ run:
 test:
 	cargo test
 
-check: fmt clippy test-matrix
+# The gate. Checks and reports, never rewrites: fmt is the target that edits.
+check: fmt-check clippy test-matrix test-install test-abi

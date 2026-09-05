@@ -13,6 +13,7 @@ _Disclaimer: personal project, built mainly for my own use, partly AI-assisted._
 
 - A Linux desktop running a **Wayland** session
 - **PipeWire** 0.3+ running as the audio server
+- **glibc** 2.34 or newer
 - **GTK4** runtime libraries (optional)
 
 ## Install
