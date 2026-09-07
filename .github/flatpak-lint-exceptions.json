@@ -1,0 +1,9 @@
+{
+  "io.github.borgenk.BnkSound": [
+    "appstream-external-screenshot-url",
+    "appstream-screenshots-not-mirrored-in-ostree",
+    "finish-args-flatpak-system-folder-exports-share-ro-access",
+    "finish-args-only-wayland",
+    "finish-args-unnecessary-xdg-data-flatpak-ro-access"
+  ]
+}

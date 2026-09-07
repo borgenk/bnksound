@@ -3,7 +3,7 @@
 	build-native build-native-release run-native \
 	build-gtk build-gtk-release run-gtk test-matrix tables perf perf-save frame \
 	screenshot test-install test-abi \
-	test-compositor
+	test-compositor flatpak
 
 APP_NAME := bnksound
 APP_ID := io.github.borgenk.BnkSound
@@ -15,6 +15,12 @@ BUILD_PATH := target/$(LINUX_TARGET)/release
 BIN_DIR := $(HOME)/.local/bin
 APPS_DIR := $(HOME)/.local/share/applications
 ICON_DIR := $(HOME)/.local/share/icons/hicolor
+# flatpak-builder usually ships as the org.flatpak.Builder Flatpak. A copy on
+# PATH wins.
+FLATPAK_BUILDER := $(shell command -v flatpak-builder 2>/dev/null || echo "flatpak run org.flatpak.Builder")
+# Where a bundle sends an installer that does not have the runtime. The release
+# workflow's action embeds the same URL by default.
+RUNTIME_REPO := https://flathub.org/repo/flathub.flatpakrepo
 
 fmt:
 	cargo fmt --all
@@ -155,6 +161,15 @@ build-linux:
 	cd dist && sha256sum $(TARBALL_UND) > $(TARBALL_UND).sha256
 	@echo "Built dist/$(TARBALL_GTK) and dist/$(TARBALL_UND), each with a .sha256"
 	@echo "Publish with: gh release create v$(VERSION) dist/$(TARBALL_GTK)* dist/$(TARBALL_UND)*"
+
+# The bundle the release workflow publishes, into dist/.
+flatpak:
+	mkdir -p dist
+	$(FLATPAK_BUILDER) --force-clean --repo=flatpak-repo build-dir $(APP_ID).yml
+	flatpak build-bundle --runtime-repo=$(RUNTIME_REPO) flatpak-repo \
+		dist/$(APP_NAME)-v$(VERSION)-x86_64.flatpak $(APP_ID)
+	@echo "Built dist/$(APP_NAME)-v$(VERSION)-x86_64.flatpak"
+	@echo "Install with: flatpak install --user dist/$(APP_NAME)-v$(VERSION)-x86_64.flatpak"
 
 run:
 	cargo run

@@ -9,7 +9,3 @@ dist/
 .flatpak-builder/
 build-dir/
 flatpak-repo/
-
-# Bytecode from the CI lint helper
-__pycache__/
-*.pyc

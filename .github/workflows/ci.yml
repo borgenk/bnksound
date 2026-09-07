@@ -157,13 +157,11 @@ jobs:
             exit 1
           fi
 
-      # The accepted errors and their reasons are in flatpak-lint-allowed.json.
-      # Every other error fails, and so does an accepted one that stopped being
-      # reported. The linter exits non-zero whenever it reports anything.
+      # The errors this project accepts are in flatpak-lint-exceptions.json,
+      # keyed by app id the way the linter reads them. Every other error fails.
       - name: Lint against Flathub's rules
         run: |
-          out="${RUNNER_TEMP:-/tmp}"
-          flatpak-builder-lint manifest io.github.borgenk.BnkSound.yml > "$out/lint-manifest.json" || true
-          flatpak-builder-lint repo flatpak-repo > "$out/lint-repo.json" || true
-          python3 .github/flatpak-lint-diff.py .github/flatpak-lint-allowed.json \
-            "$out/lint-manifest.json" "$out/lint-repo.json"
+          lint() { flatpak-builder-lint --exceptions \
+            --user-exceptions .github/flatpak-lint-exceptions.json "$@"; }
+          lint manifest io.github.borgenk.BnkSound.yml
+          lint repo flatpak-repo
