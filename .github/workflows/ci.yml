@@ -5,7 +5,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # Weekly, to catch drift in the Flatpak runtime and the installed packages.
   schedule:
     - cron: "0 6 * * 1"
 
@@ -13,10 +12,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
 
-# Actions are pinned to a commit, with the version beside it.
 jobs:
-  # GTK is deliberately not installed here: if the shared code starts reaching
-  # for the GTK stack, this job stops building.
   native:
     name: Native (no GTK)
     runs-on: ubuntu-latest
@@ -25,8 +21,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # libspa-sys runs bindgen, which needs libclang. The emoji tests skip
-      # themselves unless a colour emoji font is installed.
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -63,10 +57,6 @@ jobs:
       - name: Test
         run: cargo test
 
-      # The check is the binary's own DT_NEEDED list, not the ldd closure:
-      # HarfBuzz is built with GLib support on the usual distributions, so
-      # libglib loads behind it whatever bnksound asks for. The closure is
-      # printed for the record.
       - name: Assert the binary links no GTK stack
         run: |
           bin=target/x86_64-unknown-linux-gnu/debug/bnksound
@@ -119,14 +109,9 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
-  # Nothing else exercises cargo-sources.json: the manifest builds offline and
-  # locked, so a dependency added without regenerating it fails here and only
-  # here. Regenerate with flatpak-cargo-generator.py against Cargo.lock.
-  # Privileged because bwrap needs user namespaces the runner does not grant.
   flatpak:
     name: Flatpak
     runs-on: ubuntu-latest
-    # Longer than the cargo jobs: SDK extensions download, then an LTO build.
     timeout-minutes: 45
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:1fb2df10a57276f90806e1f35454048e30bf1855b7b4ff4808c9ee55887bd852 # gnome-50
@@ -140,16 +125,10 @@ jobs:
         with:
           manifest-path: io.github.borgenk.BnkSound.yml
           bundle: bnksound.flatpak
-          # The manifest skips these two names, so the build cannot fold its
-          # own output back into the app. The action's defaults are not.
           build-dir: build-dir
           repo-dir: flatpak-repo
-          # The action's only restore-key is the prefix flatpak-builder-<arch>,
-          # so a key without it re-downloads all of crates.io every build.
           cache-key: flatpak-builder-${{ github.sha }}
 
-      # The manifest installs bnksound-gtk under the plain name, so only the
-      # linkage says which build is inside.
       - name: Verify the app holds the GTK build
         run: |
           if ! grep -aq 'libgtk-4\.so' build-dir/files/bin/bnksound; then
@@ -157,8 +136,6 @@ jobs:
             exit 1
           fi
 
-      # The errors this project accepts are in flatpak-lint-exceptions.json,
-      # keyed by app id the way the linter reads them. Every other error fails.
       - name: Lint against Flathub's rules
         run: |
           lint() { flatpak-builder-lint --exceptions \

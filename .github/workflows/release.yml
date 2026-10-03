@@ -11,7 +11,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-# Actions are pinned to a commit, with the version beside it.
 jobs:
   version:
     name: Verify tag matches Cargo.toml version
@@ -29,7 +28,6 @@ jobs:
             exit 1
           fi
 
-  # CI does not run on tags, so the gate runs here before anything is built.
   gate:
     name: Gate
     needs: version
@@ -65,7 +63,6 @@ jobs:
       - name: Check
         run: make check
 
-  # Privileged because bwrap needs user namespaces the runner does not grant.
   flatpak:
     name: Flatpak bundle
     needs: gate
@@ -83,18 +80,11 @@ jobs:
         with:
           manifest-path: io.github.borgenk.BnkSound.yml
           bundle: bnksound-${{ github.ref_name }}-x86_64.flatpak
-          # The manifest skips these two names, so the build cannot fold its
-          # own output back into the app. The action's defaults are not.
           build-dir: build-dir
           repo-dir: flatpak-repo
-          # What ships is built from the checkout and nothing else.
           cache: false
-          # The action names its artifact from the bundle. The bundle goes up
-          # below, under a name the publish job can ask for.
           upload-artifact: false
 
-      # The binary is installed under the plain name, so only the linkage says
-      # which build is inside.
       - name: Verify the bundle holds the GTK build
         run: |
           if ! grep -aq 'libgtk-4\.so' build-dir/files/bin/bnksound; then
@@ -113,13 +103,10 @@ jobs:
     name: Build and publish
     needs: [gate, flatpak]
     runs-on: ubuntu-latest
-    # The tarballs take their glibc and system libraries from whatever builds
-    # them, so they are built in the oldest distribution they run on.
+    # Build inside Debian 12, so the binaries need no glibc newer than its 2.36.
     container: debian:12
     timeout-minutes: 30
     steps:
-      # Ahead of the checkout, so the action has git to clone with. The list is
-      # the union of what both variants need and what the image lacks.
       - name: Install system dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -159,8 +146,6 @@ jobs:
       - name: Build release tarballs
         run: make build-linux
 
-      # install.sh picks an archive by name and trusts the binary inside, so
-      # check that each archive holds the build its name claims.
       - name: Verify each archive holds the build it claims
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
@@ -186,7 +171,6 @@ jobs:
           name: flatpak-bundle
           path: dist
 
-      # make build-linux writes one per tarball; the bundle arrives without one.
       - name: Checksum the Flatpak bundle
         run: |
           cd dist
