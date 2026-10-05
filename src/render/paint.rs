@@ -275,7 +275,8 @@ fn paint_titlebar(
         (bar.close, HitTarget::WindowClose, palette.danger_bg),
     ];
     for (rect, target, hover_bg) in buttons {
-        if ui.hover.as_ref() == Some(&target) {
+        let hovered = ui.hover.as_ref() == Some(&target);
+        if hovered {
             p.rounded_rect(rect, PICK_RADIUS, hover_bg);
         }
         let fg = palette.text_subtle;
@@ -287,10 +288,15 @@ fn paint_titlebar(
             }
             HitTarget::WindowMaximize if ui.maximized => {
                 // Restore: a square with a second one peeking out behind it.
+                // The front square repaints the button's background, hover wash
+                // included, so the back one's outline stops at its edge.
                 let back = Rect::new(g.x + 3, g.y, g.w - 3, g.h - 3);
                 p.stroke_rect(back, 1, fg);
                 let front = Rect::new(g.x, g.y + 3, g.w - 3, g.h - 3);
                 p.fill(front, palette.titlebar);
+                if hovered {
+                    p.fill(front, hover_bg);
+                }
                 p.stroke_rect(front, 1, fg);
             }
             HitTarget::WindowMaximize => p.stroke_rect(g, 1, fg),
@@ -1997,6 +2003,47 @@ mod tests {
             assert!(
                 last.iter().all(|&px| px == titlebar),
                 "{chrome:?}: the band's last row carries something other than its own colour",
+            );
+        }
+    }
+
+    /// The restore glyph's front square hides the back one behind it, lit or
+    /// not: inside the front square the button shows its own background.
+    #[test]
+    fn the_restore_glyphs_front_square_hides_the_back_one() {
+        use crate::ui::Chrome;
+        let (w, h) = (560, 720);
+        let snap = build_snapshot(&scene(), |_| None);
+        for hovered in [false, true] {
+            let mut ui = UiState::new();
+            ui.chrome = Chrome::Client;
+            ui.maximized = true;
+            ui.hover = hovered.then_some(HitTarget::WindowMaximize);
+            let layout = crate::ui::layout::project(&snap, &ui, Rect::new(0, 0, w, h));
+            let button = layout.titlebar.as_ref().expect("a titlebar").maximize;
+            let mut buf = PixelBuffer::new(w as u32, h as u32);
+            {
+                let mut p = buf.painter();
+                paint_frame(
+                    &mut p,
+                    &snap,
+                    &ui,
+                    &layout,
+                    &font(),
+                    &Palette::dark(),
+                    &mut IconCache::new(),
+                );
+            }
+            // The glyph box is 10px square in the middle of the button. The
+            // back square's left edge runs down x + 3, through the front
+            // square's inside on row y + 5. Three pixels in from the button's
+            // left edge is clear of the glyph.
+            let g = button.inset((button.w - 10) / 2);
+            let at = |x: i32, y: i32| buf.pixels()[y as usize * w as usize + x as usize];
+            assert_eq!(
+                at(g.x + 3, g.y + 5),
+                at(button.x + 3, g.y + 5),
+                "hovered {hovered}: the front square's inside differs from the button",
             );
         }
     }
