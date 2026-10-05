@@ -62,7 +62,6 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 name = "bnksound"
 version = "0.3.6"
 dependencies = [
- "gdk4-wayland",
  "gtk4",
  "libspa",
  "libspa-sys",
@@ -298,30 +297,6 @@ dependencies = [
  "libc",
  "pango-sys",
  "pkg-config",
- "system-deps",
-]
-
-[[package]]
-name = "gdk4-wayland"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7027433b8f19075ab22f01d0e0ba4373e303ffdb4ce4f846a2763cb020ea9bdc"
-dependencies = [
- "gdk4",
- "gdk4-wayland-sys",
- "gio",
- "glib",
- "libc",
-]
-
-[[package]]
-name = "gdk4-wayland-sys"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "653cafb8715f2ac1c56edaf8060d9360ae3acbe3c6fb61b676a2917d42b668cf"
-dependencies = [
- "glib-sys",
- "libc",
  "system-deps",
 ]
 

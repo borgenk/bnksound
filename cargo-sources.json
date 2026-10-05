@@ -392,32 +392,6 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/gdk4-wayland/gdk4-wayland-0.11.0.crate",
-        "sha256": "7027433b8f19075ab22f01d0e0ba4373e303ffdb4ce4f846a2763cb020ea9bdc",
-        "dest": "cargo/vendor/gdk4-wayland-0.11.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"7027433b8f19075ab22f01d0e0ba4373e303ffdb4ce4f846a2763cb020ea9bdc\", \"files\": {}}",
-        "dest": "cargo/vendor/gdk4-wayland-0.11.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/gdk4-wayland-sys/gdk4-wayland-sys-0.11.0.crate",
-        "sha256": "653cafb8715f2ac1c56edaf8060d9360ae3acbe3c6fb61b676a2917d42b668cf",
-        "dest": "cargo/vendor/gdk4-wayland-sys-0.11.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"653cafb8715f2ac1c56edaf8060d9360ae3acbe3c6fb61b676a2917d42b668cf\", \"files\": {}}",
-        "dest": "cargo/vendor/gdk4-wayland-sys-0.11.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/gio/gio-0.22.6.crate",
         "sha256": "e3848bcba3a35cc0a71df8ba8ecfd799d6bfb862342a53a4a915fb62213aa4e6",
         "dest": "cargo/vendor/gio-0.22.6"

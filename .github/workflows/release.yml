@@ -43,7 +43,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
             libgtk-4-dev \
-            libwayland-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
             libfreetype6-dev \
@@ -120,7 +119,6 @@ jobs:
             make \
             pkg-config \
             libgtk-4-dev \
-            libwayland-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
             libfreetype6-dev \
