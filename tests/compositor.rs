@@ -151,7 +151,7 @@ fn with_no_compositor_the_app_says_so_and_stops() {
     // of the file is testing anything at all. It needs no compositor, only the
     // certainty that a socket by this name is not one.
     let rig = Rig::new("no-compositor");
-    let (stdout, stderr) = rig.client("bnksound-no-such-compositor", PROBE_MS, &[]);
+    let (stdout, stderr) = rig.client("bnksound-no-such-compositor", PROBE_MS, &[], &[]);
     let stderr = String::from_utf8_lossy(&stderr);
     assert!(
         stderr.contains("No such file or directory"),
@@ -345,6 +345,34 @@ fn a_maximized_window_is_read_as_maximized_and_keeps_its_own_size() {
     );
 }
 
+#[test]
+#[ignore = "needs a compositor; run with make test-compositor"]
+fn restoring_from_maximized_returns_to_the_size_from_before() {
+    // The window opens maximized and the probe restores it. weston answers the
+    // restore with 0x0, which leaves the size to the window.
+    let rig = Rig::new("restored");
+    rig.seed(Geometry {
+        maximized: true,
+        ..SEED
+    });
+    let report = rig.run_restored();
+
+    assert!(
+        !report.flag_word("maximized"),
+        "the restore went through: {report}"
+    );
+    assert_eq!(
+        report.pair("size"),
+        (SEED.width as i32, SEED.height as i32),
+        "the window is back at the size from before the maximize: {report}"
+    );
+    assert_eq!(
+        rig.saved(),
+        SEED,
+        "and so is the size that reached the disk"
+    );
+}
+
 // --- Scale ------------------------------------------------------------------
 
 #[test]
@@ -523,7 +551,7 @@ impl Rig {
             Compositor::Weston => {
                 let mut weston = self.start_weston(&[]);
                 let display = self.weston_display();
-                let (stdout, _) = self.client(&display, ms, &[]);
+                let (stdout, _) = self.client(&display, ms, &[], &[]);
                 stop(&mut weston);
                 self.unlink_lock(&display);
                 Report::parse(&stdout, &self.log_tail())
@@ -538,6 +566,17 @@ impl Rig {
                 Report::parse(&stdout, &self.log_tail())
             }
         }
+    }
+
+    /// Run one probe under weston that presses restore once weston has
+    /// maximized the window, and take back what it reported.
+    fn run_restored(&self) -> Report {
+        let mut weston = self.start_weston(&[]);
+        let display = self.weston_display();
+        let (stdout, _) = self.client(&display, PROBE_MS, &["--restore"], &[]);
+        stop(&mut weston);
+        self.unlink_lock(&display);
+        Report::parse(&stdout, &self.log_tail())
     }
 
     /// Run a probe, set the output scale to each of `scales` in turn once the
@@ -568,7 +607,7 @@ impl Rig {
             Compositor::Weston => {
                 let weston = self.start_weston(&[]);
                 let display = self.weston_display();
-                let host = self.client_spawn(&display, HOST_MS, &[]);
+                let host = self.client_spawn(&display, HOST_MS, &[], &[]);
                 (weston, display, host)
             }
             _ => {
@@ -581,7 +620,7 @@ impl Rig {
         // The lock is what a second launch hands itself over on, so there is no
         // point starting one before the first has taken it.
         self.await_lock(&display);
-        let (second, second_err) = self.client(&display, PROBE_MS, &env);
+        let (second, second_err) = self.client(&display, PROBE_MS, &[], &env);
 
         // Under weston the first probe is our own child; under the others it is
         // the compositor's, and the compositor ends with it.
@@ -708,19 +747,32 @@ impl Rig {
 
     /// Run a probe against `display` and wait for it. Returns what it wrote to
     /// each stream.
-    fn client(&self, display: &str, ms: u64, env: &[(&str, &str)]) -> (Vec<u8>, Vec<u8>) {
+    fn client(
+        &self,
+        display: &str,
+        ms: u64,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> (Vec<u8>, Vec<u8>) {
         let mut child = self
-            .client_spawn(display, ms, env)
+            .client_spawn(display, ms, args, env)
             .expect("the probe binary is there to run");
         wait_for(&mut child, Duration::from_millis(ms) + GRACE)
     }
 
     /// Start a probe against `display` without waiting for it.
-    fn client_spawn(&self, display: &str, ms: u64, env: &[(&str, &str)]) -> Option<Child> {
+    fn client_spawn(
+        &self,
+        display: &str,
+        ms: u64,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Option<Child> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bnksound"));
         command
             .arg("--probe")
             .arg(ms.to_string())
+            .args(args)
             .env("XDG_CONFIG_HOME", &self.config)
             .env("WAYLAND_DISPLAY", display)
             .stdin(Stdio::null())

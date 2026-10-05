@@ -7,8 +7,11 @@
 //! wait for. A launch that finds the lock already taken hands itself over and
 //! says so, so the same flag serves both halves of the one-window test.
 //!
+//! With --restore, the run presses the restore button once the compositor has
+//! maximized the window. A headless compositor has no pointer to press it with.
+//!
 //! ```sh
-//! bnksound --probe [ms]
+//! bnksound --probe [ms] [--restore]
 //! ```
 
 use std::time::{Duration, Instant};
@@ -29,6 +32,7 @@ pub fn run(args: &[String]) -> Result<()> {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_MS);
+    let mut restore = args.iter().any(|a| a == "--restore");
 
     let (instance, token) = match instance::claim() {
         Launch::Run { listener, token } => (listener, token),
@@ -42,6 +46,9 @@ pub fn run(args: &[String]) -> Result<()> {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while !app.closed && Instant::now() < deadline {
         app.tick()?;
+        if restore && app.restore() {
+            restore = false;
+        }
     }
 
     print!("{}", app.facts());

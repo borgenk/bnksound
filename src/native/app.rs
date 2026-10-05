@@ -591,15 +591,9 @@ impl App {
                         !states.compositor_sized(),
                     );
                 }
-                // A compositor that resizes past the declared minimum gets the
-                // minimum back: the window keeps its own floor rather than
-                // handing the user a column cut off at the knees.
-                let (w, h) = if w > 0 && h > 0 {
-                    layout::at_least_minimum(w, h, self.shell.ui.settings.show_sidebar)
-                } else {
-                    (w, h)
-                };
-                if w > 0 && h > 0 && (w, h) != (self.width, self.height) {
+                let (w, h) =
+                    configured_size(w, h, self.normal_size, self.shell.ui.settings.show_sidebar);
+                if (w, h) != (self.width, self.height) {
                     self.width = w;
                     self.height = h;
                     self.shell.ui.dirty.mark_full();
@@ -615,7 +609,7 @@ impl App {
                 // fullscreen, and tiled sizes all belong to the compositor's
                 // arrangement, and restoring into one of them on the next
                 // launch would leave the window a shape the user never chose.
-                if !states.compositor_sized() && w > 0 && h > 0 {
+                if !states.compositor_sized() {
                     self.normal_size = (w, h);
                 }
                 // Tell the core the window moved, so the save tick carries the
@@ -1706,6 +1700,16 @@ impl App {
         });
     }
 
+    /// Press the restore button, if the window is maximized and so shows one.
+    /// Returns whether it was pressed.
+    pub fn restore(&mut self) -> bool {
+        if !self.shell.ui.maximized {
+            return false;
+        }
+        self.window_action(WindowAction::ToggleMaximize);
+        true
+    }
+
     /// What this run saw of the compositor it ran against.
     pub fn facts(&self) -> Facts {
         Facts {
@@ -1822,6 +1826,16 @@ impl ToplevelStates {
     fn compositor_sized(self) -> bool {
         self.maximized || self.tiled
     }
+}
+
+/// The size a toplevel configure gives the window. A side left at zero is the
+/// window's to pick, and it picks the same side of its normal size, which is
+/// how a restore from maximized gets back the size from before. Every side
+/// still goes through the minimum, since a compositor may configure straight
+/// past the one the window declared.
+fn configured_size(w: i32, h: i32, normal: (i32, i32), show_sidebar: bool) -> (i32, i32) {
+    let side = |configured: i32, normal: i32| if configured > 0 { configured } else { normal };
+    layout::at_least_minimum(side(w, normal.0), side(h, normal.1), show_sidebar)
 }
 
 /// Read a configure's trailing state array, which is a run of u32 enum values.
@@ -2013,6 +2027,25 @@ mod tests {
         assert!(!s.maximized);
         assert!(!s.tiled);
         assert!(!s.compositor_sized(), "its size is the user's to keep");
+    }
+
+    /// Each side on its own: a side the configure gives is taken, a side it
+    /// leaves at zero or below comes from the normal size, and both keep the
+    /// minimum.
+    #[test]
+    fn a_side_left_at_zero_comes_from_the_normal_size() {
+        let (min_w, min_h) = layout::minimum_size(false);
+        let normal = (min_w + 200, min_h + 100);
+        assert_eq!(configured_size(0, 0, normal, false), normal);
+        assert_eq!(
+            configured_size(min_w + 400, 0, normal, false),
+            (min_w + 400, normal.1)
+        );
+        assert_eq!(
+            configured_size(-5, min_h + 300, normal, false),
+            (normal.0, min_h + 300)
+        );
+        assert_eq!(configured_size(1, 1, normal, false), (min_w, min_h));
     }
 
     #[test]
