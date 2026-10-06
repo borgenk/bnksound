@@ -23,6 +23,11 @@ use crate::ui::meter::MeterState;
 /// shells run their own timer against it so the blink matches.
 pub const CARET_BLINK: Duration = Duration::from_millis(530);
 
+/// How many toggles a blink run lasts before the caret rests shown, about ten
+/// seconds at CARET_BLINK. A resting caret asks for no timer and no repaint, and
+/// a key or a click in the field starts a fresh run.
+pub const CARET_BLINK_TOGGLES: u32 = 20;
+
 /// Which overlay is holding keyboard focus. When one is open, typing goes to its
 /// editor and shortcuts do not leak into the mixer body behind it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -184,6 +189,8 @@ pub struct UiState {
     /// the resize can carry off.
     pub fit_mark: PressMark,
     pub caret_visible: bool,
+    /// Toggles left in the current blink run. Zero means the caret rests shown.
+    pub caret_blinks_left: u32,
     /// The user's visual toggles, loaded once at startup. Layout reads them to
     /// decide which toolbar buttons exist.
     pub settings: Settings,
@@ -227,6 +234,7 @@ impl Default for UiState {
             halo: HaloState::new(),
             fit_mark: PressMark::default(),
             caret_visible: true,
+            caret_blinks_left: CARET_BLINK_TOGGLES,
             settings: Settings::default(),
             chrome: Chrome::Server,
             maximized: false,
@@ -334,18 +342,35 @@ impl UiState {
         self.knob_hover.clone()
     }
 
-    /// Advance the caret blink one step. Off-focus it settles visible, so the
-    /// next field to take focus starts with a caret rather than a gap. Returns
-    /// whether anything changed and the frame needs repainting.
+    /// Advance the caret blink one step. Off-focus it settles visible with a
+    /// full run ready, so the next field to take focus starts with a caret
+    /// rather than a gap. The last toggle of a run lands shown. Returns whether
+    /// anything changed and the frame needs repainting.
     pub fn blink_caret(&mut self) -> bool {
-        let next = if self.overlay_focused() {
-            !self.caret_visible
-        } else {
+        let next = if !self.overlay_focused() {
+            self.caret_blinks_left = CARET_BLINK_TOGGLES;
             true
+        } else if self.caret_blinks_left == 0 {
+            true
+        } else {
+            self.caret_blinks_left -= 1;
+            self.caret_blinks_left == 0 || !self.caret_visible
         };
         let changed = next != self.caret_visible;
         self.caret_visible = next;
         changed
+    }
+
+    /// Whether the caret still wants its blink timer: a field has focus and
+    /// the run is not spent.
+    pub fn caret_blinking(&self) -> bool {
+        self.overlay_focused() && self.caret_blinks_left > 0
+    }
+
+    /// Activity in the field: show the caret and start a fresh run.
+    pub fn wake_caret(&mut self) {
+        self.caret_visible = true;
+        self.caret_blinks_left = CARET_BLINK_TOGGLES;
     }
 }
 
@@ -385,6 +410,23 @@ mod tests {
         assert_eq!(c.press(1200, 80.0, 80.0), 1);
         // Too slow resets.
         assert_eq!(c.press(5000, 80.0, 80.0), 1);
+    }
+
+    /// A field left alone blinks for one run and then rests shown, so an idle
+    /// palette stops repainting twice a second.
+    #[test]
+    fn a_caret_left_alone_rests_shown_after_one_run() {
+        let mut ui = UiState::new();
+        ui.focus = Focus::Palette;
+        for step in 0..CARET_BLINK_TOGGLES {
+            assert!(
+                ui.blink_caret(),
+                "step {step} of the run is a visible change"
+            );
+        }
+        assert!(ui.caret_visible, "the run ends with the caret shown");
+        assert!(!ui.blink_caret(), "a rested caret changes nothing");
+        assert!(ui.caret_visible);
     }
 
     #[test]

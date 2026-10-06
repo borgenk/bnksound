@@ -435,6 +435,7 @@ pub fn on_pointer(
                         ui.editor.click(at, clicks);
                         ui.drag = Some(Drag::TextSelect);
                     }
+                    ui.wake_caret();
                 }
                 Some(HitTarget::PaletteRow(i)) => {
                     if let Some(m) = snapshot.palette.messages.get(i) {
@@ -539,6 +540,9 @@ pub fn on_key(ui: &mut UiState, snapshot: &ViewSnapshot, event: KeyEvent) -> Vec
         Focus::Palette => palette_key(ui, snapshot, event, &mut msgs),
         Focus::Modal => modal_key(ui, event, &mut msgs),
         Focus::Body => body_key(ui, event, &mut msgs),
+    }
+    if ui.overlay_focused() {
+        ui.wake_caret();
     }
     ui.dirty.mark_full();
     msgs
@@ -1204,6 +1208,26 @@ mod tests {
         );
         assert_eq!(ui.focus, Focus::Palette);
         assert!(matches!(msgs.as_slice(), [Message::TogglePalette]));
+    }
+
+    /// A key typed into a field whose caret has rested starts a fresh blink
+    /// run, so the caret blinks again once the user is back.
+    #[test]
+    fn typing_into_a_rested_field_wakes_the_caret() {
+        let (mut ui, _layout, snap) = palette_scene("");
+        while ui.caret_blinking() {
+            ui.blink_caret();
+        }
+        on_key(
+            &mut ui,
+            &snap,
+            KeyEvent {
+                key: Key::Char('a'),
+                mods: Modifiers::default(),
+            },
+        );
+        assert!(ui.caret_blinking(), "the key starts a fresh run");
+        assert!(ui.caret_visible, "with the caret shown");
     }
 
     /// A scene with the palette open, so the overlay geometry exists.

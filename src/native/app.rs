@@ -1620,7 +1620,7 @@ impl App {
         if let Some((_, next)) = self.held_key {
             timeout = timeout.min(next.saturating_duration_since(now));
         }
-        if self.shell.ui.overlay_focused() {
+        if self.shell.ui.caret_blinking() {
             timeout = timeout.min(self.caret_deadline.saturating_duration_since(now));
         }
         poll(&mut fds, Some(timeout))?;
@@ -1633,9 +1633,9 @@ impl App {
             self.autosave_deadline = Instant::now() + AUTOSAVE_INTERVAL;
         }
 
-        // Blink the caret. Off-focus this settles it visible and then costs
-        // nothing until a field takes focus again.
-        if !self.shell.ui.overlay_focused() || Instant::now() >= self.caret_deadline {
+        // Blink the caret. Off-focus, or once a run is spent, this settles it
+        // shown and costs nothing until a key or a click in a field wakes it.
+        if !self.shell.ui.caret_blinking() || Instant::now() >= self.caret_deadline {
             if self.shell.tick_caret() {
                 self.shell.ui.dirty.mark_full();
             }
