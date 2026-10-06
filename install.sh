@@ -105,6 +105,8 @@ verify_checksum() {
         echo "Error: the published checksum is not a sha256 digest, refusing to install"
         return 1
     fi
+    expected="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
+    actual="$(printf '%s' "$actual" | tr 'A-F' 'a-f')"
 
     if [ "$expected" != "$actual" ]; then
         echo "Error: checksum mismatch, refusing to install"

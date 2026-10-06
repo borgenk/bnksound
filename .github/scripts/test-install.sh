@@ -96,6 +96,10 @@ printf '%s  pkg.tar.gz\n' "$good" > "$TMP/remote/valid.sha256"
 check "valid checksum installs" "installs" \
     "$(verdict "$(staged valid)" "file://$TMP/remote/valid.sha256")"
 
+printf '%s  pkg.tar.gz\n' "$(printf '%s' "$good" | tr 'a-f' 'A-F')" > "$TMP/remote/upper.sha256"
+check "uppercase checksum installs" "installs" \
+    "$(verdict "$(staged upper)" "file://$TMP/remote/upper.sha256")"
+
 printf '%s  pkg.tar.gz\n' "$(printf '%064d' 0)" > "$TMP/remote/wrong.sha256"
 check "mismatch refuses" "refuses" \
     "$(verdict "$(staged wrong)" "file://$TMP/remote/wrong.sha256")"
