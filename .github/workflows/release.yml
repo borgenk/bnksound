@@ -79,6 +79,8 @@ jobs:
         with:
           manifest-path: io.github.borgenk.BnkSound.yml
           bundle: bnksound-${{ github.ref_name }}-x86_64.flatpak
+          # The manifest skips both names, so the build never copies its own
+          # output back in.
           build-dir: build-dir
           repo-dir: flatpak-repo
           cache: false

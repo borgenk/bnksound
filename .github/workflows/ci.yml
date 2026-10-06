@@ -57,6 +57,8 @@ jobs:
       - name: Test
         run: cargo test
 
+      # NEEDED lists only what bnksound links itself. ldd would also show GLib,
+      # which HarfBuzz depends on in most distributions, and fail every time.
       - name: Assert the binary links no GTK stack
         run: |
           bin=target/x86_64-unknown-linux-gnu/debug/bnksound
@@ -108,6 +110,9 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
+  # The only check on cargo-sources.json. After a dependency change, regenerate
+  # it with flatpak-cargo-generator (shipped in org.flatpak.Builder) from
+  # Cargo.lock.
   flatpak:
     name: Flatpak
     runs-on: ubuntu-latest
@@ -124,8 +129,12 @@ jobs:
         with:
           manifest-path: io.github.borgenk.BnkSound.yml
           bundle: bnksound.flatpak
+          # The manifest skips both names, so the build never copies its own
+          # output back in.
           build-dir: build-dir
           repo-dir: flatpak-repo
+          # The action restores only keys starting with flatpak-builder-, so any
+          # other prefix downloads every crate again on each build.
           cache-key: flatpak-builder-${{ github.sha }}
 
       - name: Verify the app holds the GTK build
