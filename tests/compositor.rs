@@ -67,6 +67,11 @@ const PROBE_MS: u64 = 1500;
 /// How long a probe holds the window while a second launch is aimed at it.
 const HOST_MS: u64 = 4000;
 
+/// The launch tokens a launcher hands the process it starts. One left in the
+/// environment the tests run from would reach the first probe as its own, and it
+/// would raise with that instead of asking the compositor for a token.
+const TOKEN_VARS: [&str; 2] = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"];
+
 // --- The window comes up at all -------------------------------------------
 
 #[test]
@@ -742,6 +747,9 @@ impl Rig {
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(Stdio::from(log));
+        for var in TOKEN_VARS {
+            command.env_remove(var);
+        }
         command.spawn().unwrap_or_else(|e| {
             panic!(
                 "cannot start {kind}: {e}\n\
@@ -802,6 +810,9 @@ impl Rig {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for var in TOKEN_VARS {
+            command.env_remove(var);
+        }
         for (key, value) in env {
             command.env(key, value);
         }
