@@ -86,6 +86,8 @@ struct Counts {
     configures: u32,
     /// Frames attached and committed.
     frames: u32,
+    /// Frame callbacks the compositor answered.
+    callbacks: u32,
     /// Activation tokens the compositor handed back.
     tokens: u32,
     /// Later launches that handed themselves over on the lock socket.
@@ -126,6 +128,9 @@ const ACTIVATION_VERSION: u32 = 1;
 pub struct App {
     conn: Connection,
     next_id: u32,
+    /// Ids the compositor has deleted, free to reuse. Every frame takes a
+    /// callback object, so without these the ids would count up forever.
+    free_ids: Vec<u32>,
 
     // Bound globals.
     registry: u32,
@@ -198,6 +203,13 @@ pub struct App {
     buffer_dims: (i32, i32),
     /// The slot the last presented frame went into, which a screenshot reads.
     last_painted: usize,
+    /// The last commit's frame callback, which the compositor answers once it
+    /// is ready for the next frame. Zero when none is outstanding, which is the
+    /// only time a frame is painted.
+    frame_callback: u32,
+    /// The latest configure's serial, acked by the next commit, which carries a
+    /// buffer of the size that configure closed on.
+    pending_configure: Option<u32>,
 
     // Window state.
     width: i32,
@@ -269,6 +281,7 @@ impl App {
         let mut app = App {
             conn,
             next_id: 2,
+            free_ids: Vec::new(),
             registry: 0,
             compositor: 0,
             shm: 0,
@@ -308,6 +321,8 @@ impl App {
             buffers: [BufferSlot::default(), BufferSlot::default()],
             buffer_dims: (0, 0),
             last_painted: 0,
+            frame_callback: 0,
+            pending_configure: None,
             width: startup_size.0,
             height: startup_size.1,
             normal_size: startup_size,
@@ -344,6 +359,9 @@ impl App {
     }
 
     fn new_id(&mut self) -> u32 {
+        if let Some(id) = self.free_ids.pop() {
+            return id;
+        }
         let id = self.next_id;
         self.next_id += 1;
         id
@@ -517,7 +535,13 @@ impl App {
                     "wayland error on object {obj} (code {code}): {text}"
                 )));
             }
-            (WL_DISPLAY, evt::DISPLAY_DELETE_ID) => {}
+            (WL_DISPLAY, evt::DISPLAY_DELETE_ID) => {
+                // Ids from SERVER_ID_BASE up are the compositor's to hand out.
+                let id = r.u32().unwrap_or(0);
+                if id != 0 && id < SERVER_ID_BASE {
+                    self.free_ids.push(id);
+                }
+            }
             (_, evt::REGISTRY_GLOBAL) if msg.object == self.registry => {
                 let name = r.u32().unwrap_or(0);
                 let interface = r.string().unwrap_or_default();
@@ -548,14 +572,9 @@ impl App {
                 self.send(wm, req::XDG_WM_BASE_PONG, &[Arg::Uint(serial)]);
             }
             (_, evt::XDG_SURFACE_CONFIGURE) if msg.object == self.xdg_surface => {
-                let serial = r.u32().unwrap_or(0);
-                let xdg = self.xdg_surface;
-                self.send(xdg, req::XDG_SURFACE_ACK_CONFIGURE, &[Arg::Uint(serial)]);
-                // Declare which part of the surface is the window. Nothing is
-                // drawn outside it, so it is the whole surface, but a
-                // compositor with no geometry to go on is left to invent a size
-                // for the window rather than honour the one it has.
-                self.set_window_geometry();
+                // A newer configure replaces one not yet acked, so a storm of
+                // them during a drag is answered once, by the next frame.
+                self.pending_configure = Some(r.u32().unwrap_or(0));
                 let first = !self.configured;
                 self.configured = true;
                 self.shell.ui.dirty.mark_full();
@@ -674,6 +693,12 @@ impl App {
                 if !token.is_empty() {
                     self.activate(token);
                 }
+            }
+            (_, evt::CALLBACK_DONE)
+                if self.frame_callback != 0 && msg.object == self.frame_callback =>
+            {
+                self.frame_callback = 0;
+                self.counts.callbacks += 1;
             }
             // Guarded on our own buffer ids: almost every event here is opcode
             // 0, so an unguarded arm would swallow the others.
@@ -1531,6 +1556,15 @@ impl App {
             );
         }
 
+        // The ack and the window geometry ride the same commit as the buffer
+        // painted at the size the configure asked for, so the compositor never
+        // acts on a size the window is not showing yet.
+        if let Some(serial) = self.pending_configure.take() {
+            self.set_window_geometry();
+            let xdg = self.xdg_surface;
+            self.send(xdg, req::XDG_SURFACE_ACK_CONFIGURE, &[Arg::Uint(serial)]);
+        }
+
         let (surface, buffer) = (self.surface, self.buffers[slot].obj);
         self.send(
             surface,
@@ -1555,6 +1589,9 @@ impl App {
                 );
             }
         }
+        self.frame_callback = self.new_id();
+        let callback = self.frame_callback;
+        self.send(surface, req::SURFACE_FRAME, &[Arg::NewId(callback)]);
         self.send(surface, req::SURFACE_COMMIT, &[]);
         self.buffers[slot].busy = true;
         self.last_painted = slot;
@@ -1665,7 +1702,10 @@ impl App {
             self.shell.ui.dirty.mark_full();
         }
 
-        if self.shell.ui.dirty.needs_paint() {
+        // Paced by the frame callback. Changes that land while one is out,
+        // configures included, wait for its answer and go out as one frame, and
+        // a hidden window, which the compositor stops answering, paints nothing.
+        if self.frame_callback == 0 && self.shell.ui.dirty.needs_paint() {
             self.present()?;
         }
         self.flush()
@@ -1804,8 +1844,12 @@ impl fmt::Display for Facts {
         )?;
         writeln!(
             f,
-            "probe counts configures={} frames={} tokens={} handovers={}",
-            self.counts.configures, self.counts.frames, self.counts.tokens, self.counts.handovers,
+            "probe counts configures={} frames={} callbacks={} tokens={} handovers={}",
+            self.counts.configures,
+            self.counts.frames,
+            self.counts.callbacks,
+            self.counts.tokens,
+            self.counts.handovers,
         )
     }
 }
@@ -2120,6 +2164,7 @@ mod tests {
             counts: Counts {
                 configures: 2,
                 frames: 3,
+                callbacks: 2,
                 tokens: 1,
                 handovers: 1,
             },
@@ -2138,7 +2183,7 @@ mod tests {
                  fractional=1 viewport=1",
                 "probe window 638x692 normal=560x720 maximized=false tiled=true chrome=server",
                 "probe scale factor=1.5 buffer_scale=1 buffer=957x1038",
-                "probe counts configures=2 frames=3 tokens=1 handovers=1",
+                "probe counts configures=2 frames=3 callbacks=2 tokens=1 handovers=1",
             ],
         );
     }

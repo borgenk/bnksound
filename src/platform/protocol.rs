@@ -4,6 +4,10 @@
 /// wl_display is always object id 1.
 pub const WL_DISPLAY: u32 = 1;
 
+/// The first id of the range the compositor allocates from. Ids below it are
+/// the client's.
+pub const SERVER_ID_BASE: u32 = 0xff00_0000;
+
 // Request opcodes (client -> compositor).
 pub mod req {
     pub const DISPLAY_SYNC: u16 = 0;

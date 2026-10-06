@@ -279,6 +279,30 @@ fn without_activation_the_lock_still_spares_the_second_window() {
     }
 }
 
+// --- Frames -----------------------------------------------------------------
+
+#[test]
+#[ignore = "needs a compositor; run with make test-compositor"]
+fn every_frame_after_the_first_waits_for_the_compositor() {
+    // Each commit asks for a frame callback, and nothing is painted while one is
+    // outstanding, so the frames can run at most one ahead of the answers.
+    for kind in [Compositor::Weston, Compositor::Labwc, Compositor::Cage] {
+        let rig = Rig::new("paced");
+        let report = rig.run(kind, PROBE_MS);
+
+        assert_eq!(report.end(), "ok", "{kind} run did not finish: {report}");
+        let (frames, callbacks) = (report.count("frames"), report.count("callbacks"));
+        assert!(
+            callbacks >= 1,
+            "{kind} never answered a frame callback: {report}"
+        );
+        assert!(
+            frames <= callbacks + 1,
+            "{kind}: {frames} frames on {callbacks} answered callbacks: {report}"
+        );
+    }
+}
+
 // --- Window states ----------------------------------------------------------
 
 #[test]
