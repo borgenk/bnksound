@@ -5,17 +5,20 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
   schedule:
     - cron: "0 6 * * 1"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
 
 jobs:
   native:
     name: Native (no GTK)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -76,7 +79,7 @@ jobs:
 
   gtk:
     name: GTK shell
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -115,7 +118,7 @@ jobs:
   # Cargo.lock.
   flatpak:
     name: Flatpak
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:1fb2df10a57276f90806e1f35454048e30bf1855b7b4ff4808c9ee55887bd852 # gnome-50

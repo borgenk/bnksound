@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,7 +14,7 @@ env:
 jobs:
   version:
     name: Verify tag matches Cargo.toml version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -31,41 +31,12 @@ jobs:
   gate:
     name: Gate
     needs: version
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libgtk-4-dev \
-            libpipewire-0.3-dev \
-            libspa-0.2-dev \
-            libfreetype6-dev \
-            libfontconfig1-dev \
-            libharfbuzz-dev \
-            libxkbcommon-dev \
-            fonts-noto-color-emoji \
-            clang \
-            libclang-dev
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      - name: Check
-        run: make check
+    uses: ./.github/workflows/ci.yml
 
   flatpak:
     name: Flatpak bundle
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:1fb2df10a57276f90806e1f35454048e30bf1855b7b4ff4808c9ee55887bd852 # gnome-50
@@ -103,7 +74,9 @@ jobs:
   release:
     name: Build and publish
     needs: [gate, flatpak]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     # Build inside Debian 12, so the binaries need no glibc newer than its 2.36.
     container: debian:12
     timeout-minutes: 30
