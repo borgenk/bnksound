@@ -6,6 +6,7 @@
 //! root; shared modules never import it.
 
 pub mod app;
+pub(crate) mod frames;
 pub(crate) mod glib_fd;
 pub(crate) mod header;
 pub(crate) mod profile;

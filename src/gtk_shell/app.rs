@@ -5,7 +5,7 @@
 //! events; the shared runtime reduces messages, the shared layout places
 //! everything, and the shared renderer draws it.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 
 use crate::bus::Sender;
+use crate::gtk_shell::frames::Frames;
 use crate::gtk_shell::glib_fd;
 use crate::gtk_shell::header;
 use crate::gtk_shell::profile::ProfileSelector;
@@ -24,10 +25,9 @@ use crate::render::screenshot;
 use crate::render::text::Font;
 use crate::runtime::Runtime;
 use crate::settings;
-use crate::shell::Shell;
+use crate::shell::{AUTOSAVE_DELAY, Shell};
 use crate::state::Message;
 use crate::ui::input::{self, ClipboardAction, PointerAction};
-use crate::ui::meter::PEAK_DECAY_INTERVAL;
 use crate::ui::{CARET_BLINK, Chrome, FitStep};
 
 pub fn activate(app: &gtk::Application) {
@@ -87,31 +87,29 @@ pub fn activate(app: &gtk::Application) {
 
     window.set_child(Some(&surface.borrow().widget));
 
-    // One repaint entry point, so every producer below asks for a frame the
-    // same way and the dirty flags decide whether it is worth painting.
+    let frames = Frames::new(&shell, &surface);
+    let timers = Timers::new(&shell, &frames);
+
+    // One entry point for every producer below, run after each change. The
+    // selector follows the snapshot at once, the timers pick up any work the
+    // change gave them, and the drawing waits for the next frame, where the
+    // dirty flags decide whether it is worth painting.
     let redraw: Rc<dyn Fn()> = {
         let shell = Rc::clone(&shell);
-        let surface = Rc::clone(&surface);
         let profiles = Rc::clone(&profiles);
+        let frames = Rc::clone(&frames);
         Rc::new(move || {
-            let mut shell = shell.borrow_mut();
             // The selector is a widget rather than paint, so it follows the
-            // snapshot even on a frame the surface has nothing to redraw for.
-            profiles.sync(&shell.snapshot);
-            // A stale frame is one painted for a different size than the widget
-            // now has, which the dirty flags know nothing about.
-            if !shell.ui.dirty.needs_paint() && !surface.borrow().is_stale() {
-                return;
-            }
-            let (snapshot, ui) = (&shell.snapshot, &shell.ui);
-            surface.borrow_mut().render(snapshot, ui);
-            shell.ui.dirty.clear();
+            // snapshot even on a turn the surface has nothing to redraw for.
+            profiles.sync(&shell.borrow().snapshot);
+            timers.arm();
+            frames.request();
         })
     };
 
     wire_input(&surface, &window, &shell, &msg_tx, &redraw);
     wire_buses(&window, &shell, &redraw, msg_rx, evt_rx);
-    wire_ticks(&shell, &redraw);
+    wire_resize(&window, &surface, &frames);
     wire_geometry(&window, &shell);
     if geometry.fitted {
         wire_refit(&window, &shell, geometry.width as i32);
@@ -312,6 +310,7 @@ fn wire_buses(
             msg_rx.drain(|m| batch.push(m));
             dispatch(&window, &shell, batch);
             redraw();
+            glib::ControlFlow::Continue
         });
     }
     {
@@ -323,57 +322,90 @@ fn wire_buses(
             evt_rx.drain(|e| batch.push(e));
             shell.borrow_mut().dispatch_worker(batch);
             redraw();
+            glib::ControlFlow::Continue
         });
     }
 }
 
-/// The autosave debounce, the meter animation, and the caret blink. What each
-/// one does belongs to the shared shell; when it happens is GTK's to schedule.
-fn wire_ticks(shell: &Rc<RefCell<Shell>>, redraw: &Rc<dyn Fn()>) {
-    // Coarse enough to collapse a slider drag into one write, fine enough to
-    // survive a near-immediate window close.
+/// A resize changes nothing the dirty flags track, so the frame it needs is
+/// asked for here. The surface's layout signal comes with every size the
+/// compositor gives the window, maximized and tiled included, and a new scale
+/// changes the pixels without changing the size.
+fn wire_resize(
+    window: &gtk::ApplicationWindow,
+    surface: &Rc<RefCell<Surface>>,
+    frames: &Rc<Frames>,
+) {
     {
-        let shell = Rc::clone(shell);
-        let redraw = Rc::clone(redraw);
-        glib::timeout_add_local(Duration::from_millis(500), move || {
-            shell.borrow_mut().tick_autosave();
-            redraw();
-            glib::ControlFlow::Continue
+        let frames = Rc::clone(frames);
+        window.connect_realize(move |window| {
+            if let Some(surface) = window.surface() {
+                let frames = Rc::clone(&frames);
+                surface.connect_layout(move |_, _, _| frames.request());
+            }
         });
     }
+    let frames = Rc::clone(frames);
+    surface
+        .borrow()
+        .widget
+        .connect_scale_factor_notify(move |_| frames.request());
+}
 
-    // Peaks aren't events: a silent node decays to zero on its own here.
-    {
-        let shell = Rc::clone(shell);
-        let redraw = Rc::clone(redraw);
-        glib::timeout_add_local(PEAK_DECAY_INTERVAL, move || {
-            {
-                let mut shell = shell.borrow_mut();
-                let mut moved = shell.tick_meters();
-                // The knob's ring and the fit button's press mark ease on the
-                // same tick.
-                moved |= shell.tick_fades(std::time::Instant::now());
-                if moved {
+/// The autosave and the caret blink, each a timer that runs only while it has
+/// work. What each one does belongs to the shared shell; when it happens is
+/// GTK's to schedule.
+struct Timers {
+    shell: Rc<RefCell<Shell>>,
+    frames: Rc<Frames>,
+    /// Whether a save is armed.
+    saving: Cell<bool>,
+    /// Whether the caret's blink timer is running.
+    blinking: Cell<bool>,
+}
+
+impl Timers {
+    fn new(shell: &Rc<RefCell<Shell>>, frames: &Rc<Frames>) -> Rc<Self> {
+        Rc::new(Timers {
+            shell: Rc::clone(shell),
+            frames: Rc::clone(frames),
+            saving: Cell::new(false),
+            blinking: Cell::new(false),
+        })
+    }
+
+    /// Start whichever timer the latest change gave work to: a save once the
+    /// disk is behind, a blink once a field has focus.
+    fn arm(self: &Rc<Self>) {
+        let (unsaved, blinking) = {
+            let shell = self.shell.borrow();
+            (shell.unsaved(), shell.ui.caret_blinking())
+        };
+        if unsaved && !self.saving.replace(true) {
+            let timers = Rc::clone(self);
+            glib::timeout_add_local_once(AUTOSAVE_DELAY, move || {
+                timers.saving.set(false);
+                timers.shell.borrow_mut().tick_autosave();
+                // A failed save has something to say on the status line.
+                timers.frames.request();
+            });
+        }
+        if blinking && !self.blinking.replace(true) {
+            let timers = Rc::clone(self);
+            glib::timeout_add_local(CARET_BLINK, move || {
+                let mut shell = timers.shell.borrow_mut();
+                if shell.tick_caret() {
                     shell.ui.dirty.mark_full();
+                    timers.frames.request();
                 }
-            }
-            redraw();
-            glib::ControlFlow::Continue
-        });
-    }
-
-    // The caret blinks only while a field has focus; a blink is a repaint, and
-    // an idle mixer should not be asking for one.
-    {
-        let shell = Rc::clone(shell);
-        let redraw = Rc::clone(redraw);
-        glib::timeout_add_local(CARET_BLINK, move || {
-            if shell.borrow_mut().tick_caret() {
-                shell.borrow_mut().ui.dirty.mark_full();
-                redraw();
-            }
-            glib::ControlFlow::Continue
-        });
+                if shell.ui.caret_blinking() {
+                    glib::ControlFlow::Continue
+                } else {
+                    timers.blinking.set(false);
+                    glib::ControlFlow::Break
+                }
+            });
+        }
     }
 }
 

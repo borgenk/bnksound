@@ -1156,12 +1156,14 @@ fn centered_text(p: &mut Painter, rect: Rect, text: &str, font: &Font, style: Te
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::domain::{SinkForm, Stream, StreamKind};
     use crate::render::buffer::PixelBuffer;
+    use crate::render::paint::*;
     use crate::state;
+    use crate::ui::meter::PEAK_DECAY_INTERVAL;
     use crate::view::snapshot::build_snapshot;
     use std::path::Path;
+    use std::time::Instant;
 
     fn font() -> Font {
         Font::from_path(Path::new(concat!(
@@ -1634,9 +1636,14 @@ mod tests {
             &mut IconCache::new(),
         );
 
-        // One tick: every bar decays, then the newest peaks fold in. That pair
+        // One step: every bar decays, then the newest peaks fold in. That pair
         // is the only thing a meter step does to the frame.
-        assert!(ui.meters.decay(), "the decay moved nothing");
+        let start = Instant::now();
+        ui.meters.decay(start);
+        assert!(
+            ui.meters.decay(start + PEAK_DECAY_INTERVAL),
+            "the decay moved nothing"
+        );
         for row in &rows {
             assert!(
                 ui.meters.apply(row, &[0.95, 0.8]),

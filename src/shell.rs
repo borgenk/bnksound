@@ -7,7 +7,7 @@
 //! otherwise write twice lives here, which is what keeps them from drifting.
 
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::mpris::Mpris;
 use crate::pipewire_worker::Event as WorkerEvent;
@@ -16,7 +16,12 @@ use crate::settings::Settings;
 use crate::state::Message;
 use crate::ui::UiState;
 use crate::ui::layout::RowId;
+use crate::ui::meter::PEAK_DECAY_INTERVAL;
 use crate::view::snapshot::{ViewSnapshot, build_snapshot};
+
+/// How long an edit waits before it is written out. Long enough to collapse a
+/// slider drag into one write, short enough that a crash loses little.
+pub const AUTOSAVE_DELAY: Duration = Duration::from_millis(500);
 
 /// The shared half of a running window.
 pub struct Shell {
@@ -24,6 +29,9 @@ pub struct Shell {
     pub ui: UiState,
     pub snapshot: ViewSnapshot,
     pub mpris: Mpris,
+    /// When the meters next step. None while every bar is at rest, which is
+    /// when they sleep on the peak pool's fd instead.
+    meters_due: Option<Instant>,
 }
 
 impl Shell {
@@ -37,6 +45,7 @@ impl Shell {
             ui,
             snapshot: build_snapshot(&crate::state::empty(), |_| None),
             mpris,
+            meters_due: None,
         };
         shell.refresh();
         shell
@@ -76,29 +85,63 @@ impl Shell {
         }
     }
 
-    /// Flush whatever the session has changed since the last tick. Edits land
+    /// Whether the session holds edits the disk does not have yet, which is
+    /// when a save is worth arming.
+    pub fn unsaved(&self) -> bool {
+        let state = self.runtime.state();
+        state.dirty || state.geometry_dirty
+    }
+
+    /// Flush whatever the session has changed since the last save. Edits land
     /// in state as they happen, so this is only what gets them onto disk, and
     /// it reprojects only when a failed save has something to say.
     pub fn tick_autosave(&mut self) {
         self.dispatch([Message::AutoSaveTick]);
     }
 
-    /// Step the meters: decay every bar, then fold in the peaks the audio
-    /// threads have left since the last step. Reports whether anything moved,
-    /// so a window whose bars are all at rest skips its repaint.
-    pub fn tick_meters(&mut self) -> bool {
-        let mut moved = self.ui.meters.decay();
+    /// When the meters next want a step, or None while every bar is at rest.
+    pub fn meters_due(&self) -> Option<Instant> {
+        self.meters_due
+    }
+
+    /// Step the meters now, for a loop the peak pool's fd woke while they were
+    /// at rest. The step does not wait for a frame: from rest the pool holds
+    /// only the peak that woke it, and draining it here keeps a window that
+    /// cannot paint yet from piling up a stale one. Reports whether anything
+    /// moved.
+    pub fn wake_meters(&mut self, now: Instant) -> bool {
+        self.meters_due = Some(now);
+        self.tick_meters(now)
+    }
+
+    /// Step the meters if they are due: decay every bar by the time since the
+    /// last step, then fold in the peaks the audio threads have left since.
+    /// They keep stepping while anything moves and go to rest once nothing
+    /// does. Reports whether anything moved, so a window whose bars are all at
+    /// rest skips its repaint.
+    pub fn tick_meters(&mut self, now: Instant) -> bool {
+        if !self.meters_due.is_some_and(|due| now >= due) {
+            return false;
+        }
+        let stale = self.ui.meters.readings_stale(now);
+        let mut moved = self.ui.meters.decay(now);
         // Three disjoint fields, so the routes can be read off the snapshot
         // while the meters take a mutable borrow.
         let routes = &self.snapshot.meter_routes;
         let meters = &mut self.ui.meters;
         self.runtime.peaks().drain(|node_id, values| {
+            // Drained all the same, so the next step starts from what is
+            // playing now.
+            if stale {
+                return;
+            }
             if let Some(rows) = routes.get(&node_id) {
                 for row in rows {
                     moved |= meters.apply(row, values);
                 }
             }
         });
+        self.meters_due = moved.then(|| now + PEAK_DECAY_INTERVAL);
         moved
     }
 

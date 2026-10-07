@@ -34,7 +34,7 @@ use crate::render::primitives::{Painter, Rect};
 use crate::render::text::Font;
 use crate::ui::UiState;
 use crate::ui::layout::{self, Layout as UiLayout};
-use crate::ui::meter::MeterState;
+use crate::ui::meter::{MeterState, PEAK_DECAY_INTERVAL};
 use crate::ui::theme::Palette;
 use crate::view::snapshot::{ViewSnapshot, build_snapshot};
 
@@ -217,9 +217,13 @@ fn measure(font: &Font, palette: &Palette) -> Vec<Sample> {
         ));
     }));
 
+    // Each call is one step's worth of time later, which is what a playing
+    // window asks of the decay.
     let mut meters = meters_for(&snapshot);
+    let mut now = Instant::now();
     samples.push(bench("meter_decay", 4096, || {
-        black_box(meters.decay());
+        now += PEAK_DECAY_INTERVAL;
+        black_box(meters.decay(now));
     }));
 
     samples.push(bench("hit_test", 4096, || {
@@ -244,7 +248,7 @@ fn hit_sweep(ui_layout: &UiLayout) -> usize {
 }
 
 /// Meters holding a value for every row a snapshot routes to, which is the
-/// state a decay tick actually walks.
+/// state a decay step actually walks.
 fn meters_for(snapshot: &ViewSnapshot) -> MeterState {
     let mut meters = MeterState::new();
     for rows in snapshot.meter_routes.values() {

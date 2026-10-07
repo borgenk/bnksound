@@ -67,6 +67,10 @@ const PROBE_MS: u64 = 1500;
 /// How long a probe holds the window while a second launch is aimed at it.
 const HOST_MS: u64 = 4000;
 
+/// How long a probe holds the window while it is watched for wakeups: time to
+/// come up and settle, then the stretch it is watched for.
+const IDLE_MS: u64 = 5000;
+
 /// The launch tokens a launcher hands the process it starts. One left in the
 /// environment the tests run from would reach the first probe as its own, and it
 /// would raise with that instead of asking the compositor for a token.
@@ -306,6 +310,45 @@ fn every_frame_after_the_first_waits_for_the_compositor() {
             "{kind}: {frames} frames on {callbacks} answered callbacks: {report}"
         );
     }
+}
+
+#[test]
+#[ignore = "needs a compositor; run with make test-compositor"]
+fn an_idle_window_stops_waking() {
+    // A window with nothing to show, save, or animate sleeps until something
+    // arrives. A timer that fires without work wakes it anyway, and on a
+    // battery each wakeup pulls a core out of its idle state.
+    //
+    // PipeWire and the session bus are cut off, so nothing outside the app can
+    // wake it: no meters, no players.
+    let rig = Rig::new("idle");
+    let mut weston = rig.start_weston(&[]);
+    let display = rig.weston_display();
+    let isolated = [
+        ("PIPEWIRE_REMOTE", "bnksound-compositor-test-none"),
+        ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent"),
+    ];
+    let mut probe = rig
+        .client_spawn(&display, IDLE_MS, &[], &isolated)
+        .expect("the probe binary is there to run");
+    rig.await_lock(&display);
+
+    // Long enough for the configure, the first frame, the missing PipeWire
+    // reported on the status line, and a save if the geometry armed one.
+    std::thread::sleep(Duration::from_millis(1500));
+    let before = wakeups(&probe);
+    std::thread::sleep(Duration::from_secs(2));
+    let woke = wakeups(&probe) - before;
+
+    let (stdout, _) = wait_for(&mut probe, Duration::from_millis(IDLE_MS) + GRACE);
+    stop(&mut weston);
+    rig.unlink_lock(&display);
+    let report = Report::parse(&stdout, &rig.log_tail());
+    assert_eq!(report.end(), "ok", "the run did not finish: {report}");
+    assert_eq!(
+        woke, 0,
+        "an idle window woke {woke} times in two seconds: {report}"
+    );
 }
 
 // --- Window states ----------------------------------------------------------
@@ -912,6 +955,20 @@ fn lock_socket(display: &str) -> PathBuf {
         })
         .collect();
     runtime_dir().join(format!("bnksound-{name}.sock"))
+}
+
+/// How many times a process's main thread has gone to sleep and been woken
+/// again. A poll that blocks and later returns is one, and it is the same
+/// count powertop reads.
+fn wakeups(child: &Child) -> u64 {
+    let pid = child.id();
+    let status = fs::read_to_string(format!("/proc/{pid}/task/{pid}/status"))
+        .expect("read the probe's main thread status");
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+        .and_then(|count| count.trim().parse().ok())
+        .expect("the status has a voluntary_ctxt_switches line")
 }
 
 /// Wait for a process, killing it if it runs past `limit`, and take everything

@@ -92,10 +92,11 @@ impl Surface {
     }
 
     /// Repaint the frame and hand it to the widget as a texture. A widget GTK
-    /// has not sized yet keeps the frame it already has.
-    pub fn render(&mut self, snapshot: &ViewSnapshot, ui: &UiState) {
+    /// has not sized yet keeps the frame it already has. Reports whether a
+    /// frame was painted.
+    pub fn render(&mut self, snapshot: &ViewSnapshot, ui: &UiState) -> bool {
         let Some(alloc) = self.allocation() else {
-            return;
+            return false;
         };
         let Allocation { w, h, scale } = alloc;
         let (dw, dh) = (w * scale, h * scale);
@@ -126,6 +127,7 @@ impl Surface {
         );
         self.widget.set_paintable(Some(&texture));
         self.painted = Some(alloc);
+        true
     }
 
     pub fn font(&self) -> &Font {

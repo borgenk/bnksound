@@ -1,9 +1,10 @@
 //! The native Wayland application: bind the globals, map an xdg-shell toplevel,
 //! present wl_shm frames painted by the shared renderer, and translate input.
 //!
-//! One poll loop waits on the Wayland socket, both bus wakeup fds, and the
-//! one-window lock, with the meter tick as its timeout, so an idle window does
-//! no work beyond the tick.
+//! One poll loop waits on the Wayland socket, both bus wakeup fds, the
+//! one-window lock, and the peak pool while the meters rest, with the soonest
+//! deadline as its timeout. A window with nothing to show, save, or animate has
+//! no deadline at all and sleeps until something arrives.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -30,14 +31,13 @@ use crate::render::screenshot;
 use crate::render::text::Font;
 use crate::runtime::Runtime;
 use crate::settings::Decorations;
-use crate::shell::Shell;
+use crate::shell::{AUTOSAVE_DELAY, Shell};
 use crate::state::Message as AppMessage;
 use crate::ui::input::{
     self, ClipboardAction, Key, KeyEvent, Modifiers, MouseButton, PointerAction, PointerEvent,
     WindowAction,
 };
 use crate::ui::layout::{self, ResizeEdge};
-use crate::ui::meter::PEAK_DECAY_INTERVAL;
 use crate::ui::theme::Palette;
 use crate::ui::{CARET_BLINK, Chrome, Drag, FitStep};
 
@@ -93,10 +93,6 @@ struct Counts {
     /// Later launches that handed themselves over on the lock socket.
     handovers: u32,
 }
-
-/// How often state is flushed to disk while the app runs. Matches the interval
-/// the GTK shell has always used.
-const AUTOSAVE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Globals we bind, with the versions we speak.
 const COMPOSITOR_VERSION: u32 = 4;
@@ -251,12 +247,10 @@ pub struct App {
     ptr_y: f64,
     /// When the caret next flips, while a field has focus.
     caret_deadline: Instant,
-    /// When the next save tick is due. Edits land in state as they happen, so
-    /// this is what gets them onto disk.
-    autosave_deadline: Instant,
-    /// When the meters next step. Their decay is a step per tick, so the step
-    /// has to be paced rather than taken on whatever turn the loop is on.
-    meter_deadline: Instant,
+    /// When the edits the disk does not have yet are written out. None while
+    /// there are none, so a window with nothing to save has no timer to wake
+    /// for.
+    autosave_due: Option<Instant>,
     started: Instant,
 }
 
@@ -349,8 +343,7 @@ impl App {
             ptr_x: 0.0,
             ptr_y: 0.0,
             caret_deadline: Instant::now() + CARET_BLINK,
-            autosave_deadline: Instant::now() + AUTOSAVE_INTERVAL,
-            meter_deadline: Instant::now() + PEAK_DECAY_INTERVAL,
+            autosave_due: None,
             started: Instant::now(),
         };
         app.bind_globals()?;
@@ -1600,37 +1593,52 @@ impl App {
         self.flush()
     }
 
-    /// One loop turn: wait for the socket, the buses, or the meter deadline.
-    pub fn tick(&mut self) -> io::Result<()> {
+    /// One loop turn: wait for the socket, the buses, the peak pool, or the
+    /// soonest deadline, then handle whatever came. `until` caps the wait for a
+    /// caller with a deadline of its own.
+    pub fn tick(&mut self, until: Option<Instant>) -> io::Result<()> {
+        // Meters at rest sleep on the peak pool until the audio threads have
+        // something audible. Moving ones step on their own deadline, and the
+        // fd, readable until the next drain, stays out of the wait.
+        let peaks = match self.shell.meters_due() {
+            None => self.shell.runtime.peaks().wake_fd(),
+            Some(_) => -1,
+        };
         let mut fds = [
-            PollFd::readable(self.conn.fd()),
+            // Requests a flush could not send wait for room on the socket.
+            PollFd::readable(self.conn.fd()).or_writable(self.conn.has_pending_output()),
             PollFd::readable(self.msg_rx.wake_fd()),
             PollFd::readable(self.evt_rx.wake_fd()),
             // poll ignores a negative fd, which covers a session where the
             // one-window lock could not be taken.
             PollFd::readable(self.instance.as_ref().map_or(-1, Listener::fd)),
+            PollFd::readable(peaks),
         ];
-        // Wake for whichever comes first: the meter tick, the save tick, the
-        // next key repeat, or the caret's next flip.
+        // Animation deadlines stay out of the wait while a frame callback is
+        // outstanding. Its answer wakes the loop anyway, and a hidden window,
+        // which the compositor stops answering, has nothing to wake for.
+        let animating = self.frame_callback == 0;
+        let deadlines = [
+            self.autosave_due,
+            self.held_key.map(|(_, next)| next),
+            until,
+            self.shell.meters_due().filter(|_| animating),
+            (animating && self.shell.ui.caret_blinking()).then_some(self.caret_deadline),
+        ];
         let now = Instant::now();
-        // Wake when the meters are next due rather than a flat interval later,
-        // so a turn spent on input does not push their step out.
-        let mut timeout = self.meter_deadline.saturating_duration_since(now);
-        timeout = timeout.min(self.autosave_deadline.saturating_duration_since(now));
-        if let Some((_, next)) = self.held_key {
-            timeout = timeout.min(next.saturating_duration_since(now));
-        }
-        if self.shell.ui.caret_blinking() {
-            timeout = timeout.min(self.caret_deadline.saturating_duration_since(now));
-        }
-        poll(&mut fds, Some(timeout))?;
+        let timeout = deadlines
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|deadline| deadline.saturating_duration_since(now));
+        poll(&mut fds, timeout)?;
 
-        // Persist anything that changed since the last tick. Without this the
-        // only save is at shutdown, so a kill or a crash would drop the whole
+        // Persist what changed since the save was armed. Without this the only
+        // save is at shutdown, so a kill or a crash would drop the whole
         // session's edits.
-        if Instant::now() >= self.autosave_deadline {
+        if self.autosave_due.is_some_and(|due| Instant::now() >= due) {
             self.shell.tick_autosave();
-            self.autosave_deadline = Instant::now() + AUTOSAVE_INTERVAL;
+            self.autosave_due = None;
         }
 
         // Blink the caret. Off-focus, or once a run is spent, this settles it
@@ -1683,23 +1691,26 @@ impl App {
         // fit is owed to.
         self.tick_refit();
 
-        // Meter animation: decay, then fold in the newest peaks. An idle window
-        // whose bars are all at rest changes nothing and skips its repaint.
-        //
-        // The decay is a step per tick, so it has to run on its own clock. The
-        // loop also wakes for input, and taking a step on those turns would let
-        // the bars fall faster the more the pointer moved.
-        if Instant::now() >= self.meter_deadline {
-            self.meter_deadline = Instant::now() + PEAK_DECAY_INTERVAL;
-            if self.shell.tick_meters() {
-                self.shell.ui.dirty.mark_meters();
-            }
+        // Meter animation: decay, then fold in the newest peaks. Peaks that
+        // woke the loop step the meters at once; from then on they step on
+        // their own deadline until every bar is at rest again.
+        let now = Instant::now();
+        if fds[4].is_ready() && self.shell.wake_meters(now) {
+            self.shell.ui.dirty.mark_meters();
+        }
+        if self.shell.tick_meters(now) {
+            self.shell.ui.dirty.mark_meters();
         }
 
         // The knob's ring eases in and out, and the fit button's press mark
         // eases away, so both keep painting for as long as they are moving.
-        if self.shell.tick_fades(Instant::now()) {
+        if self.shell.tick_fades(now) {
             self.shell.ui.dirty.mark_full();
+        }
+
+        // Arm a save on the first edit the disk does not have yet.
+        if self.autosave_due.is_none() && self.shell.unsaved() {
+            self.autosave_due = Some(now + AUTOSAVE_DELAY);
         }
 
         // Paced by the frame callback. Changes that land while one is out,
@@ -1974,7 +1985,7 @@ pub fn run() -> io::Result<()> {
     };
     let mut app = App::new(instance, token)?;
     while !app.closed {
-        app.tick()?;
+        app.tick(None)?;
     }
     app.shutdown();
     Ok(())

@@ -45,7 +45,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut app = App::new(instance, token)?;
     let deadline = Instant::now() + Duration::from_millis(ms);
     while !app.closed && Instant::now() < deadline {
-        app.tick()?;
+        app.tick(Some(deadline))?;
         if restore && app.restore() {
             restore = false;
         }

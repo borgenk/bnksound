@@ -65,6 +65,14 @@ impl PollFd {
         }
     }
 
+    /// Also watch for room to write while `waiting` output is held back.
+    pub fn or_writable(mut self, waiting: bool) -> Self {
+        if waiting {
+            self.events |= POLLOUT;
+        }
+        self
+    }
+
     /// Whether the last poll reported this fd readable, errored, or hung up.
     pub fn is_ready(&self) -> bool {
         self.revents & (POLLIN | POLLERR | POLLHUP) != 0
@@ -97,8 +105,9 @@ pub fn make_eventfd() -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Add 1 to the eventfd's counter to wake a poller. Best-effort: a lost wake is
-/// covered by the poll timeout, so a failed write is never fatal.
+/// Add 1 to the eventfd's counter to wake a poller. The write fails only when
+/// the counter would overflow, which a counter drained on every wake never
+/// approaches.
 pub fn eventfd_signal(fd: RawFd) {
     let one: u64 = 1;
     // SAFETY: writing eight bytes of a u64 is the eventfd write contract;

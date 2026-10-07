@@ -109,6 +109,11 @@ impl Connection {
         &mut self.out
     }
 
+    /// Whether requests a flush could not send are waiting for room.
+    pub fn has_pending_output(&self) -> bool {
+        !self.out.is_empty()
+    }
+
     /// Flush buffered requests. `pass_fd` (the shm pool fd) rides the first
     /// bytes as SCM_RIGHTS ancillary data.
     ///
@@ -116,7 +121,7 @@ impl Connection {
     /// carrying one cannot leave them buffered: the request would go out on the
     /// next flush without its fd, which is a protocol error rather than a
     /// dropped frame. That case waits for room; a plain flush does not, and
-    /// leaves the remainder for the next turn.
+    /// leaves the remainder for the turn the loop wakes on once there is room.
     pub fn flush(&mut self, pass_fd: Option<RawFd>) -> io::Result<()> {
         if self.out.is_empty() {
             return Ok(());

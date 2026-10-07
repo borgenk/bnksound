@@ -1,6 +1,6 @@
 //! Per-stream peak metering. Each bound Node gets a passive PipeWire
 //! capture stream that taps its audio and folds per-channel peaks into a
-//! shared [`crate::meter::PeakPool`] slot the UI decays ~60Hz.
+//! shared [`crate::meter::PeakPool`] slot the UI drains while its bars move.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -41,15 +41,18 @@ struct MonitorData {
 /// level through `tx`. `None` on any setup failure (the meter is a
 /// nicety, not load-bearing).
 ///
-/// Three properties keep this from disturbing the audio graph:
+/// Four properties keep this from disturbing the audio graph:
 ///
-/// - `stream.monitor = "true"`: WirePlumber's bluetooth autoswitch
-///   excludes monitor streams, so our meter won't drop an A2DP headset
-///   to HFP mic mode.
-/// - `node.dont-reconnect = "true"`: when the target goes away, stop
-///   rather than auto-link elsewhere.
-/// - `stream.capture.sink = "true"` (sinks only): request the sink's
-///   monitor port. App streams produce output, so we tap them directly.
+/// - stream.monitor: WirePlumber's bluetooth autoswitch excludes monitor
+///   streams, so the meter won't drop an A2DP headset to HFP mic mode.
+/// - node.passive: the link to the target is passive, so the meter reads
+///   a node only while something else keeps it running and never holds a
+///   device out of suspend itself. An input device's meter moves only
+///   while some app records from it.
+/// - node.dont-reconnect: when the target goes away, stop rather than
+///   auto-link elsewhere.
+/// - stream.capture.sink (sinks only): request the sink's monitor port.
+///   App streams produce output, so they are tapped directly.
 pub(crate) fn start_monitor_stream(
     core: &CoreRc,
     node_id: u32,
@@ -67,8 +70,7 @@ pub(crate) fn start_monitor_stream(
         *pw::keys::NODE_NAME => "bnksound-meter",
         *pw::keys::NODE_DONT_RECONNECT => "true",
         *pw::keys::STREAM_MONITOR => "true",
-        // NOT setting `node.passive = "true"`: the producer side is
-        // already passive, so a passive input link means no buffers arrive.
+        *pw::keys::NODE_PASSIVE => "true",
     };
     if matches!(kind, StreamKind::Sink) {
         props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
@@ -160,7 +162,8 @@ pub(crate) fn start_monitor_stream(
             }
 
             // Fold per-channel maxima into the shared slot via atomic max
-            // (no alloc/lock); the GTK decay tick reads-and-clears ~60Hz.
+            // (no alloc/lock); the main thread's meter step reads and clears
+            // it.
             if let Some(slot) = &data.slot {
                 slot.fold(&peaks_buf[..track]);
             }

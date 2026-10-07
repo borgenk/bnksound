@@ -6,7 +6,9 @@
 //! value per row rather than a single lit one.
 //!
 //! Progress is driven by the clock rather than by a step per tick, so the fade
-//! takes the same time however often the loop happens to wake.
+//! takes the same time however often the loop happens to wake. A fade's clock
+//! starts when the fade does: the loop sleeps while nothing moves, and that
+//! stretch is not part of the next fade.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -27,7 +29,8 @@ const EPSILON: f32 = 0.001;
 #[derive(Default)]
 pub struct HaloState {
     rows: HashMap<RowId, f32>,
-    /// When the last advance ran, so the next one knows how much time passed.
+    /// When the last advance ran while a fade was running, so the next one
+    /// knows how much time passed. None while every ring is where it is going.
     last: Option<Instant>,
 }
 
@@ -37,16 +40,18 @@ impl HaloState {
     }
 
     /// Move every row toward its target: the lit row toward full, the rest
-    /// toward nothing. Reports whether anything moved, so a still window can
-    /// skip repainting.
+    /// toward nothing. Reports whether the rings still need frames, because
+    /// one moved or one has further to go, so a still window can skip
+    /// repainting.
     pub fn advance(&mut self, lit: Option<&RowId>, now: Instant) -> bool {
-        let dt = match self.last.replace(now) {
-            Some(last) => now.saturating_duration_since(last),
-            // First run: nothing has had time to move yet.
-            None => return self.sync_target(lit),
-        };
+        // The clock runs only while a fade does, so a fade that starts after a
+        // still stretch starts from now rather than from the last advance.
+        let dt = self
+            .last
+            .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
         let step = dt.as_secs_f32() / FADE.as_secs_f32();
         let mut changed = self.sync_target(lit);
+        let mut going = false;
 
         self.rows.retain(|row, value| {
             let target = if Some(row) == lit { 1.0 } else { 0.0 };
@@ -61,11 +66,13 @@ impl HaloState {
                 *value = next;
                 changed = true;
             }
+            going |= next != target;
             // Keep a row while it still shows something or still has somewhere
             // to go. One that has finished falling is dropped.
             *value > EPSILON || target > 0.0
         });
-        changed
+        self.last = going.then_some(now);
+        changed || going
     }
 
     /// Make sure the lit row is being tracked, so it has something to rise
@@ -105,9 +112,11 @@ pub struct PressMark {
 }
 
 impl PressMark {
-    /// Take the mark to full, where a press leaves it.
+    /// Take the mark to full, where a press leaves it. Its fade starts on the
+    /// next advance, so the press shows at full on the frame it lands.
     pub fn strike(&mut self) {
         self.value = 1.0;
+        self.last = None;
     }
 
     /// How strongly to draw it, eased so it leaves quickly and trails off.
@@ -115,8 +124,9 @@ impl PressMark {
         ease_out(self.value)
     }
 
-    /// Ease toward nothing. Reports whether it moved, so a still window can
-    /// skip repainting.
+    /// Ease toward nothing. Reports whether the mark still needs frames,
+    /// because it moved or has further to go, so a still window can skip
+    /// repainting.
     pub fn advance(&mut self, now: Instant) -> bool {
         let last = self.last.replace(now);
         if self.value <= 0.0 {
@@ -124,13 +134,13 @@ impl PressMark {
         }
         // First run after a strike: nothing has had time to move yet.
         let Some(last) = last else {
-            return false;
+            return true;
         };
         let step = now.saturating_duration_since(last).as_secs_f32() / MARK.as_secs_f32();
         let next = (self.value - step).max(0.0);
         let moved = next != self.value;
         self.value = next;
-        moved
+        moved || next > 0.0
     }
 }
 
@@ -143,7 +153,7 @@ fn ease_out(t: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ui::halo::*;
 
     fn row(n: u32) -> RowId {
         RowId::Sink(n)
@@ -182,11 +192,13 @@ mod tests {
         tick(&mut state, Some(&r), start + FADE * 2);
         assert_eq!(state.strength(&r), 1.0);
 
-        tick(&mut state, None, start + FADE * 2 + FADE / 2);
+        let leave = start + FADE * 2;
+        tick(&mut state, None, leave);
+        tick(&mut state, None, leave + FADE / 2);
         let mid = state.strength(&r);
         assert!(mid > 0.0 && mid < 1.0, "partway down, got {mid}");
 
-        tick(&mut state, None, start + FADE * 4);
+        tick(&mut state, None, leave + FADE * 2);
         assert_eq!(state.strength(&r), 0.0, "gone once the fade has passed");
     }
 
@@ -201,7 +213,9 @@ mod tests {
         assert_eq!(state.strength(&a), 1.0);
 
         // The pointer moves to b: a has to still be visible on the way down.
-        tick(&mut state, Some(&b), start + FADE * 2 + FADE / 4);
+        let moved = start + FADE * 2;
+        tick(&mut state, Some(&b), moved);
+        tick(&mut state, Some(&b), moved + FADE / 4);
         assert!(state.strength(&a) > 0.0, "the old ring is still fading");
         assert!(state.strength(&b) > 0.0, "the new ring has started");
         assert!(
@@ -218,6 +232,7 @@ mod tests {
 
         tick(&mut state, Some(&r), start);
         tick(&mut state, Some(&r), start + FADE * 2);
+        tick(&mut state, None, start + FADE * 2);
         tick(&mut state, None, start + FADE * 4);
         assert!(
             state.rows.is_empty(),
@@ -238,6 +253,7 @@ mod tests {
             !tick(&mut state, Some(&r), start + FADE * 3),
             "a ring already at full is not a reason to repaint",
         );
+        tick(&mut state, None, start + FADE * 3);
         tick(&mut state, None, start + FADE * 5);
         assert!(
             !tick(&mut state, None, start + FADE * 6),
@@ -261,8 +277,8 @@ mod tests {
         let start = Instant::now();
         // The clock starts running from the first advance after the strike, so
         // the press is at full for the frame it lands on.
-        mark.advance(start);
         mark.strike();
+        assert!(mark.advance(start), "a fresh press wants frames");
         assert_eq!(
             mark.strength(),
             1.0,
@@ -285,12 +301,65 @@ mod tests {
     fn a_second_press_takes_the_mark_back_to_full() {
         let mut mark = PressMark::default();
         let start = Instant::now();
-        mark.advance(start);
         mark.strike();
+        mark.advance(start);
         mark.advance(start + MARK / 2);
         assert!(mark.strength() < 1.0);
         mark.strike();
         assert_eq!(mark.strength(), 1.0, "the second press reads as its own");
+    }
+
+    #[test]
+    fn a_press_after_a_still_stretch_still_shows_at_full() {
+        // The loop sleeps while nothing moves, so the advance before a press can
+        // be seconds old. None of that time belongs to the press's fade.
+        let mut mark = PressMark::default();
+        let start = Instant::now();
+        mark.advance(start);
+        let press = start + Duration::from_secs(5);
+        mark.strike();
+        assert!(mark.advance(press), "the press asks for frames");
+        assert_eq!(mark.strength(), 1.0, "the press shows on its frame");
+        mark.advance(press + MARK / 2);
+        let mid = mark.strength();
+        assert!(
+            mid > 0.0 && mid < 1.0,
+            "it fades over MARK from there, got {mid}"
+        );
+    }
+
+    #[test]
+    fn a_ring_fades_in_from_where_the_pointer_arrives_after_a_still_stretch() {
+        let mut state = HaloState::new();
+        let start = Instant::now();
+        let r = row(1);
+        tick(&mut state, None, start);
+
+        // Five seconds of nothing, then the pointer lands on a knob.
+        let arrive = start + Duration::from_secs(5);
+        assert!(
+            tick(&mut state, Some(&r), arrive),
+            "a fade starting wants frames"
+        );
+        assert_eq!(state.strength(&r), 0.0, "it starts from nothing");
+        tick(&mut state, Some(&r), arrive + FADE / 2);
+        let mid = state.strength(&r);
+        assert!(mid > 0.0 && mid < 1.0, "partway up, not snapped, got {mid}");
+
+        // At full, then the pointer leaves after a long still stretch.
+        tick(&mut state, Some(&r), arrive + FADE * 2);
+        let leave = arrive + Duration::from_secs(10);
+        assert!(
+            tick(&mut state, None, leave),
+            "a fade starting wants frames"
+        );
+        assert_eq!(state.strength(&r), 1.0, "it starts from full");
+        tick(&mut state, None, leave + FADE / 2);
+        let mid = state.strength(&r);
+        assert!(
+            mid > 0.0 && mid < 1.0,
+            "partway down, not snapped, got {mid}"
+        );
     }
 
     #[test]

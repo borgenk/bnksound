@@ -34,12 +34,12 @@ impl Runtime {
     /// Boot the services a running app needs: the two buses, the shared peak
     /// pool, the PipeWire worker thread, and the persisted state. Returns the
     /// runtime plus the message and worker-event receivers the shell's loop
-    /// drains. Fails only if a bus wakeup fd cannot be created.
+    /// drains. Fails only if a wakeup fd cannot be created.
     pub fn boot() -> io::Result<(Runtime, Receiver<Message>, Receiver<Event>)> {
         let (msg_tx, msg_rx) = bus::channel::<Message>(BUS_CAPACITY)?;
         let (evt_tx, evt_rx) = bus::channel::<Event>(BUS_CAPACITY)?;
 
-        let peaks = Arc::new(PeakPool::new());
+        let peaks = Arc::new(PeakPool::new()?);
         let worker = pipewire_worker::init(evt_tx, Arc::clone(&peaks));
 
         let runtime = Runtime {
@@ -62,7 +62,7 @@ impl Runtime {
         &self.state
     }
 
-    /// The shared peak pool, read by the shell's meter tick.
+    /// The shared peak pool, read by the shell's meter step.
     pub fn peaks(&self) -> &Arc<PeakPool> {
         &self.peaks
     }

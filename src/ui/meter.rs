@@ -1,13 +1,13 @@
 //! Meter visual model: the decayed per-row peaks and the pure math that maps a
 //! linear amplitude to a lit segment fraction and a color tier.
 //!
-//! The audio threads fold raw peaks into the shared pool; each frame the shell
+//! The audio threads fold raw peaks into the shared pool; each step the shell
 //! decays every bar and folds in the newest reading (decay first, so a fresh
 //! reading lands at full height). Drawing reads the lit fraction and tier from
 //! here, keeping the level scale (dB) distinct from the slider's gain curve.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ui::layout::RowId;
 
@@ -68,13 +68,22 @@ pub fn cell_span(height: i32, from_bottom: i32) -> (i32, i32) {
 pub const ASSUMED_CHANNELS: usize = 2;
 /// Bottom of the meter's dB scale, matching consumer level meters.
 pub const METER_DB_FLOOR: f32 = -60.0;
-/// Decay multiplier per tick: fast attack, slow release, dropping the bar to
-/// about 10% in roughly 3 seconds.
+/// The quietest peak the meter shows, METER_DB_FLOOR as a linear amplitude.
+/// Anything below lights nothing, so it neither holds a bar up nor wakes the
+/// loop to step one.
+pub const METER_FLOOR: f32 = 0.001;
+/// The share of its height a bar keeps for every PEAK_DECAY_INTERVAL that
+/// passes: fast attack, slow release, dropping the bar to about 10% in roughly
+/// 3 seconds.
 pub const PEAK_DECAY: f32 = 0.988;
-/// Meter tick interval (16 ms is about 60 Hz).
+/// How often moving meters step, 16 ms being about 60 Hz. The decay follows
+/// elapsed time, so this sets how often a playing window wakes, not how fast
+/// the bars fall.
 pub const PEAK_DECAY_INTERVAL: Duration = Duration::from_millis(16);
-/// Below this the bar is treated as fully decayed and snapped to zero.
-const DECAY_FLOOR: f32 = 0.001;
+/// The longest gap between steps whose readings are still current. Moving bars
+/// step every frame, so a longer gap means nothing stepped them, a hidden
+/// window most likely.
+const STALE_READINGS: Duration = Duration::from_millis(250);
 
 /// How many bars a row's meter shows. A row with no readings yet is drawn as
 /// stereo rather than collapsed to one bar it would then have to grow out of.
@@ -126,16 +135,13 @@ pub fn segment_coverage(lit: f32, total: i32, from_bottom: i32) -> f32 {
     (lit_segments - from_bottom as f32).clamp(0.0, 1.0)
 }
 
-/// One decay step for a single bar value.
-fn decayed(v: f32) -> f32 {
-    let next = v * PEAK_DECAY;
-    if next < DECAY_FLOOR { 0.0 } else { next }
-}
-
 /// Per-row decayed peaks: the meter's retained visual state.
 #[derive(Default)]
 pub struct MeterState {
     rows: HashMap<RowId, Vec<f32>>,
+    /// When the bars last stepped, so the next step decays them by the time
+    /// that has passed since.
+    last_step: Option<Instant>,
 }
 
 impl MeterState {
@@ -143,14 +149,20 @@ impl MeterState {
         MeterState::default()
     }
 
-    /// Ease every bar of every row toward zero. Runs once per tick, before the
-    /// fresh readings are folded in. Reports whether any bar moved, so a silent
-    /// window can skip repainting entirely.
-    pub fn decay(&mut self) -> bool {
+    /// Ease every bar of every row toward zero by the time since the last
+    /// step. Runs before the fresh readings are folded in. Reports whether any
+    /// bar moved, so a silent window can skip repainting entirely.
+    pub fn decay(&mut self, now: Instant) -> bool {
+        let elapsed = self
+            .last_step
+            .replace(now)
+            .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
+        let keep = PEAK_DECAY.powf(elapsed.as_secs_f32() / PEAK_DECAY_INTERVAL.as_secs_f32());
         let mut changed = false;
         for channels in self.rows.values_mut() {
             for v in channels.iter_mut() {
-                let next = decayed(*v);
+                let next = *v * keep;
+                let next = if next < METER_FLOOR { 0.0 } else { next };
                 if next != *v {
                     *v = next;
                     changed = true;
@@ -158,6 +170,20 @@ impl MeterState {
             }
         }
         changed
+    }
+
+    /// Whether the readings the pool holds now are older than they look.
+    ///
+    /// The pool keeps the loudest peak since its last drain. A step that comes
+    /// after a long gap finds the loudest moment of the whole gap there rather
+    /// than what is playing now. Bars at rest have no such gap to account for,
+    /// because the first audible peak wakes a step at once.
+    pub fn readings_stale(&self, now: Instant) -> bool {
+        let moving = self.rows.values().flatten().any(|&v| v > 0.0);
+        moving
+            && self
+                .last_step
+                .is_some_and(|last| now.saturating_duration_since(last) > STALE_READINGS)
     }
 
     /// Fold fresh per-channel peaks into a row, keeping the louder of current
@@ -192,7 +218,7 @@ impl MeterState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ui::meter::*;
 
     #[test]
     fn lit_fraction_spans_the_db_range() {
@@ -294,19 +320,90 @@ mod tests {
         assert!(m.apply(&row, &[0.5, 0.2]));
         assert!(m.apply(&row, &[0.3, 0.9])); // max-fold per channel
         assert_eq!(m.channels(&row), &[0.5, 0.9]);
-        assert!(m.decay());
+        let start = Instant::now();
+        m.decay(start);
+        assert!(m.decay(start + PEAK_DECAY_INTERVAL));
         let after = m.channels(&row);
         assert!(after[0] < 0.5 && after[0] > 0.0);
         assert!(after[1] < 0.9 && after[1] > 0.0);
     }
 
     #[test]
-    fn decay_snaps_a_tiny_value_to_zero() {
+    fn the_fall_follows_elapsed_time_not_the_number_of_steps() {
+        // A window that steps twice as often, or one whose steps land off the
+        // display's beat, has to show the same fall.
+        let row = RowId::Sink(1);
+        let start = Instant::now();
+        let mut often = MeterState::new();
+        let mut seldom = MeterState::new();
+        for m in [&mut often, &mut seldom] {
+            m.apply(&row, &[0.8]);
+            m.decay(start);
+        }
+        for i in 1..=30 {
+            often.decay(start + PEAK_DECAY_INTERVAL * i);
+        }
+        seldom.decay(start + PEAK_DECAY_INTERVAL * 30);
+
+        let (a, b) = (often.channels(&row)[0], seldom.channels(&row)[0]);
+        assert!(
+            (a - b).abs() < 1e-5,
+            "{a} after thirty steps, {b} after one"
+        );
+        let expected = 0.8 * PEAK_DECAY.powi(30);
+        assert!((b - expected).abs() < 1e-5, "{b}, expected {expected}");
+    }
+
+    #[test]
+    fn a_step_takes_no_time_on_the_first_turn() {
+        // With no step before it there is no elapsed time to decay by, so a bar
+        // that has just risen is drawn at the height it rose to.
+        let mut m = MeterState::new();
+        let row = RowId::Sink(1);
+        m.apply(&row, &[0.5]);
+        assert!(!m.decay(Instant::now()), "the first step moved a bar");
+        assert_eq!(m.channels(&row), &[0.5]);
+    }
+
+    #[test]
+    fn decay_snaps_a_bar_below_the_floor_to_zero() {
         let mut m = MeterState::new();
         let row = RowId::Source(2);
-        m.apply(&row, &[DECAY_FLOOR / 2.0]);
-        assert!(m.decay());
+        m.apply(&row, &[METER_FLOOR / 2.0]);
+        assert!(m.decay(Instant::now()));
         assert_eq!(m.channels(&row), &[0.0]);
+    }
+
+    #[test]
+    fn the_floor_is_the_bottom_of_the_scale() {
+        // The wake threshold and the drawn scale have to agree, or a peak too
+        // quiet to light a cell would still keep the loop stepping.
+        assert_eq!(lit_fraction(METER_FLOOR * 0.9), 0.0);
+        assert!(lit_fraction(METER_FLOOR) < 1e-6);
+        assert!(lit_fraction(METER_FLOOR * 1.2) > 0.0);
+    }
+
+    #[test]
+    fn readings_after_a_long_gap_are_stale_while_the_bars_move() {
+        let row = RowId::Sink(1);
+        let start = Instant::now();
+        let mut m = MeterState::new();
+        m.apply(&row, &[0.5]);
+        m.decay(start);
+
+        let next_frame = start + PEAK_DECAY_INTERVAL;
+        assert!(!m.readings_stale(next_frame), "a frame's gap is current");
+        let shown_again = start + Duration::from_secs(60);
+        assert!(
+            m.readings_stale(shown_again),
+            "a minute unstepped trusted the pool"
+        );
+
+        // Bars at rest were stepped until they settled, and the first peak
+        // after that wakes a step at once, so what the pool holds is current.
+        m.decay(shown_again);
+        assert_eq!(m.channels(&row), &[0.0]);
+        assert!(!m.readings_stale(shown_again + Duration::from_secs(60)));
     }
 
     #[test]
