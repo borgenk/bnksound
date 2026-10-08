@@ -804,6 +804,9 @@ impl App {
             (_, evt::KEYBOARD_LEAVE) if msg.object == self.keyboard => {
                 // Focus left mid-press; drop the held key so it cannot stick.
                 self.held_key = None;
+                if self.shell.ui.rest_caret() {
+                    self.shell.ui.dirty.mark_full();
+                }
             }
             (_, evt::KEYBOARD_KEY) if msg.object == self.keyboard => {
                 self.last_serial = r.u32().unwrap_or(self.last_serial);

@@ -110,6 +110,7 @@ pub fn activate(app: &gtk::Application) {
     wire_input(&surface, &window, &shell, &msg_tx, &redraw);
     wire_buses(&window, &shell, &redraw, msg_rx, evt_rx);
     wire_resize(&window, &surface, &frames);
+    wire_focus(&window, &shell, &redraw);
     wire_geometry(&window, &shell);
     if geometry.fitted {
         wire_refit(&window, &shell, geometry.width as i32);
@@ -350,6 +351,25 @@ fn wire_resize(
         .borrow()
         .widget
         .connect_scale_factor_notify(move |_| frames.request());
+}
+
+/// A window that loses focus stops blinking its caret, the way GTK's own text
+/// fields do. The next key or click in the field starts it again.
+fn wire_focus(window: &gtk::ApplicationWindow, shell: &Rc<RefCell<Shell>>, redraw: &Rc<dyn Fn()>) {
+    let shell = Rc::clone(shell);
+    let redraw = Rc::clone(redraw);
+    window.connect_is_active_notify(move |window| {
+        if window.is_active() {
+            return;
+        }
+        {
+            let mut shell = shell.borrow_mut();
+            if shell.ui.rest_caret() {
+                shell.ui.dirty.mark_full();
+            }
+        }
+        redraw();
+    });
 }
 
 /// The autosave and the caret blink, each a timer that runs only while it has

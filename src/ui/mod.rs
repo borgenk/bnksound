@@ -372,6 +372,16 @@ impl UiState {
         self.caret_visible = true;
         self.caret_blinks_left = CARET_BLINK_TOGGLES;
     }
+
+    /// The window lost keyboard focus: the caret rests shown with no run left,
+    /// until a key or a click in the field starts a fresh one. Returns whether
+    /// the frame needs repainting.
+    pub fn rest_caret(&mut self) -> bool {
+        let changed = !self.caret_visible;
+        self.caret_visible = true;
+        self.caret_blinks_left = 0;
+        changed
+    }
 }
 
 #[cfg(test)]
@@ -427,6 +437,25 @@ mod tests {
         assert!(ui.caret_visible, "the run ends with the caret shown");
         assert!(!ui.blink_caret(), "a rested caret changes nothing");
         assert!(ui.caret_visible);
+    }
+
+    #[test]
+    fn a_window_that_loses_focus_stops_blinking_until_the_field_is_used() {
+        let mut ui = UiState::new();
+        ui.focus = Focus::Palette;
+        assert!(ui.blink_caret());
+        assert!(
+            !ui.caret_visible,
+            "mid-run, the caret is in its hidden half"
+        );
+
+        assert!(ui.rest_caret(), "the hidden caret has to be shown again");
+        assert!(ui.caret_visible);
+        assert!(!ui.caret_blinking(), "an unfocused window still blinks");
+        assert!(!ui.rest_caret(), "resting twice changes nothing");
+
+        ui.wake_caret();
+        assert!(ui.caret_blinking(), "a key in the field starts a fresh run");
     }
 
     #[test]

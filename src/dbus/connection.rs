@@ -5,10 +5,12 @@
 //! lone nul byte, then AUTH EXTERNAL with the effective uid hex-encoded, then
 //! BEGIN. Message framing starts immediately after BEGIN.
 //!
-//! Calls block, so this belongs on a thread of its own. Reads carry a timeout
-//! so an unresponsive peer stalls one call instead of the connection: buffered
-//! bytes are kept across attempts, so a timeout mid-message resumes rather than
-//! desyncs.
+//! Calls block, so this belongs on a thread of its own. A call waits for its
+//! reply with a timeout, so an unresponsive peer stalls one call instead of the
+//! connection: buffered bytes are kept across attempts, so a timeout
+//! mid-message resumes rather than desyncs. Waiting for a signal has no
+//! deadline, since nothing may arrive for hours and a timeout would only wake
+//! the thread to find nothing.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -19,8 +21,8 @@ use std::time::Duration;
 use crate::dbus::wire::{self, MessageType, MethodCall};
 use crate::platform::sys;
 
-/// How long a single read waits before giving up.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the handshake or a call waits for an answer before giving up.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Signals buffered while a call waits for its reply. Past this the oldest are
 /// dropped: they are only used to avoid missing an update that raced a call,
@@ -37,6 +39,8 @@ pub struct Connection {
     serial: u32,
     /// Signals that arrived while a call was waiting for its reply.
     pending: VecDeque<wire::Message>,
+    /// REPLY_TIMEOUT, held here so a test can wait less.
+    reply_timeout: Duration,
 }
 
 impl Connection {
@@ -45,13 +49,14 @@ impl Connection {
     /// session.
     pub fn session() -> io::Result<Self> {
         let sock = connect_session_socket()?;
-        sock.set_read_timeout(Some(READ_TIMEOUT))?;
+        sock.set_read_timeout(Some(REPLY_TIMEOUT))?;
 
         let mut conn = Connection {
             sock,
             in_buf: Vec::new(),
             serial: 0,
             pending: VecDeque::new(),
+            reply_timeout: REPLY_TIMEOUT,
         };
         conn.authenticate()?;
         // Hello has to be the first message on a connection. The reply names
@@ -130,6 +135,7 @@ impl Connection {
     /// Send a method call and wait for its reply. A D-Bus error reply comes
     /// back as an Err carrying the error name.
     pub fn call(&mut self, call: &MethodCall) -> io::Result<wire::Message> {
+        self.sock.set_read_timeout(Some(self.reply_timeout))?;
         let serial = self.next_serial();
         self.sock
             .write_all(&wire::encode_method_call(serial, call))?;
@@ -166,18 +172,16 @@ impl Connection {
     }
 
     /// Block until the next signal arrives. Replies to calls we are no longer
-    /// waiting on are discarded, and a read timeout just means nothing has
-    /// happened yet.
+    /// waiting on are discarded.
     pub fn next_signal(&mut self) -> io::Result<wire::Message> {
+        if let Some(msg) = self.pending.pop_front() {
+            return Ok(msg);
+        }
+        self.sock.set_read_timeout(None)?;
         loop {
-            if let Some(msg) = self.pending.pop_front() {
+            let msg = self.read_message()?;
+            if msg.kind == MessageType::Signal {
                 return Ok(msg);
-            }
-            match self.read_message() {
-                Ok(msg) if msg.kind == MessageType::Signal => return Ok(msg),
-                Ok(_) => continue,
-                Err(e) if is_timeout(&e) => continue,
-                Err(e) => return Err(e),
             }
         }
     }
@@ -204,14 +208,6 @@ impl Connection {
             self.in_buf.extend_from_slice(&chunk[..n]);
         }
     }
-}
-
-/// Whether an error is a read timing out rather than the connection failing.
-fn is_timeout(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
 }
 
 /// Connect to the socket named by DBUS_SESSION_BUS_ADDRESS, falling back to
@@ -300,7 +296,7 @@ fn unescape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dbus::connection::*;
 
     #[test]
     fn a_path_address_parses() {
@@ -341,10 +337,97 @@ mod tests {
         assert_eq!(unescape("%zz"), "%zz");
     }
 
+    /// A connection over one end of a socket pair, with the other end standing
+    /// in for the bus. The read deadline is set the way the handshake leaves
+    /// it.
+    fn connected(reply_timeout: Duration) -> (Connection, UnixStream) {
+        let (sock, bus) = UnixStream::pair().expect("a socket pair");
+        sock.set_read_timeout(Some(reply_timeout))
+            .expect("set the read deadline");
+        let conn = Connection {
+            sock,
+            in_buf: Vec::new(),
+            serial: 0,
+            pending: VecDeque::new(),
+            reply_timeout,
+        };
+        (conn, bus)
+    }
+
+    /// A signal as the bus would send it. A method call carries the same header
+    /// fields, so it is encoded as one and retyped.
+    fn signal(member: &str) -> Vec<u8> {
+        let mut bytes = wire::encode_method_call(
+            1,
+            &MethodCall {
+                destination: ":1.1",
+                path: "/org/mpris/MediaPlayer2",
+                interface: "org.freedesktop.DBus.Properties",
+                member,
+                args: &[],
+            },
+        );
+        bytes[1] = 4; // SIGNAL
+        bytes
+    }
+
+    /// How many times a thread of this process has gone to sleep and been
+    /// woken again.
+    fn wakeups(tid: &str) -> u64 {
+        std::fs::read_to_string(format!("/proc/self/task/{tid}/status"))
+            .expect("read the thread's status")
+            .lines()
+            .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+            .and_then(|count| count.trim().parse().ok())
+            .expect("a voluntary_ctxt_switches line")
+    }
+
     #[test]
-    fn a_timeout_is_told_apart_from_a_real_failure() {
-        assert!(is_timeout(&io::Error::from(io::ErrorKind::WouldBlock)));
-        assert!(is_timeout(&io::Error::from(io::ErrorKind::TimedOut)));
-        assert!(!is_timeout(&io::Error::from(io::ErrorKind::UnexpectedEof)));
+    fn waiting_for_a_signal_does_not_wake_until_one_arrives() {
+        // With a call's deadline this short, a wait that kept it would wake
+        // the thread every 20 ms with nothing to read.
+        let (mut conn, mut bus) = connected(Duration::from_millis(20));
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let me = std::fs::read_link("/proc/thread-self").expect("this thread's proc entry");
+            let tid = me
+                .file_name()
+                .expect("a tid")
+                .to_string_lossy()
+                .into_owned();
+            tid_tx.send(tid).expect("hand the tid over");
+            conn.next_signal().map(|msg| msg.member)
+        });
+        let tid = tid_rx.recv().expect("the waiter's tid");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let before = wakeups(&tid);
+        std::thread::sleep(Duration::from_millis(300));
+        let woke = wakeups(&tid) - before;
+        assert_eq!(woke, 0, "the wait woke {woke} times with nothing to read");
+
+        bus.write_all(&signal("PropertiesChanged"))
+            .expect("send the signal");
+        let member = waiter.join().expect("the waiter").expect("a signal");
+        assert_eq!(member.as_deref(), Some("PropertiesChanged"));
+    }
+
+    #[test]
+    fn a_call_gives_up_on_a_bus_that_never_answers() {
+        let (mut conn, _bus) = connected(Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        let reply = conn.call(&MethodCall {
+            destination: BUS_NAME,
+            path: BUS_PATH,
+            interface: BUS_NAME,
+            member: "Hello",
+            args: &[],
+        });
+        assert!(reply.is_err(), "a call to a silent bus returned a reply");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the call waited {:?} rather than giving up",
+            started.elapsed(),
+        );
     }
 }
