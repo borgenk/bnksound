@@ -81,6 +81,7 @@ fn put_array(buf: &mut Vec<u8>, a: &[u8]) {
 }
 
 /// A parsed event: its target object, opcode, and the argument bytes.
+#[derive(Default)]
 pub struct Message {
     pub object: u32,
     pub opcode: u16,
@@ -94,9 +95,10 @@ impl Message {
     }
 }
 
-/// Parse one message from the front of `buf`, returning it and the number of
-/// bytes consumed, or None if a whole message is not yet buffered.
-pub fn parse(buf: &[u8]) -> Option<(Message, usize)> {
+/// Parse one message from the front of buf into msg, returning the number of
+/// bytes consumed, or None if a whole message is not yet buffered, which
+/// leaves msg as it was.
+pub fn parse_into(buf: &[u8], msg: &mut Message) -> Option<usize> {
     if buf.len() < HEADER_SIZE {
         return None;
     }
@@ -107,15 +109,11 @@ pub fn parse(buf: &[u8]) -> Option<(Message, usize)> {
     if size < HEADER_SIZE || buf.len() < size {
         return None;
     }
-    let body = buf[HEADER_SIZE..size].to_vec();
-    Some((
-        Message {
-            object,
-            opcode,
-            body,
-        },
-        size,
-    ))
+    msg.object = object;
+    msg.opcode = opcode;
+    msg.body.clear();
+    msg.body.extend_from_slice(&buf[HEADER_SIZE..size]);
+    Some(size)
 }
 
 /// Sequential reader over an event's argument bytes, in host byte order.
@@ -173,7 +171,15 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::wire::*;
+
+    /// One message decoded into a fresh Message, for tests that look at a
+    /// single event.
+    fn parse(buf: &[u8]) -> Option<(Message, usize)> {
+        let mut msg = Message::default();
+        let used = parse_into(buf, &mut msg)?;
+        Some((msg, used))
+    }
 
     #[test]
     fn encode_then_parse_roundtrips_header() {
@@ -213,6 +219,37 @@ mod tests {
         assert!(parse(&buf[..HEADER_SIZE]).is_none(), "header only, no body");
         assert!(parse(&buf[..4]).is_none(), "not even a header");
         assert!(parse(&buf).is_some());
+    }
+
+    #[test]
+    fn a_reused_message_takes_the_next_event_without_reallocating() {
+        // The loop decodes every event into one message, so an event no larger
+        // than the largest before it lands in memory the message already has.
+        let mut buf = Vec::new();
+        encode(&mut buf, 3, 0, &[Arg::Uint(1), Arg::Uint(2)]);
+        encode(&mut buf, 1, 1, &[Arg::Uint(40)]);
+        let mut msg = Message::default();
+        let used = parse_into(&buf, &mut msg).expect("the first event");
+        let body = msg.body.as_ptr();
+
+        let second = parse_into(&buf[used..], &mut msg).expect("the second event");
+        assert_eq!(used + second, buf.len());
+        assert_eq!((msg.object, msg.opcode), (1, 1));
+        assert_eq!(msg.reader().u32(), Some(40));
+        assert_eq!(msg.body.len(), 4, "nothing of the first event is left");
+        assert_eq!(msg.body.as_ptr(), body, "the second event reallocated");
+    }
+
+    #[test]
+    fn a_partial_event_leaves_the_message_as_it_was() {
+        let mut buf = Vec::new();
+        encode(&mut buf, 3, 2, &[Arg::Uint(7)]);
+        encode(&mut buf, 1, 1, &[Arg::Uint(40)]);
+        let mut msg = Message::default();
+        let used = parse_into(&buf, &mut msg).expect("the first event");
+        assert_eq!(parse_into(&buf[used..buf.len() - 2], &mut msg), None);
+        assert_eq!((msg.object, msg.opcode), (3, 2));
+        assert_eq!(msg.reader().u32(), Some(7));
     }
 
     #[test]

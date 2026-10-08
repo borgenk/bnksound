@@ -213,11 +213,14 @@ impl Connection {
         Ok(true)
     }
 
-    /// Pop the next fully received message, if one is buffered.
-    pub fn next_message(&mut self) -> Option<Message> {
-        let (msg, used) = wire::parse(&self.in_buf)?;
+    /// Decode the next fully received message into msg, reusing its body.
+    /// Reports whether one was buffered.
+    pub fn next_message(&mut self, msg: &mut Message) -> bool {
+        let Some(used) = wire::parse_into(&self.in_buf, msg) else {
+            return false;
+        };
         self.in_buf.drain(..used);
-        Some(msg)
+        true
     }
 
     /// Take the oldest received fd (a message that declares an fd argument

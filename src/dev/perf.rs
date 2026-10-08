@@ -27,6 +27,8 @@ use std::io;
 use std::time::Instant;
 
 use crate::dev::{Result, alloc, scene};
+use crate::platform::protocol::{WL_DISPLAY, evt};
+use crate::platform::wire::{self, Arg, Message, encode};
 use crate::render::buffer::PixelBuffer;
 use crate::render::image::IconCache;
 use crate::render::paint::{paint_frame, paint_meters};
@@ -244,7 +246,36 @@ fn measure(font: &Font, palette: &Palette) -> Vec<Sample> {
         black_box(hit_sweep(&ui_layout));
     }));
 
+    // Decoded into one reused message, the way the loop does it.
+    let events = frame_events();
+    let mut msg = Message::default();
+    samples.push(bench("frame_events", 4096, || {
+        let mut at = 0;
+        while let Some(used) = wire::parse_into(&events[at..], &mut msg) {
+            black_box(msg.reader().u32());
+            at += used;
+        }
+        at
+    }));
+
     samples
+}
+
+/// What the compositor sends back for each painted frame: the frame
+/// callback's done, the id that frees, and the buffer's release.
+fn frame_events() -> Vec<u8> {
+    const CALLBACK: u32 = 40;
+    const BUFFER: u32 = 30;
+    let mut events = Vec::new();
+    encode(&mut events, CALLBACK, evt::CALLBACK_DONE, &[Arg::Uint(0)]);
+    encode(
+        &mut events,
+        WL_DISPLAY,
+        evt::DISPLAY_DELETE_ID,
+        &[Arg::Uint(CALLBACK)],
+    );
+    encode(&mut events, BUFFER, evt::BUFFER_RELEASE, &[]);
+    events
 }
 
 /// Every hit target the pointer could be over, walked once. A single lookup is

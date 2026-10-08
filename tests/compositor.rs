@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use bnksound::geometry::Geometry;
 use bnksound::platform::conn::Connection;
 use bnksound::platform::protocol::{WL_DISPLAY, evt, req};
-use bnksound::platform::wire::{Arg, encode};
+use bnksound::platform::wire::{Arg, Message, encode};
 use bnksound::store::{self, State};
 
 /// The window size every test starts from. Small enough to fit the headless
@@ -1146,6 +1146,7 @@ fn set_output_scale(display: &str, scale: f64) {
     let mut manager = 0;
     let mut heads = Vec::new();
     let mut serial = None;
+    let mut msg = Message::default();
     let deadline = Instant::now() + STARTUP;
     while serial.is_none() {
         assert!(
@@ -1153,7 +1154,7 @@ fn set_output_scale(display: &str, scale: f64) {
             "{display} never finished announcing its outputs"
         );
         assert!(conn.fill().expect("read from the compositor"), "closed");
-        while let Some(msg) = conn.next_message() {
+        while conn.next_message(&mut msg) {
             let mut r = msg.reader();
             match (msg.object, msg.opcode) {
                 (obj, evt::REGISTRY_GLOBAL) if obj == registry => {
@@ -1221,6 +1222,7 @@ fn set_output_scale(display: &str, scale: f64) {
     encode(conn.out(), config, wlr::APPLY, &[]);
     conn.flush(None).expect("apply the configuration");
 
+    let mut msg = Message::default();
     let deadline = Instant::now() + STARTUP;
     loop {
         assert!(
@@ -1228,7 +1230,7 @@ fn set_output_scale(display: &str, scale: f64) {
             "{display} never answered the configuration"
         );
         assert!(conn.fill().expect("read from the compositor"), "closed");
-        while let Some(msg) = conn.next_message() {
+        while conn.next_message(&mut msg) {
             if msg.object != config {
                 continue;
             }

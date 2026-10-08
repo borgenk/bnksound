@@ -234,6 +234,9 @@ pub struct App {
     icons: IconCache,
     msg_rx: Receiver<AppMessage>,
     evt_rx: Receiver<WorkerEvent>,
+    /// The compositor event being handled. Every event is decoded into this
+    /// one.
+    incoming: Message,
 
     /// The one-window lock. Later launches hand themselves over on it, and the
     /// window comes forward instead of a second one opening. None when the lock
@@ -339,6 +342,7 @@ impl App {
             icons: IconCache::new(),
             msg_rx,
             evt_rx,
+            incoming: Message::default(),
             instance,
             xkb: None,
             // Sensible defaults until repeat_info arrives.
@@ -414,13 +418,15 @@ impl App {
                 return Err(io::Error::other("compositor closed the connection"));
             }
             let mut done = false;
-            while let Some(msg) = self.conn.next_message() {
+            let mut msg = std::mem::take(&mut self.incoming);
+            while self.conn.next_message(&mut msg) {
                 if msg.object == cb && msg.opcode == evt::CALLBACK_DONE {
                     done = true;
                 } else {
-                    self.handle(msg)?;
+                    self.handle(&msg)?;
                 }
             }
+            self.incoming = msg;
             self.flush()?;
             if done {
                 return Ok(());
@@ -522,7 +528,7 @@ impl App {
     }
 
     /// Dispatch one Wayland event.
-    fn handle(&mut self, msg: Message) -> io::Result<()> {
+    fn handle(&mut self, msg: &Message) -> io::Result<()> {
         let mut r = msg.reader();
         match (msg.object, msg.opcode) {
             (WL_DISPLAY, evt::DISPLAY_ERROR) => {
@@ -1523,9 +1529,7 @@ impl App {
             Owed::Meters
         };
 
-        // Reprojecting builds the column and hit lists afresh, which a meter
-        // step would pay for on every frame while anything plays. The size
-        // check keeps a resize from painting into the old geometry.
+        // The size check keeps a resize from painting into the old geometry.
         let window = Rect::new(0, 0, self.width, self.height);
         let layout = match self.painted_layout.take() {
             Some(layout) if change == Owed::Meters && layout.window == window => layout,
@@ -1677,9 +1681,12 @@ impl App {
                 self.closed = true;
                 return Ok(());
             }
-            while let Some(msg) = self.conn.next_message() {
-                self.handle(msg)?;
+            // Out of self for the loop, so handle can borrow the rest of it.
+            let mut msg = std::mem::take(&mut self.incoming);
+            while self.conn.next_message(&mut msg) {
+                self.handle(&msg)?;
             }
+            self.incoming = msg;
         }
 
         // Later launches, which hand over whatever their launcher told them and

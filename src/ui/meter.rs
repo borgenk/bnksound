@@ -206,9 +206,6 @@ impl MeterState {
     /// and incoming. Resizes on a channel-count change. Reports whether any bar
     /// rose.
     pub fn apply(&mut self, row: &RowId, peaks: &[f32]) -> bool {
-        // Only a row seen for the first time takes a copy of its id. An app
-        // group's id owns its name, and copying it on every step would allocate
-        // for a row that is already there.
         match self.rows.get_mut(row) {
             Some(channels) => fold_peaks(channels, peaks),
             None => {
