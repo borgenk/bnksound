@@ -33,7 +33,7 @@ use crate::render::paint::{paint_frame, paint_meters};
 use crate::render::primitives::{Painter, Rect};
 use crate::render::text::Font;
 use crate::ui::UiState;
-use crate::ui::layout::{self, Layout as UiLayout};
+use crate::ui::layout::{self, Layout as UiLayout, RowId};
 use crate::ui::meter::{MeterState, PEAK_DECAY_INTERVAL};
 use crate::ui::theme::Palette;
 use crate::view::snapshot::{ViewSnapshot, build_snapshot};
@@ -224,6 +224,20 @@ fn measure(font: &Font, palette: &Palette) -> Vec<Sample> {
     samples.push(bench("meter_decay", 4096, || {
         now += PEAK_DECAY_INTERVAL;
         black_box(meters.decay(now));
+    }));
+
+    // A whole step while everything plays: the bars decay, then every row
+    // takes a fresh reading. App groups are among the rows, and their ids own
+    // their names, so a step that copied ids would show up here.
+    let rows: Vec<RowId> = snapshot.meter_routes.values().flatten().cloned().collect();
+    let mut playing = meters_for(&snapshot);
+    samples.push(bench("meter_step", 4096, || {
+        now += PEAK_DECAY_INTERVAL;
+        let mut moved = playing.decay(now);
+        for row in &rows {
+            moved |= playing.apply(row, &[0.8, 0.6]);
+        }
+        black_box(moved)
     }));
 
     samples.push(bench("hit_test", 4096, || {

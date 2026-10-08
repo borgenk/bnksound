@@ -135,6 +135,22 @@ pub fn segment_coverage(lit: f32, total: i32, from_bottom: i32) -> f32 {
     (lit_segments - from_bottom as f32).clamp(0.0, 1.0)
 }
 
+/// The fold behind MeterState::apply, for one row's bars.
+fn fold_peaks(channels: &mut Vec<f32>, peaks: &[f32]) -> bool {
+    let mut changed = false;
+    if channels.len() != peaks.len() {
+        channels.resize(peaks.len(), 0.0);
+        changed = true;
+    }
+    for (slot, &incoming) in channels.iter_mut().zip(peaks) {
+        if incoming > *slot {
+            *slot = incoming;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Per-row decayed peaks: the meter's retained visual state.
 #[derive(Default)]
 pub struct MeterState {
@@ -190,19 +206,18 @@ impl MeterState {
     /// and incoming. Resizes on a channel-count change. Reports whether any bar
     /// rose.
     pub fn apply(&mut self, row: &RowId, peaks: &[f32]) -> bool {
-        let channels = self.rows.entry(row.clone()).or_default();
-        let mut changed = false;
-        if channels.len() != peaks.len() {
-            channels.resize(peaks.len(), 0.0);
-            changed = true;
-        }
-        for (slot, &incoming) in channels.iter_mut().zip(peaks) {
-            if incoming > *slot {
-                *slot = incoming;
-                changed = true;
+        // Only a row seen for the first time takes a copy of its id. An app
+        // group's id owns its name, and copying it on every step would allocate
+        // for a row that is already there.
+        match self.rows.get_mut(row) {
+            Some(channels) => fold_peaks(channels, peaks),
+            None => {
+                let mut channels = Vec::new();
+                let changed = fold_peaks(&mut channels, peaks);
+                self.rows.insert(row.clone(), channels);
+                changed
             }
         }
-        changed
     }
 
     /// The current per-channel peaks for a row, empty if it has none yet.

@@ -3,6 +3,7 @@ build_snapshot	2252	113
 hit_test	1908	0
 layout_project	1046	64
 meter_decay	23	0
+meter_step	170	0
 paint_frame	545043	0
 paint_frame_24_apps	526736	0
 paint_frame_64_apps	540945	0

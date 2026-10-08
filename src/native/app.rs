@@ -199,6 +199,10 @@ pub struct App {
     buffer_dims: (i32, i32),
     /// The slot the last presented frame went into, which a screenshot reads.
     last_painted: usize,
+    /// The layout the last frame was painted from. A frame where only the
+    /// meters moved paints from it again, since anything that moves the layout
+    /// asks for a full repaint.
+    painted_layout: Option<layout::Layout>,
     /// The last commit's frame callback, which the compositor answers once it
     /// is ready for the next frame. Zero when none is outstanding, which is the
     /// only time a frame is painted.
@@ -315,6 +319,7 @@ impl App {
             buffers: [BufferSlot::default(), BufferSlot::default()],
             buffer_dims: (0, 0),
             last_painted: 0,
+            painted_layout: None,
             frame_callback: 0,
             pending_configure: None,
             width: startup_size.0,
@@ -1518,7 +1523,14 @@ impl App {
             Owed::Meters
         };
 
-        let layout = self.layout();
+        // Reprojecting builds the column and hit lists afresh, which a meter
+        // step would pay for on every frame while anything plays. The size
+        // check keeps a resize from painting into the old geometry.
+        let window = Rect::new(0, 0, self.width, self.height);
+        let layout = match self.painted_layout.take() {
+            Some(layout) if change == Owed::Meters && layout.window == window => layout,
+            _ => self.layout(),
+        };
         let (dw, dh) = self.device_size();
         let scale = self.scale;
         let frame_px = (dw * dh) as usize;
@@ -1588,6 +1600,7 @@ impl App {
         self.send(surface, req::SURFACE_COMMIT, &[]);
         self.buffers[slot].busy = true;
         self.last_painted = slot;
+        self.painted_layout = Some(layout);
         self.counts.frames += 1;
         self.shell.ui.dirty.clear();
         self.flush()
